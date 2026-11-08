@@ -1,7 +1,7 @@
 # lunepack-rs
 
-Pure-Rust installer, packager and auto-updater framework: package releases, build installers, ship full and delta updates, apply an update and restart. First consumer is Lunegit (a .NET / Avalonia desktop git client); meant for other apps too. Inspired by Velopack but not a clone: it is a reference only, so do not port its design or formats unless `docs/DECISIONS.md` says so.
-Public repo (`lune-rs/lunepack-rs`), dual-licensed MIT OR Apache-2.0. Target platforms and the set of language bindings are not decided yet (see `docs/STATE.md`).
+Pure-Rust installer, packager and auto-updater framework: package releases, build installers, ship full and delta updates, apply an update and restart. First consumer is Lunegit (a desktop git client, currently .NET / Avalonia, expected to move to Rust around Q3-Q4 2027); meant for other apps too. Inspired by Velopack but not a clone: it is a reference only, so do not port its design or formats unless `docs/DECISIONS.md` says so.
+Public repo (`lune-rs/lunepack-rs`), dual-licensed MIT OR Apache-2.0. The primary API is the native Rust crate API; other-language bindings are the last roadmap step. Target platforms are not decided yet (see `docs/STATE.md`).
 
 ## Start here
 
@@ -23,7 +23,7 @@ No code exists yet; the first plan creates the Cargo workspace. Until then every
 ## Architecture rules
 
 Boundary list and crate names are provisional until the first plan confirms them; every path is to be created by the first plan.
-- Rust core, bindings as adapters: `crates/lunepack-core` holds the pure logic and the traits and depends on no adapter or I/O crate. Bindings (C ABI, .NET, Node, ...) are adapter crates over the core (`crates/lunepack-ffi`, ...) and add no logic.
+- Rust core, bindings as adapters: `crates/lunepack-core` holds the pure logic and the traits and depends on no adapter or I/O crate. Bindings (C ABI, .NET, Node, ...; last roadmap step, not near-term) are adapter crates over the core (`crates/lunepack-ffi`, ...) and add no logic.
 - Anything external or replaceable sits behind a trait owned by the core, in core types and the core error enum: filesystem, release source / network, compression and delta codec, hashing and signature verification, OS install / shortcut / autostart, process launch and restart, clock and randomness, logging sink. Implementations: `crates/lunepack-<thing>`.
 - One composition root per shipped binary (e.g. `crates/lunepack-cli/src/main.rs`) wires traits to adapters; nothing else constructs an adapter.
 - Dependencies point inward only (`adapter -> core`). Enforced by the crate graph plus `scripts/check-boundaries.sh` (gate).
