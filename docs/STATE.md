@@ -16,4 +16,4 @@ Nothing in progress. The repo holds docs and config only; no code, no Cargo work
 ## Blockers / open questions
 
 - Target platforms (Windows / macOS / Linux assumed, not confirmed), MSRV and toolchain pin: decided in planning.
-- Fact: the primary API is the native Rust crate API. Other-language bindings (C ABI, .NET, Node, ...) are the last roadmap step. Lunegit is currently .NET (Avalonia) and is expected to move to Rust around Q3-Q4 2027 (date uncertain). The binding set is not decided.
+- Fact: the primary API is the native Rust crate API. Other-language bindings (C ABI, .NET, Node, ...) are the last roadmap step. The binding set is not decided.
