@@ -1,0 +1,8 @@
+# local agent/config state - never commit
+CLAUDE.local.md
+.claude/settings.local.json
+# secrets - keep the example, ignore the rest
+.env*
+!.env.example
+# Rust build output
+/target
