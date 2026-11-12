@@ -19,7 +19,7 @@ trust milestone and the list below stays provisional until then. Decisions behin
 | `lunepack` | The app-facing facade and the composition root for apps that embed lunepack: a builder wires the default adapters, each swappable. | core, adapters |
 | `lunepack-runtime` | Binary: launcher, updater, installer, uninstaller, service. | core, adapters, facade |
 | `lunepack-cli` | Binary `lunepack`: the packager and feed tooling. | core, adapters, facade |
-| `xtask` | Repository tooling: the boundary check and the optional denylist scan. | nothing in the workspace |
+| `xtask` | Repository tooling: the boundary check, the key-container file check and the optional denylist scan. | nothing in the workspace |
 
 A language binding (a C ABI crate, later others) is one more adapter crate over the core and adds no logic.
 Every crate has `publish = false` until a publishing decision is made.
@@ -60,6 +60,9 @@ check does not recognise is a violation, and an internal error exits 2, never 0.
   only differences are `unsafe_code` and an added `undocumented_unsafe_blocks = "deny"`;
 - a root `unsafe_code` that is not `forbid`, and package fields (edition, license, MSRV) that
   differ from the workspace's.
+- a `Cargo.lock` (the workspace's and each `probes/*/`'s) that is missing or resolves any package from
+  somewhere other than crates.io or a workspace path, and any `[patch]` or `[replace]` section: the lock
+  records what cargo actually resolved, so a redirected dependency cannot hide behind `cargo metadata`.
 
 Adding a crate is one line in `ROLES` in `xtask/src/boundaries.rs`.
 
