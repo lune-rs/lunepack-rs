@@ -12,8 +12,11 @@ fn main() -> ExitCode {
             }
             xtask::boundaries::main()
         }
+        Some("denylist-scan") => xtask::denylist::main(args),
         other => {
-            eprintln!("xtask: unknown or missing task {other:?}; tasks: check-boundaries");
+            eprintln!(
+                "xtask: unknown or missing task {other:?}; tasks: check-boundaries, denylist-scan"
+            );
             ExitCode::from(2)
         }
     }
