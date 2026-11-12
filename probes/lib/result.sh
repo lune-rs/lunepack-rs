@@ -100,6 +100,8 @@ probe_begin() { # id
   PROBE_DONE=0
   if [ -n "$PROBE_GUARD_BASIS" ]; then probe_detail guard "$PROBE_GUARD_BASIS"; fi
   trap probe__on_exit EXIT
+  # A cancelled or timed-out step is a SIGINT/SIGTERM: turn it into an exit so the trap runs.
+  trap 'exit 143' INT TERM HUP
 }
 
 # probe_cleanup_on_exit <function>: run <function> (best effort) on exit, then the result trap,
@@ -129,6 +131,38 @@ probe_detail_bool() { # key 0|1 (0 = true, like a shell status)
 probe_finish() { # PASS|FAIL ok|failed
   probe_write "$PROBE_DIR" "$PROBE_ID" "$1" "$2" "$PROBE_DETAILS"
   PROBE_DONE=1
+}
+
+# probe_limited <seconds> <command...>: run a command in its own session with stdin closed and a
+# hard time limit; prints its combined stdout+stderr (at most 4000 bytes) and exits with its status,
+# or 124 after killing the process group on timeout. Never blocks past the limit (plus a few seconds),
+# even when the command or a child hangs waiting for a GUI or a prompt. Needs python3.
+probe_limited() {
+  python3 -I - "$@" <<'PY'
+import os, signal, subprocess, sys
+secs = int(sys.argv[1])
+try:
+    p = subprocess.Popen(sys.argv[2:], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                         stderr=subprocess.STDOUT, start_new_session=True)
+except OSError as e:
+    sys.stdout.write("cannot start: %s\n" % type(e).__name__)
+    sys.exit(127)
+try:
+    out, _ = p.communicate(timeout=secs)
+    rc = p.returncode
+except subprocess.TimeoutExpired:
+    try:
+        os.killpg(p.pid, signal.SIGKILL)
+    except OSError:
+        pass
+    try:
+        out, _ = p.communicate(timeout=3)
+    except Exception:
+        out = b""
+    rc = 124
+sys.stdout.write(out[:4000].decode("utf-8", "replace"))
+sys.exit(rc)
+PY
 }
 
 probe__self_test() {
@@ -181,6 +215,25 @@ PY
   rc=0
   env -u RUNNER_ENVIRONMENT -u ImageOS GITHUB_ACTIONS=true bash -c '. "$1"; probe_guard' _ "$self" >/dev/null 2>&1 || rc=$?
   if [ "$rc" -eq 3 ]; then echo "  ok: guard refuses with no hosted-runner signal"; else echo "  FAIL: no-signal guard (rc=$rc)" >&2; fails=$((fails + 1)); fi
+  # probe_limited: output and status pass through; a hang is killed at the limit.
+  local lim_out lim_rc=0 t0 t1 term_pid
+  lim_out=$(probe_limited 5 sh -c 'echo hi; echo err >&2; exit 3') || lim_rc=$?
+  if [ "$lim_rc" -eq 3 ] && [ "$lim_out" = "$(printf 'hi\nerr')" ]; then echo "  ok: probe_limited passes output and status"; else echo "  FAIL: probe_limited passthrough (rc=$lim_rc)" >&2; fails=$((fails + 1)); fi
+  lim_rc=0
+  t0=$(date +%s)
+  probe_limited 1 sh -c 'sleep 30 & sleep 30' >/dev/null || lim_rc=$?
+  t1=$(date +%s)
+  if [ "$lim_rc" -eq 124 ] && [ $((t1 - t0)) -lt 10 ]; then echo "  ok: probe_limited kills a hang (status 124)"; else echo "  FAIL: probe_limited timeout (rc=$lim_rc, $((t1 - t0))s)" >&2; fails=$((fails + 1)); fi
+  lim_rc=0
+  probe_limited 1 /nonexistent/command >/dev/null || lim_rc=$?
+  if [ "$lim_rc" -eq 127 ]; then echo "  ok: probe_limited reports a missing command (127)"; else echo "  FAIL: probe_limited missing command (rc=$lim_rc)" >&2; fails=$((fails + 1)); fi
+  # SIGTERM during a probe still leaves an INVALID result.
+  PROBE_RESULTS_DIR=$tmp bash -c '. "$1"; probe_begin T-term; sleep 30 & wait' _ "$self" &
+  term_pid=$!
+  sleep 1
+  kill -TERM "$term_pid" 2>/dev/null || true
+  wait "$term_pid" 2>/dev/null || true
+  check "SIGTERM before a verdict writes INVALID" T-term 'r["verdict"]=="INVALID" and "status 143" in r["details"]["error"]'
   rm -rf "$tmp"
   if [ "$fails" -ne 0 ]; then echo "self-test: $fails failed" >&2; return 1; fi
   echo "self-test: all passed"

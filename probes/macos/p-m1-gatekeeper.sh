@@ -9,8 +9,10 @@
 # must not produce the marker (and at least one unquarantined bundle must have launched, so the
 # control is not passing because `open` cannot launch anything); any process a bundle started is
 # killed after the timeout.
-# Verdict PASS when the swapped, unquarantined bundle ran via `open` in both locations. Runner-only
-# (guard). bash 3.2.
+# Verdict PASS when the swapped, unquarantined bundle ran via `open` in both locations. Every
+# external command that could wait on a GUI or a prompt runs under probe_limited (hard time limit),
+# so a launch that cannot be observed ends as INVALID (control failed) with the exit codes recorded,
+# never as a hung job. Runner-only (guard). bash 3.2.
 set -euo pipefail
 
 here=${BASH_SOURCE[0]}
@@ -29,13 +31,14 @@ apps_dir=/Applications
 created_apps=
 py=$(command -v python3)
 wait_seconds=20
+open_seconds=30
 
 # shellcheck disable=SC2086  # created_apps holds space-separated paths without spaces
 cleanup() {
   local app
-  pkill -f "$work/" >/dev/null 2>&1 || true
-  pkill -f '/LpProbeM1' >/dev/null 2>&1 || true
-  for app in $created_apps; do sudo -n rm -rf "$app" >/dev/null 2>&1 || true; done
+  pkill -9 -f "$work/" >/dev/null 2>&1 || true
+  pkill -9 -f '/LpProbeM1' >/dev/null 2>&1 || true
+  for app in $created_apps; do probe_limited 60 sudo -n rm -rf "$app" >/dev/null 2>&1 || true; done
   rm -rf "$work"
 }
 probe_cleanup_on_exit cleanup
@@ -57,7 +60,7 @@ int main(void) {
 }
 CSRC
   exe=$stage/Contents/MacOS/probe
-  cc -o "$exe" "$src"
+  probe_limited 120 cc -o "$exe" "$src" >/dev/null
   cat >"$stage/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -69,10 +72,10 @@ CSRC
   <key>CFBundleVersion</key><string>1</string>
 </dict></plist>
 PLIST
-  codesign --force --sign - "$stage" >/dev/null 2>&1
+  probe_limited 60 codesign --force --sign - "$stage" >/dev/null
   if [ "$mode" = sudo ]; then
-    sudo -n rm -rf "$bundle"
-    sudo -n cp -R "$stage" "$bundle"
+    probe_limited 60 sudo -n rm -rf "$bundle" >/dev/null
+    probe_limited 60 sudo -n cp -R "$stage" "$bundle" >/dev/null
     created_apps="$created_apps $bundle"
   else
     rm -rf "$bundle"
@@ -88,19 +91,22 @@ rc = libc.renamex_np(sys.argv[1].encode(), sys.argv[2].encode(), 0x2)  # RENAME_
 print("swap=ok" if rc == 0 else "swap=error errno=%d" % ctypes.get_errno())
 PY
 
-# launch <bundle> <marker>: `open -n`, wait for the marker, then kill what it started.
-# Sets LAUNCH_RAN to 0 when the marker appeared, 1 otherwise.
+# launch <bundle> <marker>: `open -n` (time-limited), wait for the marker, then kill what it
+# started. Sets LAUNCH_RAN to 0 when the marker appeared, 1 otherwise; records open's exit code
+# (124 = it did not return in time).
 launch() {
-  local bundle=$1 marker=$2 i=0
+  local bundle=$1 marker=$2 i=0 open_rc=0
   rm -f "$marker"
-  open -n "$bundle" >/dev/null 2>&1 || true
+  echo "p-m1: open $(basename "$bundle")"
+  probe_limited "$open_seconds" open -n "$bundle" >/dev/null || open_rc=$?
+  probe_detail "open_$(basename "$bundle" .app)_exit_code" "$open_rc"
   LAUNCH_RAN=1
   while [ "$i" -lt "$wait_seconds" ]; do
     if [ -f "$marker" ]; then LAUNCH_RAN=0; break; fi
     sleep 1
     i=$((i + 1))
   done
-  pkill -f "$bundle/Contents/MacOS/" >/dev/null 2>&1 || true
+  pkill -9 -f "$bundle/Contents/MacOS/" >/dev/null 2>&1 || true
 }
 
 first_line() { # collapse a command's output to one short line
@@ -116,12 +122,12 @@ observe() {
   else
     probe_detail "${label}_quarantine" "absent"
   fi
-  s=$(spctl --assess --type execute -vv "$bundle" 2>&1) || rc=$?
+  s=$(probe_limited 60 spctl --assess --type execute -vv "$bundle") || rc=$?
   probe_detail "${label}_spctl_exit_code" "$rc"
   probe_detail "${label}_spctl_output" "$(printf '%s' "$s" | first_line)"
   if command -v syspolicy_check >/dev/null 2>&1; then
     rc=0
-    s=$(syspolicy_check distribution "$bundle" 2>&1) || rc=$?
+    s=$(probe_limited 60 syspolicy_check distribution "$bundle") || rc=$?
     probe_detail "${label}_syspolicy_check_exit_code" "$rc"
     probe_detail "${label}_syspolicy_check_output" "$(printf '%s' "$s" | first_line)"
   else
@@ -130,7 +136,7 @@ observe() {
 }
 
 probe_detail macos_version "$(sw_vers -productVersion)"
-probe_detail spctl_status "$(spctl --status 2>&1 | first_line)"
+probe_detail spctl_status "$(probe_limited 30 spctl --status | first_line)"
 
 # run_location <label> <dir> <sudo|plain>: build A (v1) and B (v2), swap, observe, launch A.
 # Sets RUN_LOCATION_RAN to 0 when the swapped bundle (now holding v2) ran via `open`.
@@ -142,9 +148,9 @@ run_location() {
   make_app "$a" "$work/marker-$label-a" "$mode"
   make_app "$b" "$marker_b" "$mode"
   if [ "$mode" = sudo ]; then
-    sw=$(sudo -n "$py" "$work/swap.py" "$a" "$b")
+    sw=$(probe_limited 60 sudo -n "$py" "$work/swap.py" "$a" "$b") || sw="$sw swap_exit_code=$?"
   else
-    sw=$("$py" "$work/swap.py" "$a" "$b")
+    sw=$(probe_limited 60 "$py" "$work/swap.py" "$a" "$b") || sw="$sw swap_exit_code=$?"
   fi
   probe_detail "${label}_swap" "$sw"
   observe "${label}_swapped" "$a"
@@ -153,11 +159,14 @@ run_location() {
   RUN_LOCATION_RAN=$LAUNCH_RAN
 }
 
+echo "p-m1: stage temp location"
 run_location temp "$work" plain
 temp_ran=$RUN_LOCATION_RAN
+echo "p-m1: stage /Applications location"
 run_location apps "$apps_dir" sudo
 apps_ran=$RUN_LOCATION_RAN
 
+echo "p-m1: stage quarantined control"
 # --- known-negative control: a quarantined copy ------------------------------------------
 q_bundle=$work/LpProbeM1-quarantined.app
 q_marker=$work/marker-quarantined
@@ -165,7 +174,7 @@ make_app "$q_bundle" "$q_marker" plain
 xattr -w com.apple.quarantine "0083;$(printf '%x' "$(date +%s)");LunepackProbe;" "$q_bundle"
 observe quarantined_copy "$q_bundle"
 q_spctl_rc=0
-spctl --assess --type execute "$q_bundle" >/dev/null 2>&1 || q_spctl_rc=$?
+probe_limited 60 spctl --assess --type execute "$q_bundle" >/dev/null || q_spctl_rc=$?
 launch "$q_bundle" "$q_marker"
 probe_detail_bool control_quarantined_ran "$LAUNCH_RAN"
 
