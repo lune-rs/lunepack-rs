@@ -163,3 +163,60 @@ jobs:
           name: probe-P-W6
           path: probe-results/P-W6.json
           if-no-files-found: error
+
+  p-m1:
+    # Gatekeeper behaviour of updater-swapped bundles can be observed (P4)
+    continue-on-error: true
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Probe
+        shell: bash
+        run: ./probes/macos/p-m1-gatekeeper.sh
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: always()
+        with:
+          name: probe-P-M1
+          path: probe-results/P-M1.json
+          if-no-files-found: error
+
+  p-m2:
+    # a standard user can trigger a socket-activated root daemon (P5; D12 macOS)
+    continue-on-error: true
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Probe
+        shell: bash
+        run: ./probes/macos/p-m2-socket-daemon.sh
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: always()
+        with:
+          name: probe-P-M2
+          path: probe-results/P-M2.json
+          if-no-files-found: error
+
+  p-l1:
+    # a non-root user can trigger a socket-activated root service (D12 Linux)
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Probe
+        shell: bash
+        run: ./probes/linux/p-l1-socket-unit.sh
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: always()
+        with:
+          name: probe-P-L1
+          path: probe-results/P-L1.json
+          if-no-files-found: error

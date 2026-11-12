@@ -37,6 +37,7 @@ PROBE_DONE=1
 PROBE_DETAILS=
 PROBE_DIR=
 PROBE_GUARD_BASIS=
+PROBE_CLEANUP=true
 
 probe__clean() { # collapse newlines/tabs so a value stays on one line
   printf '%s' "$1" | tr '\n\t\r' '   '
@@ -101,6 +102,20 @@ probe_begin() { # id
   trap probe__on_exit EXIT
 }
 
+# probe_cleanup_on_exit <function>: run <function> (best effort) on exit, then the result trap,
+# keeping the script's exit status. Call after probe_begin.
+probe_cleanup_on_exit() {
+  PROBE_CLEANUP=$1
+  trap probe__exit_with_cleanup EXIT
+}
+
+probe__exit_with_cleanup() {
+  local rc=$?
+  "$PROBE_CLEANUP" || true
+  (exit "$rc")
+  probe__on_exit
+}
+
 probe_detail() { # key value
   printf '%s\ts\t%s\n' "$(probe__clean "$1")" "$(probe__clean "$2")" >>"$PROBE_DETAILS"
 }
@@ -147,6 +162,10 @@ PY
   check "death before a verdict writes INVALID with the error" T-die 'r["verdict"]=="INVALID" and "status 7" in r["details"]["error"]'
   PROBE_RESULTS_DIR=$tmp bash -c '. "$1"; probe_begin T-done; probe_finish PASS ok; exit 0' _ "$self"
   check "a finished probe is not overwritten by the trap" T-done 'r["verdict"]=="PASS"'
+  # Cleanup runs on death, and the INVALID result is still written.
+  PROBE_RESULTS_DIR=$tmp bash -c '. "$1"; c() { echo cleaned > "$PROBE_RESULTS_DIR/cleaned.txt"; }; probe_begin T-clean; probe_cleanup_on_exit c; exit 5' _ "$self" || true
+  check "cleanup-on-exit still writes INVALID" T-clean 'r["verdict"]=="INVALID" and "status 5" in r["details"]["error"]'
+  if [ -f "$tmp/cleaned.txt" ]; then echo "  ok: cleanup function ran"; else echo "  FAIL: cleanup function did not run" >&2; fails=$((fails + 1)); fi
   # The guard refuses off a runner and writes nothing.
   local before after rc=0
   before=$(find "$tmp" -type f | wc -l)
