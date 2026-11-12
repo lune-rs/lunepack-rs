@@ -220,3 +220,34 @@ jobs:
           name: probe-P-L1
           path: probe-results/P-L1.json
           if-no-files-found: error
+
+  p-n1:
+    # the default transport (ureq + platform verifier + system proxy) meets D23, on all three OSes
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { id: P-N1-linux, os: ubuntu-latest, shell: bash }
+          - { id: P-N1-macos, os: macos-latest, shell: bash }
+          - { id: P-N1-windows, os: windows-latest, shell: pwsh }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Probe (bash)
+        if: matrix.shell == 'bash'
+        shell: bash
+        run: ./probes/transport/run.sh
+      - name: Probe (pwsh)
+        if: matrix.shell == 'pwsh'
+        shell: pwsh
+        run: ./probes/transport/run.ps1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: always()
+        with:
+          name: probe-${{ matrix.id }}
+          path: probe-results/${{ matrix.id }}.json
+          if-no-files-found: error
