@@ -140,17 +140,26 @@ probe_detail spctl_status "$(probe_limited 30 spctl --status | first_line)"
 
 # run_location <label> <dir> <sudo|plain>: build A (v1) and B (v2), swap, observe, launch A.
 # Sets RUN_LOCATION_RAN to 0 when the swapped bundle (now holding v2) ran via `open`.
+SWAP_HELPER_FAILED=0
 run_location() {
-  local label=$1 dir=$2 mode=$3 a b marker_b sw
+  local label=$1 dir=$2 mode=$3 a b marker_b sw swap_rc
   a=$dir/LpProbeM1-$label-a.app
   b=$dir/LpProbeM1-$label-b.app
   marker_b=$work/marker-$label-b
   make_app "$a" "$work/marker-$label-a" "$mode"
   make_app "$b" "$marker_b" "$mode"
+  # A helper that exits nonzero (timeout 124, crash, refused `sudo -n`) is the instrument failing,
+  # not a platform result: SWAP_HELPER_FAILED makes the control fail (INVALID). The helper's own
+  # "swap=error errno=N" (exit 0) is the OS refusing the swap, a real result, and stays a FAIL.
+  swap_rc=0
   if [ "$mode" = sudo ]; then
-    sw=$(probe_limited 60 sudo -n "$py" "$work/swap.py" "$a" "$b") || sw="$sw swap_exit_code=$?"
+    sw=$(probe_limited 60 sudo -n "$py" "$work/swap.py" "$a" "$b") || swap_rc=$?
   else
-    sw=$(probe_limited 60 "$py" "$work/swap.py" "$a" "$b") || sw="$sw swap_exit_code=$?"
+    sw=$(probe_limited 60 "$py" "$work/swap.py" "$a" "$b") || swap_rc=$?
+  fi
+  if [ "$swap_rc" -ne 0 ]; then
+    sw="$sw swap_exit_code=$swap_rc"
+    SWAP_HELPER_FAILED=1
   fi
   probe_detail "${label}_swap" "$sw"
   observe "${label}_swapped" "$a"
@@ -181,7 +190,10 @@ probe_detail_bool control_quarantined_ran "$LAUNCH_RAN"
 # The negative control only means something if `open` can launch anything at all, so at least one
 # unquarantined bundle must have run; otherwise the instrument is blind and the verdict is INVALID.
 control=failed
-if [ "$q_spctl_rc" -ne 0 ] && [ "$LAUNCH_RAN" -ne 0 ] && { [ "$temp_ran" -eq 0 ] || [ "$apps_ran" -eq 0 ]; }; then
+# Only spctl's real rejection exit (3) counts as "rejected": 124 (hung) and 127 (cannot start) mean
+# spctl was blind, so the control fails. A failed swap helper also fails the control.
+if [ "$q_spctl_rc" -eq 3 ] && [ "$LAUNCH_RAN" -ne 0 ] && [ "$SWAP_HELPER_FAILED" -eq 0 ] \
+  && { [ "$temp_ran" -eq 0 ] || [ "$apps_ran" -eq 0 ]; }; then
   control=ok
 fi
 verdict=FAIL
