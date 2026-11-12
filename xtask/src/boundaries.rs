@@ -101,11 +101,25 @@ impl fmt::Display for Violation {
     }
 }
 
-/// Parsed manifests: the root and each member, keyed by the member's `manifest_path`.
+/// Parsed manifests: the root and each member, keyed by the member's `manifest_path`, plus the
+/// workspace's `Cargo.lock` (`None` when there is none, which is itself a violation).
 #[derive(Debug, Default)]
 pub struct Manifests {
     pub root: toml::Table,
     pub members: BTreeMap<String, toml::Table>,
+    pub lock: Option<toml::Table>,
+    /// Standalone probe crates under `probes/*/` (outside the workspace): label (`probes/<dir>`),
+    /// manifest and lock file. They build on runners with elevated rights, so their sources
+    /// are held to the same rule.
+    pub probes: Vec<ProbeCrate>,
+}
+
+/// A standalone crate under `probes/`.
+#[derive(Debug, Default)]
+pub struct ProbeCrate {
+    pub label: String,
+    pub manifest: toml::Table,
+    pub lock: Option<toml::Table>,
 }
 
 fn read_table(path: &Path) -> Result<toml::Table> {
@@ -139,12 +153,58 @@ pub fn metadata_json(dir: &Path) -> Result<String> {
     String::from_utf8(out.stdout).context("cargo metadata output is not UTF-8")
 }
 
+/// Every `probes/<dir>/Cargo.toml` (a directory without one is ignored: scripts live there too).
+fn load_probe_crates(workspace_root: &Path) -> Result<Vec<ProbeCrate>> {
+    let dir = workspace_root.join("probes");
+    let mut out = Vec::new();
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+        Err(e) => bail!("cannot read {}: {e}", dir.display()),
+    };
+    for entry in entries {
+        let path = entry
+            .with_context(|| format!("cannot read {}", dir.display()))?
+            .path();
+        let manifest_path = path.join("Cargo.toml");
+        if !manifest_path.is_file() {
+            continue;
+        }
+        let lock_path = path.join("Cargo.lock");
+        out.push(ProbeCrate {
+            label: format!("probes/{}", entry_name(&path)),
+            manifest: read_table(&manifest_path)?,
+            lock: if lock_path.is_file() {
+                Some(read_table(&lock_path)?)
+            } else {
+                None
+            },
+        });
+    }
+    out.sort_by(|a, b| a.label.cmp(&b.label));
+    Ok(out)
+}
+
+fn entry_name(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
 /// Read the root manifest and every member manifest named by the metadata.
 pub fn load_manifests(metadata_json: &str) -> Result<Manifests> {
     let md = MetadataCommand::parse(metadata_json).context("cannot parse cargo metadata output")?;
+    let lock_path = md.workspace_root.join("Cargo.lock");
+    let lock = if lock_path.as_std_path().exists() {
+        Some(read_table(lock_path.as_std_path())?)
+    } else {
+        None
+    };
     let mut manifests = Manifests {
         root: read_table(md.workspace_root.join("Cargo.toml").as_std_path())?,
         members: BTreeMap::new(),
+        lock,
+        probes: load_probe_crates(md.workspace_root.as_std_path())?,
     };
     for pkg in &md.packages {
         let table = read_table(pkg.manifest_path.as_std_path())?;
@@ -188,6 +248,7 @@ pub fn check(metadata_json: &str, manifests: &Manifests) -> Result<Vec<Violation
         .collect();
 
     check_root(&md, manifests, &mut out)?;
+    check_lock(manifests, &mut out);
     for pkg in &md.packages {
         check_package(pkg, &member_dirs, manifests, &mut out)?;
     }
@@ -244,6 +305,78 @@ fn check_root(md: &Metadata, manifests: &Manifests, out: &mut Vec<Violation>) ->
         }
     }
     Ok(())
+}
+
+/// Every package cargo resolved comes from the workspace (no `source`) or from crates.io.
+/// `cargo metadata --no-deps` only reports declared dependencies, so a root `[patch]`,
+/// `[replace]` or a config-level patch that redirects a dependency to a git or path source is
+/// invisible there; the lock file records what was actually resolved. `[patch]` and `[replace]`
+/// in the root manifest are flagged as well (a deliberate one needs an allowlist entry here).
+fn check_lock(manifests: &Manifests, out: &mut Vec<Violation>) {
+    check_lock_for(
+        WORKSPACE_LABEL,
+        &manifests.root,
+        manifests.lock.as_ref(),
+        out,
+    );
+    for probe in &manifests.probes {
+        check_lock_for(&probe.label, &probe.manifest, probe.lock.as_ref(), out);
+    }
+}
+
+fn check_lock_for(
+    label: &str,
+    manifest: &toml::Table,
+    lock: Option<&toml::Table>,
+    out: &mut Vec<Violation>,
+) {
+    for key in ["patch", "replace"] {
+        if manifest.contains_key(key) {
+            out.push(v(
+                label,
+                "patch",
+                format!("the manifest has a [{key}] section"),
+            ));
+        }
+    }
+    let Some(lock) = lock else {
+        out.push(v(
+            label,
+            "lockfile",
+            "Cargo.lock is missing: dependency sources cannot be verified",
+        ));
+        return;
+    };
+    let Some(packages) = lock.get("package").and_then(|p| p.as_array()) else {
+        out.push(v(label, "lockfile", "Cargo.lock has no [[package]] array"));
+        return;
+    };
+    for entry in packages {
+        let Some(table) = entry.as_table() else {
+            out.push(v(label, "lockfile", "a [[package]] entry is not a table"));
+            continue;
+        };
+        let Some(name) = table.get("name").and_then(|n| n.as_str()) else {
+            out.push(v(label, "lockfile", "a [[package]] entry has no name"));
+            continue;
+        };
+        match table.get("source") {
+            None => {}
+            Some(toml::Value::String(src)) if src == CRATES_IO_SOURCE => {}
+            Some(toml::Value::String(src)) => out.push(v(
+                name,
+                "lock-source",
+                format!(
+                    "Cargo.lock ({label}) resolves `{name}` from {src}, not crates.io or a workspace path"
+                ),
+            )),
+            Some(_) => out.push(v(
+                name,
+                "lock-source",
+                "Cargo.lock `source` is not a string",
+            )),
+        }
+    }
 }
 
 fn check_package(

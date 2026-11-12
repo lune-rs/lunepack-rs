@@ -60,6 +60,8 @@ undocumented_unsafe_blocks = "deny"
     struct Fx {
         root: String,
         crates: BTreeMap<String, String>,
+        /// Extra `[[package]]` tables for the fixture's `Cargo.lock`; `None` writes no lock file.
+        lock_extra: Option<String>,
     }
 
     impl Fx {
@@ -97,6 +99,7 @@ undocumented_unsafe_blocks = "deny"
             Fx {
                 root: ROOT.to_string(),
                 crates,
+                lock_extra: Some(String::new()),
             }
         }
 
@@ -129,6 +132,16 @@ undocumented_unsafe_blocks = "deny"
             fs::write(outside.join("src/lib.rs"), "").unwrap();
             fs::create_dir_all(&root).unwrap();
             fs::write(root.join("Cargo.toml"), &self.root).unwrap();
+            if let Some(extra) = &self.lock_extra {
+                let mut lock = String::from("version = 4\n");
+                for name in self.crates.keys() {
+                    lock.push_str(&format!(
+                        "\n[[package]]\nname = \"{name}\"\nversion = \"0.0.0\"\n"
+                    ));
+                }
+                lock.push_str(extra);
+                fs::write(root.join("Cargo.lock"), lock).unwrap();
+            }
             for (name, text) in &self.crates {
                 let c = root.join("crates").join(name);
                 fs::create_dir_all(c.join("src")).unwrap();
@@ -413,6 +426,101 @@ undocumented_unsafe_blocks = "deny"
 
         let out = xtask_in(dir.path(), &["no-such-task"]);
         assert_eq!(out.status.code(), Some(2));
+    }
+
+    // F3: sources come from Cargo.lock, so [patch] / [replace] cannot hide a git dependency ----
+    const CRATES_IO: &str = "registry+https://github.com/rust-lang/crates.io-index";
+
+    #[test]
+    fn t_lock_with_crates_io_packages_is_clean() {
+        let mut fx = Fx::clean();
+        fx.lock_extra = Some(format!(
+            "\n[[package]]\nname = \"anyhow\"\nversion = \"1.0.0\"\nsource = \"{CRATES_IO}\"\nchecksum = \"00\"\n"
+        ));
+        assert_clean(&fx.run().1);
+    }
+
+    #[test]
+    fn t_patch_to_git_is_rejected_by_the_lock_and_the_patch_rule() {
+        let mut fx = Fx::clean();
+        fx.root.push_str(
+            "\n[patch.crates-io]\nanyhow = { git = \"https://example.invalid/anyhow.git\" }\n",
+        );
+        fx.lock_extra = Some(
+            "\n[[package]]\nname = \"anyhow\"\nversion = \"1.0.0\"\n\
+             source = \"git+https://example.invalid/anyhow.git#0123456789abcdef0123456789abcdef01234567\"\n"
+                .to_string(),
+        );
+        let (_, vs) = fx.run();
+        assert_has(&vs, "anyhow", "lock-source");
+        assert_has(&vs, "<workspace>", "patch");
+    }
+
+    #[test]
+    fn t_replace_section_is_rejected() {
+        let mut fx = Fx::clean();
+        fx.root
+            .push_str("\n[replace]\n\"anyhow:1.0.0\" = { path = \"../elsewhere\" }\n");
+        assert_has(&fx.run().1, "<workspace>", "patch");
+    }
+
+    #[test]
+    fn t_lock_source_that_is_not_crates_io_is_rejected_without_a_patch_section() {
+        // e.g. a config-level `[patch]` in .cargo/config.toml, which leaves the manifests clean
+        let mut fx = Fx::clean();
+        fx.lock_extra = Some(
+            "\n[[package]]\nname = \"serde\"\nversion = \"1.0.0\"\n\
+             source = \"registry+https://example.invalid/index\"\n"
+                .to_string(),
+        );
+        assert_has(&fx.run().1, "serde", "lock-source");
+    }
+
+    #[test]
+    fn t_probe_crates_are_held_to_the_same_source_rule() {
+        let fx = Fx::clean();
+        let dir = fx.write();
+        let probe = dir.path().join("probes").join("demo");
+        fs::create_dir_all(probe.join("src")).unwrap();
+        fs::write(probe.join("Cargo.toml"), manifest("demo", "", "")).unwrap();
+        fs::write(probe.join("src/lib.rs"), "").unwrap();
+        // no lock file: a violation
+        let (_, vs) = check_workspace(dir.path()).expect("check");
+        assert_has(&vs, "probes/demo", "lockfile");
+        // a lock with a git source, and a [patch] in the probe manifest
+        fs::write(
+            probe.join("Cargo.lock"),
+            "version = 4\n\n[[package]]\nname = \"ring\"\nversion = \"0.17.0\"\n\
+             source = \"git+https://example.invalid/ring.git#0123456789abcdef0123456789abcdef01234567\"\n",
+        )
+        .unwrap();
+        fs::write(
+            probe.join("Cargo.toml"),
+            format!(
+                "{}\n[patch.crates-io]\nring = {{ git = \"https://example.invalid/ring.git\" }}\n",
+                manifest("demo", "", "")
+            ),
+        )
+        .unwrap();
+        let (_, vs) = check_workspace(dir.path()).expect("check");
+        assert_has(&vs, "ring", "lock-source");
+        assert_has(&vs, "probes/demo", "patch");
+        // a clean probe lock passes
+        fs::write(probe.join("Cargo.toml"), manifest("demo", "", "")).unwrap();
+        fs::write(
+            probe.join("Cargo.lock"),
+            format!("version = 4\n\n[[package]]\nname = \"demo\"\nversion = \"0.0.0\"\n\n[[package]]\nname = \"ring\"\nversion = \"0.17.0\"\nsource = \"{CRATES_IO}\"\n"),
+        )
+        .unwrap();
+        let (_, vs) = check_workspace(dir.path()).expect("check");
+        assert_clean(&vs);
+    }
+
+    #[test]
+    fn t_missing_lock_file_is_a_violation() {
+        let mut fx = Fx::clean();
+        fx.lock_extra = None;
+        assert_has(&fx.run().1, "<workspace>", "lockfile");
     }
 
     #[test]
