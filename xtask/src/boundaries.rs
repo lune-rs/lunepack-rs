@@ -31,7 +31,7 @@ pub const ROLES: &[(&str, Role)] = &[
     ("lunepack-core", Role::Core),
     ("lunepack-testkit", Role::Testkit),
     ("lunepack-crypto", Role::Adapter),
-    ("lunepack-codec-zstd", Role::Adapter),
+    ("lunepack-codec-lzma", Role::Adapter),
     ("lunepack-fs", Role::Adapter),
     ("lunepack-http", Role::Adapter),
     ("lunepack-os-windows", Role::Adapter),

@@ -12,7 +12,7 @@ trust milestone and the list below stays provisional until then. Decisions behin
 | `lunepack-core` | Types, rules, verification policy, planning, state machine, apply engine; owns every trait and the error enum. No I/O, clock, randomness or network of its own. | nothing external beyond an explicit allowlist (empty today) |
 | `lunepack-testkit` | In-memory fakes (including a crash-injecting filesystem, a faulty Range transport, a fake clock) and the contract suites. `publish = false`. | core |
 | `lunepack-crypto` | Hashing, signature verification and signing adapters. | core |
-| `lunepack-codec-zstd` | Compression and delta codec adapter. | core |
+| `lunepack-codec-lzma` | Compression and delta codec adapter. | core |
 | `lunepack-fs` | Filesystem adapter. | core |
 | `lunepack-http` | Release source and network adapter. | core |
 | `lunepack-os-windows`, `lunepack-os-macos`, `lunepack-os-linux` | OS install, shortcut, autostart and process adapters. | core |
