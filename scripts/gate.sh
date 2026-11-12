@@ -4,17 +4,18 @@
 # Env: LUNEPACK_REQUIRE_SHELLCHECK=1  fail when shellcheck is missing (default: notice, skip)
 #      LUNEPACK_GATE_DOCKER=0         skip the Docker Linux suite
 # The Docker stage runs only when `docker info` succeeds, CI is unset and LUNEPACK_GATE_DOCKER
-# is not 0 (CI has a native Linux job). It touches only its own --rm container and two named
-# volumes; it never prunes and never touches other containers, images or volumes.
+# is not 0 (CI has a native Linux job). It touches only its own --rm container, the image
+# `lunepack-rs-gate:<hash>` it builds from scripts/gate.Dockerfile, and two named volumes; it
+# never prunes and never touches other containers, images or volumes.
 # bash 3.2 compatible.
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 top=$PWD
 
-# rust:1.99.1-slim-trixie, resolved 2026-11-12 with `docker pull` + `docker inspect`
-# (RepoDigests). The tag alone is not trusted; the digest is.
-IMAGE='rust:1.99.1-slim-trixie@sha256:f6c4a35d21dbb3c89d7a8d056c193e94fc09037f2b58dd858b09c39a47dd02d7'
+# The Docker stage runs in a small derived image: scripts/gate.Dockerfile (the pinned
+# rust:1.99.1-slim-trixie digest plus git). It is built only when the local tag, derived from the
+# Dockerfile's hash, is missing; nothing is ever pruned or removed.
 TARGET_VOLUME=lunepack-rs-gate-target
 CARGO_VOLUME=lunepack-rs-gate-cargo
 
@@ -63,13 +64,27 @@ fi
 if [ -n "$skip_reason" ]; then
   echo "gate: NOTICE docker linux suite skipped: $skip_reason"
 else
+  # Derived image, tagged with the Dockerfile's hash; built once per Dockerfile change.
+  dockerfile=scripts/gate.Dockerfile
+  if command -v shasum >/dev/null 2>&1; then
+    hash=$(shasum -a 256 "$dockerfile" | cut -c 1-12)
+  else
+    hash=$(sha256sum "$dockerfile" | cut -c 1-12)
+  fi
+  image=lunepack-rs-gate:$hash
+  if docker image inspect "$image" >/dev/null 2>&1; then
+    echo "gate: using docker image $image"
+  else
+    echo "gate: building docker image $image from $dockerfile"
+    docker build --quiet -t "$image" - <"$dockerfile" >/dev/null
+  fi
   # Source read-only; target and cargo registry in named volumes. RUSTUP_TOOLCHAIN makes
   # rustup use the image's own 1.99.1 instead of installing the components and targets that
-  # rust-toolchain.toml lists (this stage runs only `cargo test`). No host env is passed.
-  # The slim image has no git, which the xtask tests drive, so it is installed from the
-  # Debian archive first (apt needs the default root capabilities, so none are dropped).
+  # rust-toolchain.toml lists (this stage runs only `cargo test`). No host env is passed, no
+  # capabilities, no new privileges, no apt or network setup at run time.
   docker run --rm \
     --name "lunepack-rs-gate-$$" \
+    --cap-drop ALL \
     --security-opt no-new-privileges \
     -v "$top":/src:ro \
     -v "$TARGET_VOLUME":/target \
@@ -78,8 +93,8 @@ else
     -e CARGO_HOME=/cargo-home \
     -e RUSTUP_TOOLCHAIN=1.99.1 \
     -w /src \
-    "$IMAGE" \
-    bash -c 'apt-get update -qq >/dev/null && apt-get install -y -qq --no-install-recommends git >/dev/null && exec cargo test --workspace --locked'
+    "$image" \
+    cargo test --workspace --locked
 fi
 
 echo
