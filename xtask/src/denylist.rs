@@ -712,8 +712,7 @@ pub fn run(args: &Args, get_env: impl Fn(&str) -> Option<OsString>) -> Result<u8
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_else(|| common.clone());
-    let canon = path
-        .canonicalize()
+    let canon = crate::paths::canonicalize(&path)
         .with_context(|| format!("cannot resolve denylist path {}", path.display()))?;
     if canon.starts_with(&top) || canon.starts_with(&main_checkout) {
         bail!(
@@ -754,8 +753,7 @@ fn abs_git_path(git: &Git, what: &str, flag: &str) -> Result<PathBuf> {
     if line.is_empty() {
         bail!("git rev-parse {what} returned nothing");
     }
-    PathBuf::from(line)
-        .canonicalize()
+    crate::paths::canonicalize(&PathBuf::from(line))
         .with_context(|| format!("cannot resolve the repository {what}"))
 }
 

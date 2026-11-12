@@ -3,3 +3,4 @@
 pub mod boundaries;
 pub mod denylist;
 pub mod keyfiles;
+pub mod paths;

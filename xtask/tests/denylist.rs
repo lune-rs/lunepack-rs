@@ -87,7 +87,7 @@ mod denylist {
     impl Fx {
         fn new() -> Fx {
             let tmp = tempfile::tempdir().expect("tempdir");
-            let root = tmp.path().canonicalize().unwrap();
+            let root = xtask::paths::canonicalize(tmp.path()).unwrap();
             let fx = Fx {
                 repo: root.join("repo"),
                 home: root.join("home"),

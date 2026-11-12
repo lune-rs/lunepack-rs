@@ -23,7 +23,7 @@ mod keyfiles {
     impl Fx {
         fn new() -> Fx {
             let tmp = tempfile::tempdir().unwrap();
-            let root = tmp.path().canonicalize().unwrap();
+            let root = xtask::paths::canonicalize(tmp.path()).unwrap();
             let fx = Fx {
                 repo: root.join("repo"),
                 gitconfig: root.join("gitconfig"),
@@ -39,6 +39,12 @@ mod keyfiles {
             let mut c = Command::new(program);
             c.env_clear();
             c.env("PATH", std::env::var_os("PATH").unwrap_or_default());
+            #[cfg(windows)]
+            for key in ["SystemRoot", "SYSTEMROOT", "TEMP", "TMP"] {
+                if let Some(v) = std::env::var_os(key) {
+                    c.env(key, v);
+                }
+            }
             c.env("GIT_CONFIG_GLOBAL", &self.gitconfig);
             c.env("GIT_CONFIG_NOSYSTEM", "1");
             c.env("GIT_AUTHOR_NAME", "Synth Author");
@@ -202,7 +208,7 @@ mod keyfiles {
         assert_eq!(fx.scan(&["--all", "--range", "HEAD"]).code, 2);
         assert_eq!(fx.scan(&["--range", "no-such-ref..HEAD"]).code, 2);
         let plain = tempfile::tempdir().unwrap();
-        let cwd = plain.path().canonicalize().unwrap();
+        let cwd = xtask::paths::canonicalize(plain.path()).unwrap();
         assert_eq!(fx.scan_in(&cwd, &[]).code, 2);
     }
 
