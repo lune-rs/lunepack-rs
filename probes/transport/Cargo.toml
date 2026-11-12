@@ -1,0 +1,20 @@
+[package]
+name = "transport-probe"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+description = "P-N1 probe: does the default transport (ureq + platform verifier + system proxy) meet D23 (throwaway, runner-only use)"
+
+[dependencies]
+ureq = { version = "3.5", features = ["platform-verifier", "win-system-proxy"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+time = "0.3"
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring", "pem"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+hyper-util = { version = "0.1", features = ["client-proxy", "client-proxy-system"] }
+http = "1"
+
+# Standalone: not part of the lunepack workspace.
+[workspace]

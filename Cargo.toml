@@ -1,0 +1,33 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "xtask"]
+exclude = ["probes"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/lune-rs/lunepack-rs"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+
+[workspace.dependencies]
+lunepack-core = { path = "crates/lunepack-core" }
+lunepack-testkit = { path = "crates/lunepack-testkit" }
+lunepack-crypto = { path = "crates/lunepack-crypto" }
+lunepack-codec-zstd = { path = "crates/lunepack-codec-zstd" }
+lunepack-fs = { path = "crates/lunepack-fs" }
+lunepack-http = { path = "crates/lunepack-http" }
+lunepack-os-windows = { path = "crates/lunepack-os-windows" }
+lunepack-os-macos = { path = "crates/lunepack-os-macos" }
+lunepack-os-linux = { path = "crates/lunepack-os-linux" }
+lunepack = { path = "crates/lunepack" }
+lunepack-runtime = { path = "crates/lunepack-runtime" }
+lunepack-cli = { path = "crates/lunepack-cli" }

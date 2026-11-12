@@ -1,0 +1,257 @@
+name: probes
+
+on:
+  push:
+    branches: [main, 'orch/**']
+    paths: ['probes/**', '.github/workflows/probes.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: probes-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  p-r0:
+    # Runner facts: admin rights, OS and image versions. Control: a non-admin identity is not admin.
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { id: P-R0-linux, os: ubuntu-latest, shell: bash }
+          - { id: P-R0-macos, os: macos-latest, shell: bash }
+          - { id: P-R0-windows, os: windows-latest, shell: pwsh }
+    runs-on: ${{ matrix.os }}
+    steps:
+      # actions/checkout v7.0.1 (lightweight tag, resolves directly to the commit)
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Self-test the result writer
+        if: matrix.shell == 'bash'
+        shell: bash
+        run: bash probes/lib/result.sh --self-test
+      - name: Probe (bash)
+        if: matrix.shell == 'bash'
+        shell: bash
+        run: ./probes/runner-facts/facts.sh
+      - name: Probe (pwsh)
+        if: matrix.shell == 'pwsh'
+        shell: pwsh
+        run: ./probes/runner-facts/facts.ps1
+      # actions/upload-artifact v7.0.2 (lightweight tag, resolves directly to the commit)
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: always()
+        with:
+          name: probe-${{ matrix.id }}
+          path: probe-results/${{ matrix.id }}.json
+          if-no-files-found: error
+
+  p-w1:
+    # a running .exe can be renamed (M6 self-replace)
+    continue-on-error: true
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Probe
+        shell: pwsh
+        run: ./probes/windows/p-w1-rename-running.ps1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: always()
+        with:
+          name: probe-P-W1
+          path: probe-results/P-W1.json
+          if-no-files-found: error
+
+  p-w2:
+    # an HKCU Uninstall entry is listed by Get-Package (D11); Windows PowerShell 5.1
+    continue-on-error: true
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Probe
+        shell: powershell
+        run: ./probes/windows/p-w2-hkcu-uninstall.ps1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: always()
+        with:
+          name: probe-P-W2
+          path: probe-results/P-W2.json
+          if-no-files-found: error
+
+  p-w3:
+    # editpe stamping (VERSIONINFO + icon) survives Authenticode signing (D11); Windows PowerShell 5.1
+    continue-on-error: true
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Probe
+        shell: powershell
+        run: ./probes/windows/p-w3-stamp-sign.ps1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: always()
+        with:
+          name: probe-P-W3
+          path: probe-results/P-W3.json
+          if-no-files-found: error
+
+  p-w4:
+    # Defender can run on the runner (P3); control: anti-malware test file detected
+    continue-on-error: true
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Probe
+        shell: powershell
+        run: ./probes/windows/p-w4-defender.ps1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: always()
+        with:
+          name: probe-P-W4
+          path: probe-results/P-W4.json
+          if-no-files-found: error
+
+  p-w5:
+    # a standard user can start a SYSTEM service or task (D12 Windows)
+    continue-on-error: true
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Probe
+        shell: powershell
+        run: ./probes/windows/p-w5-start-system.ps1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: always()
+        with:
+          name: probe-P-W5
+          path: probe-results/P-W5.json
+          if-no-files-found: error
+
+  p-w6:
+    # pipe ACL plus impersonation confine a SYSTEM service to the caller (C8)
+    continue-on-error: true
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Probe
+        shell: powershell
+        run: ./probes/windows/p-w6-pipe-impersonation.ps1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: always()
+        with:
+          name: probe-P-W6
+          path: probe-results/P-W6.json
+          if-no-files-found: error
+
+  p-m1:
+    # Gatekeeper behaviour of updater-swapped bundles can be observed (P4)
+    continue-on-error: true
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Probe
+        # a step timeout (not the job's) so the artifact upload below still runs
+        timeout-minutes: 12
+        shell: bash
+        run: ./probes/macos/p-m1-gatekeeper.sh
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: always()
+        with:
+          name: probe-P-M1
+          path: probe-results/P-M1.json
+          if-no-files-found: error
+
+  p-m2:
+    # a standard user can trigger a socket-activated root daemon (P5; D12 macOS)
+    continue-on-error: true
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Probe
+        shell: bash
+        run: ./probes/macos/p-m2-socket-daemon.sh
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: always()
+        with:
+          name: probe-P-M2
+          path: probe-results/P-M2.json
+          if-no-files-found: error
+
+  p-l1:
+    # a non-root user can trigger a socket-activated root service (D12 Linux)
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Probe
+        shell: bash
+        run: ./probes/linux/p-l1-socket-unit.sh
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: always()
+        with:
+          name: probe-P-L1
+          path: probe-results/P-L1.json
+          if-no-files-found: error
+
+  p-n1:
+    # the default transport (ureq + platform verifier + system proxy) meets D23, on all three OSes
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { id: P-N1-linux, os: ubuntu-latest, shell: bash }
+          - { id: P-N1-macos, os: macos-latest, shell: bash }
+          - { id: P-N1-windows, os: windows-latest, shell: pwsh }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Probe (bash)
+        if: matrix.shell == 'bash'
+        timeout-minutes: 15
+        shell: bash
+        run: ./probes/transport/run.sh
+      - name: Probe (pwsh)
+        if: matrix.shell == 'pwsh'
+        timeout-minutes: 15
+        shell: pwsh
+        run: ./probes/transport/run.ps1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: always()
+        with:
+          name: probe-${{ matrix.id }}
+          path: probe-results/${{ matrix.id }}.json
+          if-no-files-found: error
