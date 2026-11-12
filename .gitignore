@@ -10,3 +10,15 @@ CLAUDE.local.md
 .claude/worktrees/
 probe-results/
 /probes/*/target/
+# key containers (the secret check also fails on a tracked path with these extensions)
+*.pfx
+*.p12
+*.p8
+*.key
+*.pem
+*.jks
+*.keystore
+*.der
+*.pk8
+*.pkcs12
+*.ppk

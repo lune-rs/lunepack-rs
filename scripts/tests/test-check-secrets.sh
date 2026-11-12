@@ -101,6 +101,60 @@ run_in "$REPO" "$SCRIPT" --range "$base..HEAD"
 t_check "range with a planted key: nonzero" rc_nonzero
 t_check "range with a planted key: body not in output" out_lacks "$BODY_MARK"
 
+# --- S1: a credential added only in a merge commit (and gone from the tip) -------------------
+new_repo evilmerge
+commit_file "$REPO" a.txt "one" "first"
+em_base=$(g -C "$REPO" rev-parse HEAD)
+g -C "$REPO" branch side
+g -C "$REPO" checkout -q side
+commit_file "$REPO" side.txt "side" "side work"
+g -C "$REPO" checkout -q main
+commit_file "$REPO" main.txt "main" "main work"
+g -C "$REPO" merge --no-commit --no-ff -q side
+printf '%s\n' "$PEM" >"$REPO/merged-key.txt"
+g -C "$REPO" add merged-key.txt
+g -C "$REPO" commit -q -m "merge side"
+g -C "$REPO" rm -q -f merged-key.txt
+g -C "$REPO" commit -q -m "drop it again"
+run_in "$REPO" "$SCRIPT"
+t_check "evil merge (history mode): nonzero" rc_nonzero
+t_check "evil merge (history mode): the history scan names gitleaks" out_has "gitleaks FAILED"
+t_check "evil merge (history mode): body not in output" out_lacks "$BODY_MARK"
+run_in "$REPO" "$SCRIPT" --range "$em_base..HEAD"
+t_check "evil merge (--range): nonzero" rc_nonzero
+t_check "evil merge (--range): the history scan names gitleaks" out_has "gitleaks FAILED"
+t_check "evil merge (--range): body not in output" out_lacks "$BODY_MARK"
+
+# --- S2: key containers and text secrets in binary-classified files -----------------------
+new_repo keycontainer
+commit_file "$REPO" a.txt "one" "first"
+printf 'PK\000\001binary-container-bytes\000' >"$REPO/signing.pfx"
+g -C "$REPO" add signing.pfx
+g -C "$REPO" commit -q -m "add a container"
+run_in "$REPO" "$SCRIPT"
+t_check "tracked .pfx: nonzero" rc_nonzero
+t_check "tracked .pfx: key-files named" out_has "key-files FAILED"
+t_check "tracked .pfx: the file name is not echoed" out_lacks "signing"
+run_in "$REPO" "$SCRIPT" --staged
+t_check "tracked .pfx (--staged): nonzero" rc_nonzero
+g -C "$REPO" rm -q -f signing.pfx
+g -C "$REPO" commit -q -m "remove it again"
+run_in "$REPO" "$SCRIPT"
+t_check "container removed from the tip but still in history: nonzero" rc_nonzero
+t_check "container in history: key-files named" out_has "key-files FAILED"
+run_in "$REPO" "$SCRIPT" --range "HEAD~1..HEAD"
+t_check "range that deletes the container: nonzero (the path is changed)" rc_nonzero
+
+new_repo binarytext
+commit_file "$REPO" a.txt "one" "first"
+{ printf 'x\000y\n'; printf '%s\n' "$PEM"; } >"$REPO/notes.dat"
+g -C "$REPO" add notes.dat
+g -C "$REPO" commit -q -m "binary-classified file holding a key"
+run_in "$REPO" "$SCRIPT"
+t_check "key inside a NUL-bearing file: nonzero" rc_nonzero
+t_check "key inside a NUL-bearing file: tracked-files scan named" out_has "gitleaks (tracked files) FAILED"
+t_check "key inside a NUL-bearing file: body not in output" out_lacks "$BODY_MARK"
+
 # --- denylist term in a commit ---------------------------------------------------------
 new_repo deny
 commit_file "$REPO" ok.txt "fine" "init"
