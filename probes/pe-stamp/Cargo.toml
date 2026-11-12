@@ -1,0 +1,21 @@
+[package]
+name = "pe-stamp"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+description = "P-W3 probe: stamp VERSIONINFO and an icon into a minimal exe (throwaway, runner-only use)"
+
+[[bin]]
+name = "pe-stamp"
+path = "src/main.rs"
+
+[[bin]]
+name = "hello"
+path = "src/bin/hello.rs"
+
+[dependencies]
+editpe = "=0.2.4"
+
+# Standalone: not part of the lunepack workspace.
+[workspace]

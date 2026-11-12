@@ -88,6 +88,25 @@ jobs:
           path: probe-results/P-W2.json
           if-no-files-found: error
 
+  p-w3:
+    # editpe stamping (VERSIONINFO + icon) survives Authenticode signing (D11); Windows PowerShell 5.1
+    continue-on-error: true
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Probe
+        shell: powershell
+        run: ./probes/windows/p-w3-stamp-sign.ps1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: always()
+        with:
+          name: probe-P-W3
+          path: probe-results/P-W3.json
+          if-no-files-found: error
+
   p-w4:
     # Defender can run on the runner (P3); control: anti-malware test file detected
     continue-on-error: true
