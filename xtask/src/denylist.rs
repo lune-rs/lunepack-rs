@@ -112,6 +112,21 @@ impl Rules {
         self.0.is_empty()
     }
 
+    /// True when the text contains any single term of any rule (case-insensitively). Used to
+    /// decide what may be printed: a text that merely contains one term of a multi-term rule
+    /// would still tell the reader which word is on the list.
+    pub fn mentions_any_term(&self, text: &str) -> bool {
+        if self.0.is_empty() {
+            return false;
+        }
+        let lower = text.to_lowercase();
+        let stripped: String = lower.chars().filter(|c| *c != '\0').collect();
+        self.0
+            .iter()
+            .flat_map(|r| r.terms.iter())
+            .any(|t| lower.contains(t.as_str()) || stripped.contains(t.as_str()))
+    }
+
     /// Ids of the rules the line hits (every term a substring, case-insensitively).
     pub fn hits(&self, line: &str) -> Vec<usize> {
         if self.0.is_empty() {
@@ -165,7 +180,7 @@ fn clean(path: &str) -> String {
 }
 
 fn shown_path(rules: &Rules, path: &str, k: usize) -> String {
-    if rules.hits(path).is_empty() {
+    if !rules.mentions_any_term(path) {
         clean(path)
     } else {
         format!("<redacted path #{k}>")
@@ -210,21 +225,61 @@ impl<'a> Scan<'a> {
         }
     }
 
-    /// Match one line; record a hit for each rule it satisfies.
+    /// Match one line; record a hit for each rule it satisfies. A line holding NUL bytes is
+    /// also matched with the NULs removed, which exposes ASCII text in UTF-16 (LE or BE,
+    /// whatever the line splitting) that the lossy UTF-8 view interleaves with NULs.
     fn line(&mut self, text: &str, loc: impl Fn() -> Loc) {
         for rule in self.rules.hits(text) {
             self.push(loc(), rule);
         }
+        if text.contains('\0') {
+            let stripped: String = text.chars().filter(|c| *c != '\0').collect();
+            for rule in self.rules.hits(&stripped) {
+                self.push(loc(), rule);
+            }
+        }
     }
 
-    /// Match every line of `bytes` (split on `\n`, trailing `\r` removed, lossy UTF-8).
+    /// Match every line of `bytes` (split on `\n`, trailing `\r` removed) as lossy UTF-8 plus
+    /// the NUL-stripped view of each line (see `line`). Content with a UTF-16 byte-order mark
+    /// is also decoded as UTF-16, so non-ASCII terms match there too; both views always run,
+    /// so a file that merely starts with those bytes loses nothing.
     fn bytes(&mut self, bytes: &[u8], loc: impl Fn(usize) -> Loc) {
-        let text = String::from_utf8_lossy(bytes);
+        self.text(&String::from_utf8_lossy(bytes), &loc);
+        if let Some(decoded) = decode_utf16_bom(bytes) {
+            self.text(&decoded, &loc);
+        }
+    }
+
+    fn text(&mut self, text: &str, loc: &impl Fn(usize) -> Loc) {
         for (idx, raw) in text.split('\n').enumerate() {
             let line = raw.strip_suffix('\r').unwrap_or(raw);
             self.line(line, || loc(idx + 1));
         }
     }
+}
+
+/// Decode content that starts with a UTF-16 byte-order mark (`FF FE` little-endian, `FE FF`
+/// big-endian); `None` for anything else.
+fn decode_utf16_bom(bytes: &[u8]) -> Option<String> {
+    let (le, body) = match bytes {
+        [0xFF, 0xFE, rest @ ..] => (true, rest),
+        [0xFE, 0xFF, rest @ ..] => (false, rest),
+        _ => return None,
+    };
+    let units: Vec<u16> = body
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| {
+            if le {
+                u16::from_le_bytes(*c)
+            } else {
+                u16::from_be_bytes(*c)
+            }
+        })
+        .collect();
+    Some(String::from_utf16_lossy(&units))
 }
 
 // ---------------------------------------------------------------------------------------
@@ -250,10 +305,10 @@ impl Git<'_> {
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
             let first = stderr.lines().next().unwrap_or("").trim();
-            let first = if self.rules.hits(first).is_empty() {
-                first.chars().take(200).collect::<String>()
+            let first = if self.rules.mentions_any_term(first) {
+                "<suppressed: contains a denylist term>".to_string()
             } else {
-                "<suppressed: matches a rule>".to_string()
+                first.chars().take(200).collect::<String>()
             };
             bail!("git {what} failed ({}): {first}", out.status);
         }
@@ -337,10 +392,10 @@ fn scan_tree(git: &Git, top: &Path, scan: &mut Scan) -> Result<()> {
             bail!("unrecognised `git ls-files -s` entry");
         };
         if mode == "160000" {
-            let shown = if scan.rules.hits(&path).is_empty() {
-                clean(&path)
+            let shown = if scan.rules.mentions_any_term(&path) {
+                "<redacted>".to_string()
             } else {
-                "<redacted>".into()
+                clean(&path)
             };
             bail!("tracked gitlink (submodule) entry cannot be scanned: {shown}");
         }
@@ -443,13 +498,16 @@ fn unquote_c(s: &[u8]) -> Option<Vec<u8>> {
 
 /// The new-side path of a `+++ ` header (without the `b/` prefix); `None` for `/dev/null`.
 fn parse_new_path(rest: &[u8]) -> Result<Option<String>> {
+    // git appends one TAB to the header when the name contains a space, quoted or not; a
+    // quoted name never ends in a raw TAB (git writes it as `\t`).
+    let rest = rest.strip_suffix(b"\t").unwrap_or(rest);
     if rest == b"/dev/null" {
         return Ok(None);
     }
     let bytes = if rest.starts_with(b"\"") {
         unquote_c(rest).ok_or_else(|| anyhow!("unrecognised quoted path in a diff header"))?
     } else {
-        rest.strip_suffix(b"\t").unwrap_or(rest).to_vec()
+        rest.to_vec()
     };
     let bytes = bytes
         .strip_prefix(b"b/")

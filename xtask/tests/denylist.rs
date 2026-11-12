@@ -427,6 +427,134 @@ mod denylist {
         assert!(tree_only.stdout.contains("bin.dat:1: rule 4"));
     }
 
+    // F1: a quoted path with a space makes git append a TAB to the `+++` header --------------
+    #[cfg(unix)]
+    #[test]
+    fn t08b_range_scan_parses_quoted_paths_containing_a_space() {
+        let fx = Fx::new();
+        fx.write("keep.txt", "base\n");
+        fx.commit("init");
+        fx.write("sp ace\"q.txt", "has zqxspace here\n");
+        let c = fx.commit("add odd name");
+        fx.deny("zqxspace\n");
+        let out = fx.scan(&["--range", "HEAD"]);
+        assert_eq!(out.code, 1, "{}", out.stderr);
+        assert!(
+            lines(&out.stdout).contains(
+                &format!("denylist: commit {} sp ace\"q.txt:1: rule 1", &c[..12]).as_str()
+            ),
+            "{}",
+            out.stdout
+        );
+        // The same name without a quote (unquoted header with a TAB) keeps working.
+        fx.write("plain name.txt", "has zqxspace here\n");
+        let c2 = fx.commit("add spaced name");
+        let out = fx.scan(&["--range", "HEAD"]);
+        assert_eq!(out.code, 1, "{}", out.stderr);
+        assert!(
+            lines(&out.stdout).contains(
+                &format!("denylist: commit {} plain name.txt:1: rule 1", &c2[..12]).as_str()
+            ),
+            "{}",
+            out.stdout
+        );
+    }
+
+    // F2: a path holding one term of a multi-term rule is redacted everywhere -------------
+    #[test]
+    fn t04b_a_single_term_of_an_and_rule_in_a_path_is_never_printed() {
+        let fx = Fx::new();
+        fx.write("zqxaa-2.txt", "zqxaa and zqxbb together\n");
+        fx.write("clean.txt", "nothing\n");
+        let c = fx.commit("init");
+        fx.deny("zqxaa && zqxbb\n");
+        // tree scan (the harness also asserts that no term occurs in stdout or stderr)
+        let out = fx.scan(&[]);
+        assert_eq!(out.code, 1, "{}", out.stderr);
+        let l = lines(&out.stdout);
+        assert!(
+            l.iter()
+                .any(|x| x.starts_with("denylist: <redacted path #") && x.ends_with(":1: rule 1")),
+            "{l:?}"
+        );
+        // range scan: the commit path hit and the added-line hit
+        let out = fx.scan(&["--range", "HEAD"]);
+        assert_eq!(out.code, 1, "{}", out.stderr);
+        assert!(
+            out.stdout
+                .contains(&format!("commit {} <redacted path #", &c[..12])),
+            "{}",
+            out.stdout
+        );
+        // a gitlink whose path holds one term: the error message must not print it
+        let sha = fx.git(&["rev-parse", "HEAD"]);
+        fx.git(&[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("160000,{sha},zqxaa-sub"),
+        ]);
+        let out = fx.scan(&[]);
+        assert_eq!(out.code, 2, "{}", out.stderr);
+        assert!(out.stderr.contains("gitlink"), "{}", out.stderr);
+    }
+
+    // S3: UTF-16 text is matched (tree and range) ------------------------------------------
+    fn utf16(text: &str, big_endian: bool, bom: bool) -> Vec<u8> {
+        let mut out = Vec::new();
+        if bom {
+            out.extend(if big_endian {
+                [0xFE, 0xFF]
+            } else {
+                [0xFF, 0xFE]
+            });
+        }
+        for u in text.encode_utf16() {
+            out.extend(if big_endian {
+                u.to_be_bytes()
+            } else {
+                u.to_le_bytes()
+            });
+        }
+        out
+    }
+
+    #[test]
+    fn t08c_utf16_content_is_matched_in_tree_and_range() {
+        let fx = Fx::new();
+        fx.write("keep.txt", "base\n");
+        fx.commit("init");
+        fx.write(
+            "le-bom.txt",
+            utf16("hello zqxutf one\r\nsecond\r\n", false, true),
+        );
+        fx.write("be-bom.txt", utf16("first\nhello zqxutf two\n", true, true));
+        fx.write("le-nobom.txt", utf16("hello zqxutf three\n", false, false));
+        fx.write(
+            "non-ascii.txt",
+            utf16("see zqx\u{e9}term here\n", false, true),
+        );
+        let c = fx.commit("add utf16 files");
+        fx.deny("zqxutf\nzqx\u{e9}term\n");
+        let out = fx.scan(&["--range", "HEAD"]);
+        assert_eq!(out.code, 1, "{}", out.stderr);
+        let l = lines(&out.stdout);
+        for (file, line, rule) in [
+            ("le-bom.txt", 1, 1),
+            ("be-bom.txt", 2, 1),
+            ("le-nobom.txt", 1, 1),
+            ("non-ascii.txt", 1, 2),
+        ] {
+            let tree = format!("denylist: {file}:{line}: rule {rule}");
+            let commit = format!("denylist: commit {} {file}:{line}: rule {rule}", &c[..12]);
+            assert!(l.contains(&tree.as_str()), "missing `{tree}` in {l:?}");
+            if file != "non-ascii.txt" {
+                // added-line view: NUL-stripped, ASCII terms only
+                assert!(l.contains(&commit.as_str()), "missing `{commit}` in {l:?}");
+            }
+        }
+    }
+
     // (9) ---------------------------------------------------------------------------------
     #[test]
     fn t09_bad_range_and_non_repo_exit_2() {
