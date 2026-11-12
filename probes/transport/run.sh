@@ -42,17 +42,20 @@ trust_added=1
 net_service=
 
 cleanup() {
-  if [ -n "$tls_pid" ]; then kill "$tls_pid" >/dev/null 2>&1 || true; fi
-  if [ -n "$proxy_pid" ]; then kill "$proxy_pid" >/dev/null 2>&1 || true; fi
+  # Every privileged call is time-limited: on the macOS runner a trust-store or network-setting
+  # change can wait for an authorisation prompt that nobody answers, which hung the job after the
+  # verdict was already written. The runner is disposable, so a skipped undo is harmless.
+  if [ -n "$tls_pid" ]; then kill -9 "$tls_pid" >/dev/null 2>&1 || true; fi
+  if [ -n "$proxy_pid" ]; then kill -9 "$proxy_pid" >/dev/null 2>&1 || true; fi
   if [ "$os" = Darwin ] && [ -n "$net_service" ]; then
-    sudo -n networksetup -setsecurewebproxystate "$net_service" off >/dev/null 2>&1 || true
+    probe_limited 30 sudo -n networksetup -setsecurewebproxystate "$net_service" off >/dev/null 2>&1 || true
   fi
   if [ "$trust_added" -eq 0 ]; then
     if [ "$os" = Linux ]; then
-      sudo -n rm -f /usr/local/share/ca-certificates/lunepack-probe-root.crt >/dev/null 2>&1 || true
-      sudo -n update-ca-certificates --fresh >/dev/null 2>&1 || true
+      probe_limited 60 sudo -n rm -f /usr/local/share/ca-certificates/lunepack-probe-root.crt >/dev/null 2>&1 || true
+      probe_limited 60 sudo -n update-ca-certificates --fresh >/dev/null 2>&1 || true
     else
-      sudo -n security remove-trusted-cert -d "$work/certs/root.pem" >/dev/null 2>&1 || true
+      probe_limited 30 sudo -n security remove-trusted-cert -d "$work/certs/root.pem" >/dev/null 2>&1 || true
     fi
   fi
   rm -rf "$work"
@@ -67,19 +70,9 @@ line_count() { # file -> number of lines (0 when missing)
   if [ -f "$1" ]; then wc -l <"$1" | tr -d ' '; else echo 0; fi
 }
 
-# Run a command with a time limit using python3 (no coreutils timeout on macOS); echoes its status.
+# Run a command with a time limit (probe_limited, no coreutils timeout on macOS); status only.
 run_limited() { # seconds, command...
-  local secs=$1
-  shift
-  python3 - "$secs" "$@" <<'PY'
-import subprocess, sys
-secs = int(sys.argv[1])
-try:
-    sys.exit(subprocess.run(sys.argv[2:], timeout=secs, stdin=subprocess.DEVNULL,
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode)
-except subprocess.TimeoutExpired:
-    sys.exit(124)
-PY
+  probe_limited "$@" >/dev/null
 }
 
 wait_listening() { # logfile
@@ -175,18 +168,18 @@ if [ "$os" = Linux ]; then
   HTTPS_PROXY="http://127.0.0.1:$proxy_port" "$bin" fetch-proxy "$target" >"$work/iii-on.txt" 2>&1 || true
 else
   probe_detail iii_kind "macOS system proxy via networksetup and hyper-util Matcher::from_system()"
-  net_service=$(networksetup -listallnetworkservices 2>/dev/null | tail -n +2 | grep -v '^\*' | head -n 1 || true)
+  net_service=$(probe_limited 30 networksetup -listallnetworkservices 2>/dev/null | tail -n +2 | grep -v '^\*' | head -n 1 || true)
   probe_detail iii_network_service_found "$([ -n "$net_service" ] && echo yes || echo no)"
   if [ -z "$net_service" ]; then
     probe_detail note "no network service to set a system proxy on"
     probe_finish FAIL failed
     exit 0
   fi
-  sudo -n networksetup -setsecurewebproxystate "$net_service" off >/dev/null 2>&1 || true
+  run_limited 30 sudo -n networksetup -setsecurewebproxystate "$net_service" off || true
   no_env_proxy "$bin" fetch-proxy "$target" >"$work/iii-off.txt" 2>&1 || true
   off_lines=$(line_count "$proxy_log")
-  sudo -n networksetup -setsecurewebproxy "$net_service" 127.0.0.1 "$proxy_port" >/dev/null 2>&1
-  sudo -n networksetup -setsecurewebproxystate "$net_service" on >/dev/null 2>&1
+  run_limited 30 sudo -n networksetup -setsecurewebproxy "$net_service" 127.0.0.1 "$proxy_port"
+  run_limited 30 sudo -n networksetup -setsecurewebproxystate "$net_service" on
   no_env_proxy "$bin" fetch-proxy "$target" >"$work/iii-on.txt" 2>&1 || true
 fi
 on_lines=$(line_count "$proxy_log")
