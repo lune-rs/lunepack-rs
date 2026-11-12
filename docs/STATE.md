@@ -1,21 +1,25 @@
 # State
 
-Last updated: 2026-11-12 (milestone 1, foundation)
+Last updated: 2026-11-13 (milestone 2, format and trust, step 1)
 
 ## Now
 
-Milestone 1 (foundation) is implemented on branch `orch/lunepack-v1` and not yet pushed:
+Milestone 1 (foundation) is merged to `main`. Milestone 2 (format v1 and the trust core) is in
+progress on branch `orch/lunepack-v1`, not pushed:
 
-- Cargo workspace (edition 2024, toolchain 1.99.1, MSRV 1.88), 12 crate skeletons plus `xtask`.
-- `scripts/gate.sh`, the boundary check, the secret check with the optional local denylist scan, and shell tests.
-- Agent guards for key files in `.claude/` (Read denies and a Bash hook).
-- CI (`.github/workflows/ci.yml`: gate on Linux, build, clippy and tests on 3 OSes, MSRV check).
-- Early platform probes under `probes/` with their workflow (`.github/workflows/probes.yml`); verdicts come from the first CI run.
+- Step 1 done: `docs/FORMAT.md` (format v1 draft: envelope, documents, caps, frames and codecs,
+  path/version/target rules, verification order and policy) and `docs/THREAT-MODEL.md` (draft).
+- Awaiting the user's approval of both documents. No code that encodes the wire format is written
+  before that approval.
 
 ## Next
 
-1. Push the branch (after the local denylist is reviewed), read the first CI and probe results, fix what the first run breaks.
-2. Milestone 2: format v1 and the trust core (format spec and threat model, core types, DSSE envelope, key set, feed and manifest verification, crypto adapter, testkit fakes). Its stop settles the open decisions below that need probe results.
+1. User stop: approve or change `docs/FORMAT.md` and `docs/THREAT-MODEL.md`; decide D9, D10, D11,
+   D12, D13 and D19 (D39 may be asked early).
+2. Milestone 2 steps 4–12: core foundation (strict JSON, encodings, traits), shared path/version/
+   target rules, testkit fakes and contract suites, the crypto adapter, envelope/root/key-set
+   verification, the frame parser, feed and manifest verification and policy, fuzz targets, and the
+   DECISIONS/ARCHITECTURE updates with a test that keeps FORMAT.md's examples parsing.
 
 ## Blockers / open questions
 
