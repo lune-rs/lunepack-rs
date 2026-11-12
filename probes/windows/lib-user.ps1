@@ -40,15 +40,16 @@ function Set-ProbeAcl {
 # Run cmd lines as the standard user and return @{Method; ExitCode; Output; TimedOut}.
 # `WorkDir` must be admin-owned and readable by Users; `OutDir` must be writable by Users.
 # The batch file records its own errorlevel so the exit code does not depend on how the
-# process was launched. Primary launch: Start-Process -Credential (CreateProcessWithLogonW);
-# fallback if that throws: a scheduled task registered for the user with the password.
+# process was launched. The redirect comes first: `echo 5> file` is a stream-5 redirect (an
+# empty file), so a single-digit errorlevel must never sit directly before the `>`.
+# Primary launch: Start-Process -Credential (CreateProcessWithLogonW); fallback if that throws: a scheduled task registered for the user with the password.
 function Invoke-AsUser {
     param($User, [string[]]$Lines, [string]$WorkDir, [string]$OutDir, [string]$Tag, [int]$TimeoutSec = 120)
     $bat = Join-Path $WorkDir "$Tag.cmd"
     $outFile = Join-Path $OutDir "$Tag.out.txt"
     $rcFile = Join-Path $OutDir "$Tag.rc.txt"
     Remove-Item -Force -ErrorAction SilentlyContinue $outFile, $rcFile
-    $body = @('@echo off') + $Lines + @("echo %errorlevel%> `"$rcFile`"")
+    $body = @('@echo off') + $Lines + @("> `"$rcFile`" echo %errorlevel%")
     Set-Content -LiteralPath $bat -Value $body -Encoding ASCII
     $method = 'Start-Process -Credential'
     $timedOut = $false
@@ -68,11 +69,17 @@ function Invoke-AsUser {
         if (-not (Test-Path -LiteralPath $rcFile)) { $timedOut = $true }
         Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
     }
+    # The launch may return before the batch finishes: wait for a parseable errorlevel.
     $rc = $null
-    if (Test-Path -LiteralPath $rcFile) {
-        $txt = (Get-Content -LiteralPath $rcFile -TotalCount 1)
-        $parsed = 0
-        if ([int]::TryParse($txt.Trim(), [ref]$parsed)) { $rc = $parsed }
+    $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    while ($null -eq $rc) {
+        if (Test-Path -LiteralPath $rcFile) {
+            $txt = ((Get-Content -LiteralPath $rcFile -TotalCount 1) + '').Trim()
+            $parsed = 0
+            if ([int]::TryParse($txt, [ref]$parsed)) { $rc = $parsed; break }
+        }
+        if ((Get-Date) -ge $deadline) { $timedOut = $true; break }
+        Start-Sleep -Milliseconds 250
     }
     $out = ''
     if (Test-Path -LiteralPath $outFile) { $out = ((Get-Content -LiteralPath $outFile -TotalCount 5) -join ' ') }

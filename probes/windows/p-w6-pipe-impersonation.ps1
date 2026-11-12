@@ -151,6 +151,8 @@ try {
 }
 catch {
     Add-ProbeDetail 'error' $_.Exception.Message
+    Add-ProbeDetail 'error_line' $_.InvocationInfo.ScriptLineNumber
+    Add-ProbeDetail 'error_script' (Split-Path -Leaf $_.InvocationInfo.ScriptName)
 }
 finally {
     Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
