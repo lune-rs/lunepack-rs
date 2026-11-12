@@ -60,9 +60,13 @@ check does not recognise is a violation, and an internal error exits 2, never 0.
   only differences are `unsafe_code` and an added `undocumented_unsafe_blocks = "deny"`;
 - a root `unsafe_code` that is not `forbid`, and package fields (edition, license, MSRV) that
   differ from the workspace's.
-- a `Cargo.lock` (the workspace's and each `probes/*/`'s) that is missing or resolves any package from
-  somewhere other than crates.io or a workspace path, and any `[patch]` or `[replace]` section: the lock
-  records what cargo actually resolved, so a redirected dependency cannot hide behind `cargo metadata`.
+- a `Cargo.lock` (the workspace's and each `probes/*/`'s) that is missing, or has a package that is
+  neither from crates.io nor, without a source, one of that lock's own members by name and version
+  (the workspace members, or the probe's own package); this catches git and other-registry sources
+  and path dependencies, including those redirected by `[patch]`, `[replace]` or a
+  `.cargo/config.toml` patch, because the lock records what cargo actually resolved. A `[patch]` or
+  `[replace]` section in the root or a probe manifest is flagged too. The check does not read
+  `.cargo/config.toml` itself; it sees a config patch only through the lock it produced.
 
 Adding a crate is one line in `ROLES` in `xtask/src/boundaries.rs`.
 

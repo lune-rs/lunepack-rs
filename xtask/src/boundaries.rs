@@ -6,7 +6,7 @@
 //! real TOML parser. Every form this check does not recognise is a violation, and
 //! any internal error is distinct from a violation (exit 2, never exit 0).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
@@ -248,7 +248,7 @@ pub fn check(metadata_json: &str, manifests: &Manifests) -> Result<Vec<Violation
         .collect();
 
     check_root(&md, manifests, &mut out)?;
-    check_lock(manifests, &mut out);
+    check_lock(&md, manifests, &mut out);
     for pkg in &md.packages {
         check_package(pkg, &member_dirs, manifests, &mut out)?;
     }
@@ -307,27 +307,66 @@ fn check_root(md: &Metadata, manifests: &Manifests, out: &mut Vec<Violation>) ->
     Ok(())
 }
 
-/// Every package cargo resolved comes from the workspace (no `source`) or from crates.io.
-/// `cargo metadata --no-deps` only reports declared dependencies, so a root `[patch]`,
-/// `[replace]` or a config-level patch that redirects a dependency to a git or path source is
-/// invisible there; the lock file records what was actually resolved. `[patch]` and `[replace]`
-/// in the root manifest are flagged as well (a deliberate one needs an allowlist entry here).
-fn check_lock(manifests: &Manifests, out: &mut Vec<Violation>) {
+/// Every package in a lock file is either crates.io (the exact `CRATES_IO_SOURCE`) or has no
+/// `source` and is one of that lock's own members, matched by name and version: the workspace
+/// members from `cargo metadata`, or for `probes/<dir>` that probe's own `[package]`. Anything
+/// else (a git or other-registry source, or a source-less package that is not a member, which is
+/// what a path dependency or a `[patch]` / `[replace]` / `.cargo/config.toml` patch to a path
+/// produces) is a violation. `cargo metadata --no-deps` only reports declared dependencies, so a
+/// redirection is invisible there; the lock file records what was actually resolved. A missing
+/// lock, and a `[patch]` or `[replace]` section in the root or a probe manifest, are violations
+/// too. A vendored crate would need an explicit allowlist entry here.
+fn check_lock(md: &Metadata, manifests: &Manifests, out: &mut Vec<Violation>) {
+    let members: BTreeSet<(String, String)> = md
+        .packages
+        .iter()
+        .map(|p| (p.name.to_string(), p.version.to_string()))
+        .collect();
     check_lock_for(
         WORKSPACE_LABEL,
         &manifests.root,
         manifests.lock.as_ref(),
+        &members,
         out,
     );
     for probe in &manifests.probes {
-        check_lock_for(&probe.label, &probe.manifest, probe.lock.as_ref(), out);
+        let members = probe_member(&probe.manifest)
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        if members.is_empty() {
+            out.push(v(
+                &probe.label,
+                "lockfile",
+                "the probe manifest has no string `[package] name` / `version`: its own lock entry cannot be identified",
+            ));
+        }
+        check_lock_for(
+            &probe.label,
+            &probe.manifest,
+            probe.lock.as_ref(),
+            &members,
+            out,
+        );
     }
+}
+
+/// A probe's own `(name, version)`; an absent `version` is cargo's default `0.0.0`. Any other
+/// form (e.g. `version.workspace = true`) yields `None`, so every source-less entry fails.
+fn probe_member(manifest: &toml::Table) -> Option<(String, String)> {
+    let pkg = manifest.get("package")?.as_table()?;
+    let name = pkg.get("name")?.as_str()?;
+    let version = match pkg.get("version") {
+        None => "0.0.0",
+        Some(v) => v.as_str()?,
+    };
+    Some((name.to_string(), version.to_string()))
 }
 
 fn check_lock_for(
     label: &str,
     manifest: &toml::Table,
     lock: Option<&toml::Table>,
+    members: &BTreeSet<(String, String)>,
     out: &mut Vec<Violation>,
 ) {
     for key in ["patch", "replace"] {
@@ -361,7 +400,18 @@ fn check_lock_for(
             continue;
         };
         match table.get("source") {
-            None => {}
+            None => {
+                let version = table.get("version").and_then(|x| x.as_str()).unwrap_or("");
+                if !members.contains(&(name.to_string(), version.to_string())) {
+                    out.push(v(
+                        name,
+                        "lock-source",
+                        format!(
+                            "Cargo.lock ({label}) has `{name}` {version} with no source and it is not a member: a path dependency or a patch to a path"
+                        ),
+                    ));
+                }
+            }
             Some(toml::Value::String(src)) if src == CRATES_IO_SOURCE => {}
             Some(toml::Value::String(src)) => out.push(v(
                 name,

@@ -516,6 +516,108 @@ undocumented_unsafe_blocks = "deny"
         assert_clean(&vs);
     }
 
+    // F7: a source-less lock entry must be a member of that lock's own workspace ---------------
+
+    /// Run the real `cargo generate-lockfile --offline` in `dir` (cargo from `CARGO`).
+    fn generate_lock(dir: &Path) {
+        let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+        let out = Command::new(cargo)
+            .args(["generate-lockfile", "--offline"])
+            .current_dir(dir)
+            .output()
+            .expect("run cargo generate-lockfile");
+        assert!(
+            out.status.success(),
+            "cargo generate-lockfile failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    fn t_config_patch_to_a_path_is_rejected() {
+        let mut fx = Fx::clean();
+        fx.add_dep("lunepack-cli", "anyhow = \"1\"");
+        fx.lock_extra = None;
+        let dir = fx.write();
+        let vendor = dir.path().join("vendor/anyhow");
+        fs::create_dir_all(vendor.join("src")).unwrap();
+        fs::write(
+            vendor.join("Cargo.toml"),
+            "[package]\nname = \"anyhow\"\nversion = \"1.0.999\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        fs::write(vendor.join("src/lib.rs"), "").unwrap();
+        fs::create_dir_all(dir.path().join(".cargo")).unwrap();
+        fs::write(
+            dir.path().join(".cargo/config.toml"),
+            "[patch.crates-io]\nanyhow = { path = \"vendor/anyhow\" }\n",
+        )
+        .unwrap();
+        generate_lock(dir.path());
+        let lock = fs::read_to_string(dir.path().join("Cargo.lock")).unwrap();
+        assert!(
+            lock.contains("name = \"anyhow\"\nversion = \"1.0.999\"\n\n"),
+            "fixture: cargo should lock the patched anyhow without a source:\n{lock}"
+        );
+        let (_, vs) = check_workspace(dir.path()).expect("check");
+        // The members in the real lock all match; only the patched crate is flagged.
+        assert_eq!(
+            vs.iter()
+                .map(|x| (x.package.as_str(), x.rule))
+                .collect::<Vec<_>>(),
+            vec![("anyhow", "lock-source")],
+            "got:\n{}",
+            render(&vs)
+        );
+    }
+
+    #[test]
+    fn t_source_less_entry_with_a_member_name_but_another_version_is_rejected() {
+        let mut fx = Fx::clean();
+        fx.lock_extra =
+            Some("\n[[package]]\nname = \"lunepack-core\"\nversion = \"9.9.9\"\n".to_string());
+        assert_has(&fx.run().1, "lunepack-core", "lock-source");
+    }
+
+    #[test]
+    fn t_probe_path_dependency_is_rejected() {
+        let fx = Fx::clean();
+        let dir = fx.write();
+        let probe = dir.path().join("probes").join("demo");
+        fs::create_dir_all(probe.join("src")).unwrap();
+        fs::write(probe.join("src/lib.rs"), "").unwrap();
+        // a real lock for a clean standalone probe: only the probe itself, which passes
+        fs::write(
+            probe.join("Cargo.toml"),
+            format!("{}\n[workspace]\n", manifest("demo", "", "")),
+        )
+        .unwrap();
+        generate_lock(&probe);
+        assert_clean(&check_workspace(dir.path()).expect("check").1);
+        // a path dependency outside the probe (`<tmp>/outside`): its lock entry has no source
+        fs::write(
+            probe.join("Cargo.toml"),
+            format!(
+                "{}\n[workspace]\n",
+                manifest("demo", "", "outside = { path = \"../../../outside\" }")
+            ),
+        )
+        .unwrap();
+        generate_lock(&probe);
+        let (_, vs) = check_workspace(dir.path()).expect("check");
+        assert_has(&vs, "outside", "lock-source");
+        // a probe whose own name cannot be read accepts no source-less entry
+        fs::write(
+            probe.join("Cargo.toml"),
+            format!("{}\n[workspace]\n", manifest("demo", "", ""))
+                .replace("version = \"0.0.0\"", "version = { workspace = true }"),
+        )
+        .unwrap();
+        let (_, vs) = check_workspace(dir.path()).expect("check");
+        assert_has(&vs, "probes/demo", "lockfile");
+        assert_has(&vs, "demo", "lock-source");
+    }
+
     #[test]
     fn t_missing_lock_file_is_a_violation() {
         let mut fx = Fx::clean();
