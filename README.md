@@ -2,15 +2,16 @@
 
 A pure-Rust installer, packager and auto-updater framework: package releases, build installers, ship full and delta updates, apply an update and restart. Built first for Lunegit and meant for other apps.
 
-Status: early. Design in progress; no code yet.
+Status: early. The workspace, build gate and CI exist as crate skeletons; the format, packager, client and installers are still to come. Design decisions are in [`docs/DECISIONS.md`](docs/DECISIONS.md), the crate layout in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), and the current state in [`docs/STATE.md`](docs/STATE.md).
 
 ## Build and test
 
-Not yet runnable: there is no code. Once the workspace exists:
+Rust 1.99.1 is pinned in `rust-toolchain.toml` and installed by rustup on first use.
 
 ```sh
-cargo build --workspace
-cargo test --workspace
+cargo build --workspace --locked
+cargo test --workspace --locked
+./scripts/gate.sh   # everything CI's gate runs; see CLAUDE.md for the stages
 ```
 
 ## License
