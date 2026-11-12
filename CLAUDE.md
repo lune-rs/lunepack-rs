@@ -1,6 +1,7 @@
 # lunepack-rs
 
-Pure-Rust installer, packager and auto-updater framework: package releases, build installers, ship full and delta updates, apply an update and restart. First consumer is Lunegit (a desktop git client); meant for other apps too. Inspired by Velopack but not a clone: it is a reference only, so do not port its design or formats unless `docs/DECISIONS.md` says so.
+Pure-Rust installer, packager and auto-updater framework: package releases, build installers, ship full and delta updates, apply an update and restart. First consumer is Lunegit (a desktop git client); meant for other apps too.
+Inspired by Velopack but not a clone: it is a reference only, so do not port its design or formats unless `docs/DECISIONS.md` says so.
 Public repo (`lune-rs/lunepack-rs`), dual-licensed MIT OR Apache-2.0. The primary API is the native Rust crate API; other-language bindings are the last roadmap step. Target platforms are not decided yet (see `docs/STATE.md`).
 
 ## Start here

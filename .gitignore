@@ -6,3 +6,7 @@ CLAUDE.local.md
 !.env.example
 # Rust build output
 /target
+# agent worktrees and probe output
+.claude/worktrees/
+probe-results/
+/probes/*/target/
