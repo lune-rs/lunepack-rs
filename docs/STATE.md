@@ -23,7 +23,7 @@ progress on branch `orch/lunepack-v1`, not pushed:
 
 ## Blockers / open questions
 
-- Probe verdicts are pending the first CI run; the decisions they inform stay open until then.
+- M1 probe verdicts: all PASS with control ok (CI runs 43258313963 and the probes re-run); they feed the step-3 decisions.
 - Open decisions (see `docs/DECISIONS.md` for the settled ones), with the milestone they must be settled by:
   - D9 Linux packaging targets, D11 Windows per-user layout, D13 lifecycle hooks, D19 runtime binary provenance: before M5.
   - D10 macOS install and update model: before M7.
