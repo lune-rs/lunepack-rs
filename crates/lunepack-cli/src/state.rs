@@ -5,8 +5,10 @@
 //! directory with time checks skipped (M3-D9), so a genuine but older document there would verify
 //! and its values would be re-signed fresh. The state file records, per app id, the root version,
 //! the `keys.json` version and threshold, and each channel's feed `seq` last written or accepted.
-//! A writer refuses a previous document older than the record unless `--allow-older-previous` is
-//! given, and refuses one it has no record of unless `--trust-release-dir` is given.
+//! A writer refuses a previous document older than the record, or a recorded `keys.json` or root
+//! that is missing, unless `--allow-older-previous` is given, and refuses one it has no record of
+//! unless `--trust-release-dir` is given. No update lowers a recorded value without
+//! `--allow-older-previous` either.
 //!
 //! The file holds only these numbers, never a key or a config value.
 
@@ -35,8 +37,9 @@ pub struct StateArgs {
     /// fetched from the public host.
     #[arg(long = "trust-release-dir")]
     pub trust_release_dir: bool,
-    /// Build on a previous document older than the state file records (recovery only). Each such
-    /// document is named on stderr, and the new values are recorded.
+    /// Build on a previous document older than the state file records, or without a recorded
+    /// keys.json that is missing (recovery only). Each such document is named on stderr, and the
+    /// new values are recorded, even when lower.
     #[arg(long = "allow-older-previous")]
     pub allow_older_previous: bool,
 }
@@ -84,6 +87,10 @@ pub struct Compared {
     pub recorded: Option<u64>,
     /// The value in the release directory; `None` when the document is absent.
     pub found: Option<u64>,
+    /// Whether the document may be absent although the state file records it: only a feed, whose
+    /// channel `feed add` may start again (M3-R1-D1) with a `seq` above the recorded one. A recorded
+    /// root or `keys.json` that is absent is refused like an older one.
+    pub may_be_absent: bool,
 }
 
 impl Record {
@@ -108,6 +115,7 @@ impl Record {
             field: "version",
             recorded: self.root_version,
             found,
+            may_be_absent: false,
         }
     }
 
@@ -118,7 +126,53 @@ impl Record {
             field: "version",
             recorded: self.keys_version,
             found: keys.map(VerifiedKeySet::version),
+            may_be_absent: false,
         }
+    }
+
+    /// Every value `next` would lower against `self`, one description each. A recorded value that
+    /// `next` drops counts as lowered, and so does a changed threshold without a newer key set.
+    pub fn lowered_by(&self, next: &Record) -> Vec<String> {
+        fn version(what: &str, old: Option<u64>, new: Option<u64>, out: &mut Vec<String>) {
+            match (old, new) {
+                (Some(o), Some(n)) if n < o => out.push(format!("{what} {o} -> {n}")),
+                (Some(o), None) => out.push(format!("{what} {o} -> none")),
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        version(
+            "root version",
+            self.root_version,
+            next.root_version,
+            &mut out,
+        );
+        version(
+            "keys.json version",
+            self.keys_version,
+            next.keys_version,
+            &mut out,
+        );
+        let newer_keys = matches!(
+            (self.keys_version, next.keys_version),
+            (Some(o), Some(n)) if n > o
+        ) || (self.keys_version.is_none() && next.keys_version.is_some());
+        match (self.keys_threshold, next.keys_threshold) {
+            (Some(o), Some(n)) if n != o && !newer_keys => out.push(format!(
+                "keys.json threshold {o} -> {n} without a newer keys.json"
+            )),
+            (Some(o), None) => out.push(format!("keys.json threshold {o} -> none")),
+            _ => {}
+        }
+        for (channel, &o) in &self.feeds {
+            version(
+                &format!("feed-{channel}.json seq"),
+                Some(o),
+                next.feeds.get(channel).copied(),
+                &mut out,
+            );
+        }
+        out
     }
 }
 
@@ -162,8 +216,40 @@ impl State {
         self.raw.apps.get(app.as_str()).cloned().unwrap_or_default()
     }
 
-    /// Sets the record of `app` and writes the file (temporary file, then rename).
-    pub fn save(&mut self, app: &AppId, record: Record) -> Result<()> {
+    /// Refuses an update of `app`'s record to `next` that would lower a recorded value (see
+    /// [`Record::lowered_by`]), unless `--allow-older-previous`, under which each lowered value is
+    /// named on stderr. Writers call it before they place anything.
+    pub fn guard_update(&self, app: &AppId, next: &Record, over: StateArgs) -> Result<()> {
+        let lowered = self.record(app).lowered_by(next);
+        if lowered.is_empty() {
+            return Ok(());
+        }
+        if over.allow_older_previous {
+            for l in &lowered {
+                eprintln!(
+                    "warning: the state file's record is lowered: {l} (--allow-older-previous); clients that already accepted the higher value reject the lower one"
+                );
+            }
+            return Ok(());
+        }
+        bail!(
+            "this would lower what {} records ({}), which only --allow-older-previous may do (nothing was written)",
+            self.path.display(),
+            lowered.join("; ")
+        )
+    }
+
+    /// Sets the record of `app` and writes the file (temporary file, then rename). A record that
+    /// would lower a recorded value is refused unless `--allow-older-previous` (the writers check
+    /// this with [`State::guard_update`] before placing; this is the backstop).
+    pub fn save(&mut self, app: &AppId, record: Record, over: StateArgs) -> Result<()> {
+        let lowered = self.record(app).lowered_by(&record);
+        if !lowered.is_empty() && !over.allow_older_previous {
+            bail!(
+                "the documents were placed, but the state file was not updated: it would lower what it records ({})",
+                lowered.join("; ")
+            );
+        }
         self.raw.apps.insert(app.as_str().to_owned(), record);
         let mut text = serde_json::to_vec_pretty(&self.raw)?;
         text.push(b'\n');
@@ -189,15 +275,35 @@ impl State {
         Ok(true)
     }
 
-    /// Compares each previous document with the record. A document older than the record is
-    /// refused unless `--allow-older-previous`; one with no record is refused unless
-    /// `--trust-release-dir`; an absent document is not compared. Returns `true` when every
-    /// document matched (equal or newer) without an override.
+    /// Compares each previous document with the record. A document older than the record, or a
+    /// recorded one that is absent (unless it [may be](Compared::may_be_absent)), is refused unless
+    /// `--allow-older-previous`; one with no record is refused unless `--trust-release-dir`; an
+    /// absent document with no record is not compared. Returns `true` when every document matched
+    /// (equal or newer) without an override.
     pub fn check(&self, docs: &[Compared], over: StateArgs) -> Result<bool> {
         let mut refused = Vec::new();
         let mut clean = true;
         for d in docs {
-            let Some(found) = d.found else { continue };
+            let Some(found) = d.found else {
+                match d.recorded {
+                    Some(recorded) if !d.may_be_absent => {
+                        if over.allow_older_previous {
+                            eprintln!(
+                                "warning: {} is missing, but the state file records {} {recorded}; building without it (--allow-older-previous)",
+                                d.document, d.field
+                            );
+                            clean = false;
+                        } else {
+                            refused.push(format!(
+                                "{}: missing from the release directory, but the state file records {} {recorded}; the release directory may be incomplete or tampered with (if it was removed on purpose to start over, pass --allow-older-previous)",
+                                d.document, d.field
+                            ));
+                        }
+                    }
+                    _ => {}
+                }
+                continue;
+            };
             match d.recorded {
                 None if over.trust_release_dir => {
                     eprintln!(
@@ -248,7 +354,7 @@ impl State {
             "the release directory does not match the state file (nothing was written):{lines}\n\
              {about}. Restore the release directory (or the state file) from the publisher's own storage; \
              pass --trust-release-dir to accept documents the state file has no record of, or \
-             --allow-older-previous to build on an older one"
+             --allow-older-previous to build on an older one or without a missing one"
         )
     }
 }
@@ -263,6 +369,17 @@ mod tests {
             field: "version",
             recorded,
             found,
+            may_be_absent: false,
+        }
+    }
+
+    fn feed(recorded: Option<u64>, found: Option<u64>) -> Compared {
+        Compared {
+            document: "feed-stable.json".to_owned(),
+            field: "seq",
+            recorded,
+            found,
+            may_be_absent: true,
         }
     }
 
@@ -283,8 +400,17 @@ mod tests {
         let s = state();
         assert!(s.check(&[compared(Some(3), Some(3))], none).unwrap());
         assert!(s.check(&[compared(Some(3), Some(4))], none).unwrap());
-        assert!(s.check(&[compared(Some(3), None)], none).unwrap());
         assert!(s.check(&[compared(None, None)], none).unwrap());
+        // A recorded keys.json or root that is missing is refused like an older one (F5, S2); a
+        // feed may be absent (its channel restarts above the recorded seq).
+        let e = s.check(&[compared(Some(3), None)], none).unwrap_err();
+        let e = format!("{e:#}");
+        assert!(
+            e.contains("keys.json: missing from the release directory, but the state file records version 3"),
+            "{e}"
+        );
+        assert!(s.check(&[feed(Some(3), None)], none).unwrap());
+        assert!(s.check(&[feed(None, None)], none).unwrap());
         let e = s.check(&[compared(Some(3), Some(2))], none).unwrap_err();
         assert!(format!("{e:#}").contains("replayed older copy"), "{e:#}");
         assert!(s.check(&[compared(None, Some(2))], none).is_err());
@@ -295,13 +421,90 @@ mod tests {
         };
         assert!(!s.check(&[compared(None, Some(2))], trust).unwrap());
         assert!(s.check(&[compared(Some(3), Some(2))], trust).is_err());
+        assert!(s.check(&[compared(Some(3), None)], trust).is_err());
 
         let older = StateArgs {
             allow_older_previous: true,
             ..StateArgs::default()
         };
         assert!(!s.check(&[compared(Some(3), Some(2))], older).unwrap());
+        assert!(!s.check(&[compared(Some(3), None)], older).unwrap());
         assert!(s.check(&[compared(None, Some(2))], older).is_err());
+    }
+
+    fn rec(root: u64, keys: u64, threshold: u64, seq: Option<u64>) -> Record {
+        let mut r = Record {
+            root_version: Some(root),
+            keys_version: Some(keys),
+            keys_threshold: Some(threshold),
+            ..Record::default()
+        };
+        if let Some(q) = seq {
+            r.feeds.insert("stable".to_owned(), q);
+        }
+        r
+    }
+
+    #[test]
+    fn lowering_rules() {
+        let old = rec(2, 5, 2, Some(100));
+        assert!(old.lowered_by(&old).is_empty());
+        // Rising values, a new channel, and a threshold change with a newer key set are fine.
+        let mut up = rec(3, 6, 1, Some(101));
+        up.feeds.insert("beta".to_owned(), 1);
+        assert!(old.lowered_by(&up).is_empty());
+        assert!(Record::default().lowered_by(&old).is_empty());
+
+        let cases = [
+            (rec(1, 5, 2, Some(100)), "root version 2 -> 1"),
+            (rec(2, 1, 2, Some(100)), "keys.json version 5 -> 1"),
+            (
+                rec(2, 5, 1, Some(100)),
+                "keys.json threshold 2 -> 1 without a newer",
+            ),
+            (rec(2, 5, 2, Some(99)), "feed-stable.json seq 100 -> 99"),
+            (rec(2, 5, 2, None), "feed-stable.json seq 100 -> none"),
+            (Record::default(), "keys.json version 5 -> none"),
+        ];
+        for (next, want) in cases {
+            let got = old.lowered_by(&next);
+            assert!(got.iter().any(|l| l.contains(want)), "{want}: {got:?}");
+        }
+    }
+
+    #[test]
+    fn updates_never_lower_without_the_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(DEFAULT_STATE);
+        let app = AppId::parse("example.app").unwrap();
+        let mut s = State::load(&path).unwrap();
+        let none = StateArgs::default();
+        s.save(&app, rec(1, 3, 2, Some(100)), none).unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        let lower = rec(1, 1, 1, Some(100));
+        let e = s.guard_update(&app, &lower, none).unwrap_err();
+        assert!(
+            format!("{e:#}").contains("keys.json version 3 -> 1"),
+            "{e:#}"
+        );
+        assert!(s.save(&app, lower.clone(), none).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let trust = StateArgs {
+            trust_release_dir: true,
+            ..StateArgs::default()
+        };
+        assert!(s.guard_update(&app, &lower, trust).is_err());
+        assert!(s.save(&app, lower.clone(), trust).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+
+        let older = StateArgs {
+            allow_older_previous: true,
+            ..StateArgs::default()
+        };
+        s.guard_update(&app, &lower, older).unwrap();
+        s.save(&app, lower.clone(), older).unwrap();
+        assert_eq!(State::load(&path).unwrap().record(&app), lower);
     }
 
     #[test]
@@ -321,7 +524,7 @@ mod tests {
             ..Record::default()
         };
         r.feeds.insert("stable".to_owned(), 7);
-        s.save(&app, r.clone()).unwrap();
+        s.save(&app, r.clone(), StateArgs::default()).unwrap();
         assert_eq!(State::load(&path).unwrap().record(&app), r);
 
         std::fs::write(&path, b"{\"format\":1,\"apps\":{},\"x\":1}").unwrap();

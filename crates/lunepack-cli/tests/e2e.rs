@@ -962,13 +962,15 @@ fn feed_add_refusals() {
     let err = assert_fails(&out, 1, "a replaced manifest");
     assert!(err.contains("never replaced"), "{err:?}");
 
-    // refresh needs an existing feed; the signer must be in keys.json.
-    let fresh = w.release_dir("fresh", &[key]);
-    let out = w.feed("refresh", &fresh, None, key, T0, &[]);
-    assert_fails(&out, 1, "refresh without a feed");
+    // The signer must be in keys.json; refresh needs an existing feed. (A second release dir under
+    // the same state file would now be refused for its missing keys.json, so the feed is removed.)
     let stranger = w.new_key("stranger");
     let out = w.feed("add", &r.dir, Some("4.0.0"), &stranger, T0, &[]);
     assert_fails(&out, 1, "feed add with a key outside keys.json");
+    fs::remove_file(r.dir.join("feed-stable.json")).unwrap();
+    let out = w.feed("refresh", &r.dir, None, key, T0, &[]);
+    let err = assert_fails(&out, 1, "refresh without a feed");
+    assert!(err.contains("does not exist"), "{err}");
 }
 
 /// A widened rollout keeps the release's seed.
@@ -1301,4 +1303,225 @@ fn allow_older_previous_overrides() {
     let seq = w.read_feed(&r.dir).seq();
     assert_eq!(seq, (T0 + 120) * 1000);
     assert_eq!(state_record(&w.state_path())["feeds"]["stable"], seq);
+}
+
+// ---- a recorded document that is missing (F5, S2) --------------------------------------------------
+
+/// The reviewer's repro: a `keys.json` the state file records is deleted. `keys set` refuses, with
+/// or without `--threshold`, and `--trust-release-dir` does not cover it. Under
+/// `--allow-older-previous` the threshold must still be given; the new key set and the record then
+/// carry it, and the lowered version is named.
+#[test]
+fn missing_key_set_is_refused() {
+    let w = World::new(2);
+    let (a, b) = (&w.release[0], &w.release[1]);
+    let dir = w.release_dir("rel", &[a]);
+    for epoch in [T0 + 60, T0 + 120] {
+        let out = w.keys_set_with(&dir, &[a, b], epoch, &["--threshold", "2"]);
+        assert_ok(&out, "keys set --threshold 2");
+    }
+    let rec = state_record(&w.state_path());
+    assert_eq!(
+        (rec["keys_version"].clone(), rec["keys_threshold"].clone()),
+        (3.into(), 2.into())
+    );
+    let keys = dir.join("keys.json");
+    fs::remove_file(&keys).unwrap();
+    let before = fs::read(w.state_path()).unwrap();
+
+    let refusals: [&[&str]; 3] = [&[], &["--threshold", "2"], &["--trust-release-dir"]];
+    for extra in refusals {
+        let out = w.keys_set_with(&dir, &[a, b], T0 + 180, extra);
+        let err = assert_fails(&out, 1, "keys set over a missing keys.json");
+        assert!(
+            err.contains(
+                "keys.json: missing from the release directory, but the state file records version 3"
+            ),
+            "{extra:?}: {err}"
+        );
+        assert!(err.contains("--allow-older-previous"), "{err}");
+        assert!(!keys.exists(), "{extra:?}: nothing was written");
+        assert_eq!(fs::read(w.state_path()).unwrap(), before, "{extra:?}");
+    }
+
+    let out = w.keys_set_with(&dir, &[a, b], T0 + 180, &["--allow-older-previous"]);
+    let err = assert_fails(&out, 1, "the override without --threshold");
+    assert!(
+        err.contains("records version 3 with threshold 2") && err.contains("pass --threshold"),
+        "{err}"
+    );
+    assert!(!keys.exists());
+    assert_eq!(fs::read(w.state_path()).unwrap(), before);
+
+    let out = w.keys_set_with(
+        &dir,
+        &[a, b],
+        T0 + 180,
+        &["--allow-older-previous", "--threshold", "2"],
+    );
+    assert_ok(&out, "keys set --allow-older-previous --threshold 2");
+    let err = stderr(&out);
+    assert!(
+        err.contains("keys.json is missing, but the state file records version 3")
+            && err.contains("keys.json version 3 -> 1 (--allow-older-previous)"),
+        "{err}"
+    );
+    assert!(
+        stdout(&out).contains("change: keys.json was missing (the state file records version 3)"),
+        "{}",
+        stdout(&out)
+    );
+    let ks = w.keys(&dir);
+    assert_eq!((ks.version(), ks.threshold()), (1, 2));
+    let rec = state_record(&w.state_path());
+    assert_eq!(
+        (rec["keys_version"].clone(), rec["keys_threshold"].clone()),
+        (1.into(), 2.into())
+    );
+}
+
+/// `keys rotate-root` with a recorded `keys.json` missing: refused, and under
+/// `--allow-older-previous` it rotates the root and keeps the recorded key set as it is. The feed
+/// writers stop on the missing `keys.json` too.
+#[test]
+fn rotate_root_with_a_missing_key_set_lowers_nothing() {
+    let r = released("4.0.0", &[WIN]);
+    let w = &r.w;
+    let a = &w.release[0];
+    assert_ok(
+        &w.keys_set_with(&r.dir, &[a], T0 + 60, &[]),
+        "keys set version 2",
+    );
+    let keys = r.dir.join("keys.json");
+    fs::remove_file(&keys).unwrap();
+    let before = fs::read(w.state_path()).unwrap();
+    let feed = fs::read(r.dir.join("feed-stable.json")).unwrap();
+
+    for (verb, version) in [("refresh", None), ("add", Some("4.0.0"))] {
+        let out = w.feed(verb, &r.dir, version, a, T0 + 120, &[]);
+        let err = assert_fails(&out, 1, verb);
+        assert!(err.contains("no keys.json"), "{err}");
+        assert_eq!(fs::read(r.dir.join("feed-stable.json")).unwrap(), feed);
+        assert_eq!(fs::read(w.state_path()).unwrap(), before, "{verb}");
+    }
+
+    let new_root = w.new_key("root2");
+    let (old_side, new_side) = (spec(&w.root), spec(&new_root));
+    let args = [
+        "keys",
+        "rotate-root",
+        "--release-dir",
+        s(&r.dir),
+        "--new-root-key",
+        &new_root.public,
+        "--new-threshold",
+        "1",
+        "--sign",
+        &old_side,
+        "--sign-new",
+        &new_side,
+    ];
+    let out = w.run_at(T0 + 120, &args);
+    let err = assert_fails(&out, 1, "rotate-root over a missing keys.json");
+    assert!(
+        err.contains(
+            "keys.json: missing from the release directory, but the state file records version 2"
+        ),
+        "{err}"
+    );
+    assert!(!r.dir.join("root-2.json").exists());
+    assert_eq!(fs::read(w.state_path()).unwrap(), before);
+
+    let mut forced = args.to_vec();
+    forced.push("--allow-older-previous");
+    let out = w.run_at(T0 + 120, &forced);
+    assert_ok(&out, "rotate-root --allow-older-previous");
+    assert!(
+        stderr(&out).contains("keys.json is missing"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(
+        !stderr(&out).contains("record is lowered"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(r.dir.join("root-2.json").exists());
+    assert!(!keys.exists());
+    let rec = state_record(&w.state_path());
+    assert_eq!(rec["root_version"], 2);
+    assert_eq!(
+        (rec["keys_version"].clone(), rec["keys_threshold"].clone()),
+        (2.into(), 1.into())
+    );
+}
+
+/// A removed feed may be started again by `feed add` (M3-R1-D1), but only above the recorded seq:
+/// equal or lower is refused with nothing written, `--allow-older-previous` writes it and names the
+/// lowered record, and a later clock needs no flag.
+#[test]
+fn restarted_channel_seq_must_rise() {
+    let r = released("4.0.0", &[WIN]);
+    let w = &r.w;
+    let a = &w.release[0];
+    assert_ok(
+        &w.feed("refresh", &r.dir, None, a, T0 + 120, &[]),
+        "refresh",
+    );
+    let recorded = (T0 + 120) * 1000;
+    assert_eq!(state_record(&w.state_path())["feeds"]["stable"], recorded);
+    let feed = r.dir.join("feed-stable.json");
+    fs::remove_file(&feed).unwrap();
+    let before = fs::read(w.state_path()).unwrap();
+
+    let out = w.feed("refresh", &r.dir, None, a, T0 + 180, &[]);
+    let err = assert_fails(&out, 1, "refresh of a removed feed");
+    assert!(err.contains("use `feed add`"), "{err}");
+
+    for epoch in [T0 + 60, T0 + 120] {
+        let out = w.feed("add", &r.dir, Some("4.0.0"), a, epoch, &[]);
+        let err = assert_fails(&out, 1, "feed add with a clock not past the record");
+        assert!(
+            err.contains(&format!(
+                "would have seq {}, not above the recorded {recorded}",
+                epoch * 1000
+            )),
+            "{err}"
+        );
+        assert!(!feed.exists());
+        assert_eq!(fs::read(w.state_path()).unwrap(), before);
+    }
+
+    let out = w.feed(
+        "add",
+        &r.dir,
+        Some("4.0.0"),
+        a,
+        T0 + 60,
+        &["--allow-older-previous"],
+    );
+    assert_ok(&out, "feed add --allow-older-previous");
+    assert!(
+        stderr(&out).contains(&format!(
+            "feed-stable.json seq {recorded} -> {} (--allow-older-previous)",
+            (T0 + 60) * 1000
+        )),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(
+        state_record(&w.state_path())["feeds"]["stable"],
+        (T0 + 60) * 1000
+    );
+
+    fs::remove_file(&feed).unwrap();
+    assert_ok(
+        &w.feed("add", &r.dir, Some("4.0.0"), a, T0 + 180, &[]),
+        "feed add with a later clock",
+    );
+    assert_eq!(w.read_feed(&r.dir).seq(), (T0 + 180) * 1000);
+    assert_eq!(
+        state_record(&w.state_path())["feeds"]["stable"],
+        (T0 + 180) * 1000
+    );
 }

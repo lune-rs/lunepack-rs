@@ -172,6 +172,9 @@ fn prepare(
                 field: "seq",
                 recorded: record.feeds.get(channel.as_str()).copied(),
                 found: prev.as_ref().map(VerifiedFeed::seq),
+                // A removed feed may be started again (M3-R1-D1); `finish` keeps its seq above
+                // the record.
+                may_be_absent: true,
             },
         ],
         over,
@@ -297,13 +300,14 @@ fn finish(
         );
     }
 
-    place::replace(&dir.join(&name), &bytes)?;
     let mut record = p.record.clone();
     record.set_keys(p.root_k, &p.keys);
     record
         .feeds
         .insert(p.channel.as_str().to_owned(), feed.seq());
-    p.state.save(&p.app_id, record)?;
+    p.state.guard_update(&p.app_id, &record, p.over)?;
+    place::replace(&dir.join(&name), &bytes)?;
+    p.state.save(&p.app_id, record, p.over)?;
     say(&format!(
         "placed: {name} (seq {}, {} release(s), {manifests} manifest(s) verified)",
         feed.seq(),

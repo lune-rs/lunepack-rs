@@ -281,7 +281,7 @@ pub fn set_keys(config_path: &Path, args: &SetArgs) -> Result<()> {
     } = release_dir::open(&args.release_dir, &config, &hasher, &verifier, &reading)?;
     // Nothing read above is built on until it matches what this publisher last signed (S1).
     let mut state = State::load(&config.state_path)?;
-    let mut record = state.record(&config.app_id);
+    let record = state.record(&config.app_id);
     let clean = state.check(
         &[
             record.root_compared(root_doc_k, config.root_version),
@@ -321,10 +321,21 @@ pub fn set_keys(config_path: &Path, args: &SetArgs) -> Result<()> {
             not_after: U53::new(na)?,
         });
     }
-    // The threshold is never inherited from a document the state check did not vouch for.
+    // The threshold is never inherited from a document the state check did not vouch for, nor
+    // defaulted when the state file records a key set that is missing (F5, S2).
     let threshold = match (args.threshold, &prev) {
         (Some(t), _) => t,
-        (None, None) => 1,
+        (None, None) => {
+            if record.keys_version.is_some() || record.keys_threshold.is_some() {
+                let show = |v: Option<u64>| v.map_or_else(|| "none".to_owned(), |v| v.to_string());
+                bail!(
+                    "keys.json is missing, and the state file records version {} with threshold {}: a threshold is not chosen for you, pass --threshold (nothing was written)",
+                    show(record.keys_version),
+                    show(record.keys_threshold)
+                );
+            }
+            1
+        }
         (None, Some(p)) => {
             let t = p.threshold() as u64;
             if !clean {
@@ -378,13 +389,21 @@ pub fn set_keys(config_path: &Path, args: &SetArgs) -> Result<()> {
         args.allow_unverifiable_feeds,
         "keys set",
     )?;
-    say(&format!(
-        "change: {}",
-        key_set_diff(prev.as_ref(), &verified)
-    ))?;
+    let mut next_record = record.clone();
+    next_record.set_keys(root_doc_k, &verified);
+    state.guard_update(&config.app_id, &next_record, args.state)?;
+    let change = match (&prev, record.keys_version) {
+        (None, Some(v)) => format!(
+            "keys.json was missing (the state file records version {v}); a new key set from version {}: {} key(s), threshold {}",
+            verified.version(),
+            verified.keys().len(),
+            verified.threshold()
+        ),
+        _ => key_set_diff(prev.as_ref(), &verified),
+    };
+    say(&format!("change: {change}"))?;
     place::replace(&release_dir::keys_path(&args.release_dir), &bytes)?;
-    record.set_keys(root_doc_k, &verified);
-    state.save(&config.app_id, record)?;
+    state.save(&config.app_id, next_record, args.state)?;
     say(&format!(
         "keys.json: version {}, root {root_doc_k}, {} key(s), threshold {}",
         verified.version(),
@@ -634,18 +653,21 @@ pub fn rotate_root_cmd(config_path: &Path, args: &RotateArgs) -> Result<()> {
         }
     };
 
+    // Without keys.json (only under --allow-older-previous when the state file records one) the
+    // recorded key set is kept as it is: nothing is lowered.
+    match &resigned {
+        Some((_, verified)) => record.set_keys(new_root.version(), verified),
+        None => record.root_version = Some(new_root.version()),
+    }
+    state.guard_update(&config.app_id, &record, args.state)?;
     place::write_new(
         &release_dir::root_path(&args.release_dir, new_root.version()),
         &root_bytes,
     )?;
-    match &resigned {
-        Some((bytes, verified)) => {
-            place::replace(&release_dir::keys_path(&args.release_dir), bytes)?;
-            record.set_keys(new_root.version(), verified);
-        }
-        None => record.root_version = Some(new_root.version()),
+    if let Some((bytes, _)) = &resigned {
+        place::replace(&release_dir::keys_path(&args.release_dir), bytes)?;
     }
-    state.save(&config.app_id, record)?;
+    state.save(&config.app_id, record, args.state)?;
     say(&format!("root-{}.json written", new_root.version()))?;
     if resigned.is_some() {
         say("keys.json re-signed under the new root")?;

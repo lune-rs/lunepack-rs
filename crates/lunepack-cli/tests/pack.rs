@@ -143,19 +143,34 @@ impl World {
         }
     }
 
-    /// A release dir named `name` with `keys.json` written at `T0`.
+    /// A release dir named `name` with `keys.json` written at `T0`. Each release dir has its own
+    /// publisher state file (a copy of the config in `<name>.publisher/`): one state file records
+    /// one release dir, and a second dir without the recorded `keys.json` is refused.
     fn release_dir(&self, name: &str, keys_extra: &[&str]) -> PathBuf {
         let dir = self.dir.path().join(name);
         fs::create_dir(&dir).unwrap();
+        let publisher = self.dir.path().join(format!("{name}.publisher"));
+        fs::create_dir(&publisher).unwrap();
+        let config = publisher.join("lunepack.toml");
+        fs::copy(&self.config, &config).unwrap();
         let t = self.threshold.to_string();
-        let mut args = vec!["keys", "set", "--release-dir", s(&dir), "--threshold", &t];
+        let mut args = vec![
+            "--config",
+            s(&config),
+            "keys",
+            "set",
+            "--release-dir",
+            s(&dir),
+            "--threshold",
+            &t,
+        ];
         for k in &self.release {
             args.extend_from_slice(&["--release-key", &k.public]);
         }
         let root = spec(&self.root);
         args.extend_from_slice(&["--sign", &root]);
         args.extend_from_slice(keys_extra);
-        let out = self.run(&args, &[("SOURCE_DATE_EPOCH", &T0.to_string())]);
+        let out = self.cmd(&args, &[("SOURCE_DATE_EPOCH", &T0.to_string())]);
         assert_ok(&out, "keys set");
         dir
     }
