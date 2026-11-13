@@ -110,6 +110,20 @@ fn reader_clock(at: Option<u64>) -> Box<dyn Clock> {
     }
 }
 
+/// Reads the manifest `entry` names and verifies it under `keys` (signatures, threshold and the
+/// feed's reference). A missing file or a failed check is an error naming the file.
+fn load_manifest(
+    dir: &Path,
+    keys: &VerifiedKeySet,
+    entry: &FeedTargetEntry,
+) -> Result<VerifiedManifest> {
+    let reference = entry.reference();
+    let bytes = read_capped(&dir.join(reference.path()), reference.size())?
+        .with_context(|| format!("{} does not exist", reference.path()))?;
+    verify_manifest(keys, entry, &bytes, &Sha256Hasher, &Ed25519Verifier)
+        .with_context(|| format!("{} does not verify", reference.path()))
+}
+
 /// Reads, verifies and decodes the manifest `entry` names and its pack (M3-D9: the way a client
 /// does). A missing file, a wrong size or hash, a bad signature or a frame that does not decode is
 /// an error naming the file.
@@ -118,12 +132,9 @@ pub fn check_target(
     keys: &VerifiedKeySet,
     entry: &FeedTargetEntry,
 ) -> Result<TargetCheck> {
-    let (hasher, verifier) = (Sha256Hasher, Ed25519Verifier);
+    let hasher = Sha256Hasher;
     let reference = entry.reference();
-    let bytes = read_capped(&dir.join(reference.path()), reference.size())?
-        .with_context(|| format!("{} does not exist", reference.path()))?;
-    let manifest = verify_manifest(keys, entry, &bytes, &hasher, &verifier)
-        .with_context(|| format!("{} does not verify", reference.path()))?;
+    let manifest = load_manifest(dir, keys, entry)?;
 
     let pack_ref = manifest.pack();
     let pack = read_capped(&dir.join(pack_ref.path()), pack_ref.size())?
@@ -162,25 +173,120 @@ pub fn check_target(
     })
 }
 
-/// The `feed-<channel>.json` files of `dir`, by file name; any other `feed-*.json` name is an
-/// error.
-fn feed_files(dir: &Path) -> Result<Vec<(String, Channel)>> {
+/// The names of the `feed-*.json` files of `dir`, sorted.
+fn feed_file_names(dir: &Path) -> Result<Vec<String>> {
     let mut out = Vec::new();
     for entry in fs::read_dir(dir).with_context(|| format!("cannot list {}", dir.display()))? {
         let entry = entry.with_context(|| format!("cannot list {}", dir.display()))?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        if !(name.starts_with("feed-") && name.ends_with(".json")) {
-            continue;
+        if name.starts_with("feed-") && name.ends_with(".json") {
+            out.push(name);
         }
-        let channel = name
-            .strip_prefix("feed-")
-            .and_then(|n| n.strip_suffix(".json"))
-            .unwrap_or_default();
-        let channel = Channel::parse(channel)
-            .with_context(|| format!("{name}: the name does not hold a valid channel"))?;
-        out.push((name, channel));
     }
-    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out.sort();
+    Ok(out)
+}
+
+/// The channel a `feed-<channel>.json` file name holds.
+fn channel_of(name: &str) -> Result<Channel> {
+    let channel = name
+        .strip_prefix("feed-")
+        .and_then(|n| n.strip_suffix(".json"))
+        .unwrap_or_default();
+    Channel::parse(channel)
+        .with_context(|| format!("{name}: the name does not hold a valid channel"))
+}
+
+/// The `feed-<channel>.json` files of `dir`, by file name; any other `feed-*.json` name is an
+/// error.
+fn feed_files(dir: &Path) -> Result<Vec<(String, Channel)>> {
+    feed_file_names(dir)?
+        .into_iter()
+        .map(|name| channel_of(&name).map(|c| (name, c)))
+        .collect()
+}
+
+/// A feed of a release directory that `verify` would reject, and what is wrong with it.
+pub struct Rejected {
+    /// The feed's file name.
+    pub feed: String,
+    /// `<version>/<target>` when the feed verifies but that release's manifest does not; none when
+    /// the feed itself does not verify.
+    pub item: Option<String>,
+    /// The cause, without any document content beyond what the verifier names.
+    pub why: String,
+}
+
+impl Rejected {
+    /// One line naming the feed (and the release and target) and the cause.
+    pub fn line(&self) -> String {
+        match &self.item {
+            Some(item) => format!("{}: {item}: {}", self.feed, self.why),
+            None => format!("{}: {}", self.feed, self.why),
+        }
+    }
+}
+
+/// Every `feed-*.json` of `dir`, and every manifest it references, that does not verify under
+/// `keys` at `reading` (no pack is read). A feed whose own signatures fail is reported once; for a
+/// feed that verifies, each failing `<version>/<target>` is reported. Used before a key set is
+/// placed (Revision 1: no command leaves a feed that `verify` would reject unless asked).
+pub fn unverifiable_feeds(
+    dir: &Path,
+    app_id: &lunepack_core::AppId,
+    keys: &VerifiedKeySet,
+    reading: &ClockReading,
+) -> Result<Vec<Rejected>> {
+    let verifier = Ed25519Verifier;
+    let mut out = Vec::new();
+    for file in feed_file_names(dir)? {
+        let checked = (|| -> Result<VerifiedFeed> {
+            let channel = channel_of(&file)?;
+            let bytes = read_capped(&dir.join(&file), Limits::V1.feed_doc_bytes)?
+                .with_context(|| format!("{file} does not exist"))?;
+            verify_feed(
+                keys,
+                &bytes,
+                app_id,
+                &channel,
+                &RollbackFloor::default(),
+                reading,
+                &verifier,
+            )
+            .map_err(Into::into)
+        })();
+        let feed = match checked {
+            Ok(feed) => feed,
+            Err(e) => {
+                out.push(Rejected {
+                    feed: file,
+                    item: None,
+                    why: format!("does not verify: {e:#}"),
+                });
+                continue;
+            }
+        };
+        for (i, release) in feed.releases().iter().enumerate() {
+            for target in release.targets().keys() {
+                let item = format!("{}/{target}", release.version_text());
+                let Some(entry) = feed.target_entry(i, *target) else {
+                    out.push(Rejected {
+                        feed: file.clone(),
+                        item: Some(item),
+                        why: "internal error: a release without its target".to_owned(),
+                    });
+                    continue;
+                };
+                if let Err(e) = load_manifest(dir, keys, &entry) {
+                    out.push(Rejected {
+                        feed: file.clone(),
+                        item: Some(item),
+                        why: format!("{e:#}"),
+                    });
+                }
+            }
+        }
+    }
     Ok(out)
 }
 

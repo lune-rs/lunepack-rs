@@ -16,6 +16,7 @@ use lunepack_core::{
 };
 use lunepack_crypto::{Ed25519Verifier, Sha256Hasher, generate_key_file};
 
+use crate::cmd_verify::unverifiable_feeds;
 use crate::config::{Config, hex32, resolve_signer, writer_clock};
 use crate::place;
 use crate::release_dir::{self, Opened};
@@ -193,6 +194,10 @@ pub struct SetArgs {
     /// root's threshold.
     #[arg(long = "sign", required = true)]
     sign: Vec<String>,
+    /// Place `keys.json` even when a feed or a manifest it references no longer verifies under it;
+    /// each such feed is named on stderr.
+    #[arg(long = "allow-unverifiable-feeds")]
+    allow_unverifiable_feeds: bool,
 }
 
 /// The release keys of a verified key set, as entries.
@@ -213,6 +218,41 @@ fn entries_of(keys: &VerifiedKeySet) -> Vec<ReleaseKeyEntry> {
 
 fn refs(signers: &[Box<dyn Signer>]) -> Vec<&dyn Signer> {
     signers.iter().map(|s| s.as_ref()).collect()
+}
+
+/// The pre-placement guard of `keys set` and `keys rotate-root` (Revision 1, I3): every
+/// `feed-*.json` of `dir`, and every manifest it references, must verify under `keys` (time checks
+/// skipped), or the command stops before it places anything. `allow` places anyway and names each
+/// feed `verify` will now reject.
+fn guard_feeds(
+    dir: &Path,
+    config: &Config,
+    keys: &VerifiedKeySet,
+    reading: &ClockReading,
+    allow: bool,
+    command: &str,
+) -> Result<()> {
+    let rejected = unverifiable_feeds(dir, &config.app_id, keys, reading)?;
+    if rejected.is_empty() {
+        return Ok(());
+    }
+    if allow {
+        let mut named = BTreeSet::new();
+        for r in &rejected {
+            if named.insert(r.feed.clone()) {
+                eprintln!("warning: {} will no longer pass `lunepack verify`", r.feed);
+            }
+        }
+        return Ok(());
+    }
+    let lines: String = rejected
+        .iter()
+        .map(|r| format!("\n  {}", r.line()))
+        .collect();
+    bail!(
+        "`{command}` would leave documents that no longer verify under the new key set (nothing was written):{lines}\n\
+         refresh the feed with a key you keep before removing this one; drop releases whose manifests only removed keys signed (`feed refresh --drop <version>`); or pass --allow-unverifiable-feeds to place it anyway"
+    )
 }
 
 /// `keys set`: writes `keys.json` with exactly the listed keys, signed to the root's threshold.
@@ -291,6 +331,14 @@ pub fn set_keys(config_path: &Path, args: &SetArgs) -> Result<()> {
         &verifier,
     )
     .context("the new keys.json does not verify (nothing was written)")?;
+    guard_feeds(
+        &args.release_dir,
+        &config,
+        &verified,
+        &reading,
+        args.allow_unverifiable_feeds,
+        "keys set",
+    )?;
     place::replace(&release_dir::keys_path(&args.release_dir), &bytes)?;
     say(&format!(
         "keys.json: version {}, root {root_doc_k}, {} key(s), threshold {}",
@@ -321,6 +369,10 @@ pub struct RotateArgs {
     /// on either side or both: it signs once.
     #[arg(long = "sign-new", required = true)]
     sign_new: Vec<String>,
+    /// Place the files even when a feed or a manifest it references no longer verifies; each such
+    /// feed is named on stderr.
+    #[arg(long = "allow-unverifiable-feeds")]
+    allow_unverifiable_feeds: bool,
 }
 
 fn root_document(root: &TrustedRoot) -> Result<RootDocument> {
@@ -442,7 +494,7 @@ pub fn rotate_root_cmd(config_path: &Path, args: &RotateArgs) -> Result<()> {
                 &hasher,
                 &verifier,
             )?;
-            verify_key_set(
+            let verified = verify_key_set(
                 &new_root,
                 &bytes,
                 &RollbackFloor::default(),
@@ -451,6 +503,14 @@ pub fn rotate_root_cmd(config_path: &Path, args: &RotateArgs) -> Result<()> {
                 &verifier,
             )
             .context("the re-signed keys.json does not verify (nothing was written)")?;
+            guard_feeds(
+                &args.release_dir,
+                &config,
+                &verified,
+                &reading,
+                args.allow_unverifiable_feeds,
+                "keys rotate-root",
+            )?;
             Some(bytes)
         }
     };

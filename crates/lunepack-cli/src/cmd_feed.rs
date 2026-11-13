@@ -70,6 +70,10 @@ pub struct RefreshArgs {
     /// Feed lifetime in days (default 90).
     #[arg(long = "expires-after-days", value_parser = clap::value_parser!(u64).range(1..=MAX_EXPIRES_DAYS))]
     expires_after_days: Option<u64>,
+    /// Remove this release (its version text, as listed in the feed) from the feed; repeat for
+    /// several. The release's files stay in the release directory.
+    #[arg(long = "drop")]
+    drop: Vec<String>,
     /// A release signer: a name from the config, `file:<path>` or `env:<VAR>`.
     #[arg(long = "sign", required = true)]
     sign: Vec<String>,
@@ -135,7 +139,11 @@ fn prepare(
                 &skip,
                 &verifier,
             )
-            .with_context(|| format!("the existing {name} does not verify"))?,
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "the existing {name} does not verify under keys.json: {e}; if it is signed by keys no longer in keys.json, delete it and run `feed add` to start the channel again (its seq restarts from the clock, so publish only with a clock later than the old feed's issue time), or restore the previous keys.json and revoke in two moves"
+                )
+            })?,
         ),
     };
     if require_prev && prev.is_none() {
@@ -180,19 +188,12 @@ fn release_doc(r: &VerifiedRelease) -> Result<ReleaseDoc> {
     })
 }
 
-/// Which releases of the new feed get their manifests and packs read back.
-enum Check<'a> {
-    All,
-    Version(&'a str),
-}
-
 /// Builds, signs, verifies and places the feed with `releases`.
 fn finish(
     p: &Prepared,
     dir: &Path,
     releases: Vec<ReleaseDoc>,
     expires_after_days: Option<u64>,
-    check: Check<'_>,
 ) -> Result<()> {
     let (hasher, verifier) = (Sha256Hasher, Ed25519Verifier);
     let expires_after = expires_after_days.map(|d| d * SECS_PER_DAY);
@@ -227,12 +228,10 @@ fn finish(
         bail!("the new feed's seq does not rise (nothing was written)");
     }
 
+    // Every release the new feed lists must have a manifest that verifies under the current key
+    // set and a pack that decodes (Revision 1, I1), not only the one just added.
     let mut manifests = 0usize;
     for (i, release) in feed.releases().iter().enumerate() {
-        match check {
-            Check::Version(v) if release.version_text() != v => continue,
-            Check::Version(_) | Check::All => {}
-        }
         for target in release.targets().keys() {
             let entry = feed
                 .target_entry(i, *target)
@@ -374,13 +373,7 @@ pub fn add(config_path: &Path, args: &AddArgs) -> Result<()> {
         });
     }
     releases.push(doc);
-    finish(
-        &p,
-        &args.release_dir,
-        releases,
-        args.expires_after_days,
-        Check::Version(&args.version),
-    )
+    finish(&p, &args.release_dir, releases, args.expires_after_days)
 }
 
 /// `feed refresh`: the same releases under a new `seq`, `issued` and `expires`.
@@ -392,17 +385,23 @@ pub fn refresh(config_path: &Path, args: &RefreshArgs) -> Result<()> {
         &args.sign,
         true,
     )?;
-    let releases = p
+    let prev = p
         .prev
         .as_ref()
-        .map(|prev| prev.releases().iter().map(release_doc).collect())
-        .transpose()?
-        .unwrap_or_default();
-    finish(
-        &p,
-        &args.release_dir,
-        releases,
-        args.expires_after_days,
-        Check::All,
-    )
+        .context("internal error: no previous feed")?;
+    for d in &args.drop {
+        if !prev.releases().iter().any(|r| r.version_text() == d) {
+            bail!(
+                "--drop {d:?}: not a release of {}",
+                feed_file_name(&p.channel)
+            );
+        }
+    }
+    let releases = prev
+        .releases()
+        .iter()
+        .filter(|r| !args.drop.iter().any(|d| d == r.version_text()))
+        .map(release_doc)
+        .collect::<Result<Vec<_>>>()?;
+    finish(&p, &args.release_dir, releases, args.expires_after_days)
 }

@@ -143,13 +143,19 @@ impl World {
     }
 
     fn keys_set(&self, dir: &Path, keys: &[&Key]) {
+        assert_ok(&self.keys_set_with(dir, keys, T0, &[]), "keys set");
+    }
+
+    /// `keys set` at `epoch` with `extra` flags; the output is the caller's to judge.
+    fn keys_set_with(&self, dir: &Path, keys: &[&Key], epoch: u64, extra: &[&str]) -> Output {
         let mut args = vec!["keys", "set", "--release-dir", s(dir)];
         for k in keys {
             args.extend_from_slice(&["--release-key", &k.public]);
         }
         let root = spec(&self.root);
         args.extend_from_slice(&["--sign", &root]);
-        assert_ok(&self.run_at(T0, &args), "keys set");
+        args.extend_from_slice(extra);
+        self.run_at(epoch, &args)
     }
 
     fn pack(&self, input: &Path, dir: &Path, version: &str, target: &str, key: &Key) -> Output {
@@ -158,6 +164,18 @@ impl World {
 
     fn pack_signed(
         &self,
+        input: &Path,
+        dir: &Path,
+        version: &str,
+        target: &str,
+        keys: &[&Key],
+    ) -> Output {
+        self.pack_signed_at(T0, input, dir, version, target, keys)
+    }
+
+    fn pack_signed_at(
+        &self,
+        epoch: u64,
         input: &Path,
         dir: &Path,
         version: &str,
@@ -179,7 +197,7 @@ impl World {
         for signer in &signers {
             args.extend_from_slice(&["--sign", signer]);
         }
-        self.run_at(T0, &args)
+        self.run_at(epoch, &args)
     }
 
     fn feed(
@@ -582,7 +600,16 @@ fn revoked_world() -> (World, PathBuf) {
     assert_ok(&w.feed("add", &dir, Some("4.0.0"), a, T0, &[]), "feed add");
     assert_ok(&w.verify(&dir, Some(T0)), "verify before the revocation");
 
-    w.keys_set(&dir, &[b]);
+    // The guard stops this `keys set` (the feed is signed by `a` alone); the operator overrides it.
+    let refused = w.keys_set_with(&dir, &[b], T0, &[]);
+    assert_fails(&refused, 1, "keys set that would orphan the feed");
+    let allowed = w.keys_set_with(&dir, &[b], T0, &["--allow-unverifiable-feeds"]);
+    assert_ok(&allowed, "keys set --allow-unverifiable-feeds");
+    assert!(
+        stderr(&allowed).contains("feed-stable.json"),
+        "{}",
+        stderr(&allowed)
+    );
     let out = w.verify(&dir, Some(T0));
     let err = assert_fails(&out, 1, "verify after the revocation");
     assert!(err.contains("feed-stable.json does not verify"), "{err:?}");
@@ -599,18 +626,185 @@ fn revocation() {
     revoked_world();
 }
 
-/// Test 6, second half: `feed refresh` with the remaining key repairs the feed. Blocked: the
-/// writer reads the previous feed through `verify_feed`, which the revoked signature fails, so
-/// there are no releases to carry over (see notes.md, step 9).
-#[test]
-#[ignore = "blocked: refresh cannot read a feed signed by a revoked key; needs a decision"]
-fn revocation_then_refresh() {
-    let (w, dir) = revoked_world();
+/// State after move 1 of the revocation story: keys `[A]`, release 1.0.0 signed by A, a feed
+/// signed by A at `T0`. Returns the world, the release dir, the app tree, A's feed bytes and seq.
+fn after_move_1() -> (World, PathBuf, tempfile::TempDir, Vec<u8>, u64) {
+    let w = World::new(3);
+    let input = app_tree();
+    let a = &w.release[0];
+    let dir = w.release_dir("rel", &[a]);
+    assert_ok(&w.pack(input.path(), &dir, "1.0.0", WIN, a), "pack 1.0.0");
     assert_ok(
-        &w.feed("refresh", &dir, None, &w.release[1], T0 + DAY, &[]),
-        "feed refresh with the new key",
+        &w.feed("add", &dir, Some("1.0.0"), a, T0, &[]),
+        "feed add 1.0.0",
     );
-    assert_ok(&w.verify(&dir, Some(T0 + DAY)), "verify after the refresh");
+    let bytes = fs::read(dir.join("feed-stable.json")).unwrap();
+    let seq = w.read_feed(&dir).seq();
+    (w, dir, input, bytes, seq)
+}
+
+/// Test 6: revoking a release key in two moves (M3-R1-D1), every read verified.
+#[test]
+fn revocation_two_moves() {
+    let (w, dir, input, feed1, seq1) = after_move_1();
+    let (a, b) = (&w.release[0], &w.release[1]);
+
+    // Move 2: keep A, add B; the previous feed verifies through A.
+    w.keys_set(&dir, &[a, b]);
+    assert_ok(&w.pack(input.path(), &dir, "1.1.0", WIN, b), "pack 1.1.0");
+    assert_ok(
+        &w.feed("add", &dir, Some("1.1.0"), b, T0, &[]),
+        "feed add 1.1.0",
+    );
+    let seq2 = w.read_feed(&dir).seq();
+    assert_ok(&w.feed("refresh", &dir, None, b, T0, &[]), "feed refresh");
+    let seq3 = w.read_feed(&dir).seq();
+    assert!(seq1 < seq2 && seq2 < seq3, "{seq1} {seq2} {seq3}");
+
+    // Move 3: removing A now would orphan 1.0.0 (its manifest is signed by A alone).
+    let keys_before = fs::read(dir.join("keys.json")).unwrap();
+    let feed_before = fs::read(dir.join("feed-stable.json")).unwrap();
+    let out = w.keys_set_with(&dir, &[b], T0, &[]);
+    let err = assert_fails(&out, 1, "keys set [B] with 1.0.0 still listed");
+    assert!(err.contains(&format!("1.0.0/{WIN}")), "{err:?}");
+    assert!(err.contains("--drop"), "{err:?}");
+    assert!(!err.contains("1.1.0/"), "{err:?}");
+    assert_eq!(fs::read(dir.join("keys.json")).unwrap(), keys_before);
+    assert_eq!(fs::read(dir.join("feed-stable.json")).unwrap(), feed_before);
+
+    // A version the feed does not list cannot be dropped.
+    let out = w.feed("refresh", &dir, None, b, T0, &["--drop", "9.9.9"]);
+    assert_fails(&out, 1, "--drop of an unlisted version");
+    assert_eq!(fs::read(dir.join("feed-stable.json")).unwrap(), feed_before);
+
+    // Move 4: drop 1.0.0, then remove A.
+    assert_ok(
+        &w.feed("refresh", &dir, None, b, T0, &["--drop", "1.0.0"]),
+        "feed refresh --drop 1.0.0",
+    );
+    let feed = w.read_feed(&dir);
+    assert!(feed.seq() > seq3);
+    assert_eq!(feed.releases().len(), 1);
+    assert_eq!(feed.releases()[0].version_text(), "1.1.0");
+    assert_ok(&w.keys_set_with(&dir, &[b], T0, &[]), "keys set [B]");
+    assert_ok(&w.verify(&dir, Some(T0)), "verify after the revocation");
+
+    // Move 5: A is revoked.
+    let out = w.pack(input.path(), &dir, "1.2.0", WIN, a);
+    assert_fails(&out, 1, "pack with the revoked key");
+    let out = w.feed("refresh", &dir, None, a, T0, &[]);
+    assert_fails(&out, 1, "feed refresh with the revoked key");
+    let old = w.dir.path().join("rel-old");
+    copy_dir(&dir, &old);
+    fs::write(old.join("feed-stable.json"), &feed1).unwrap();
+    let out = w.verify(&old, Some(T0));
+    let err = assert_fails(&out, 1, "verify of A's old feed against the new keys.json");
+    assert!(err.contains("feed-stable.json does not verify"), "{err:?}");
+}
+
+/// A feed with no release is valid (FORMAT section 7): `--drop` can empty it.
+#[test]
+fn dropping_every_release_leaves_an_empty_feed() {
+    let r = released("4.0.0", &[WIN]);
+    let w = &r.w;
+    let before = w.read_feed(&r.dir).seq();
+    assert_ok(
+        &w.feed(
+            "refresh",
+            &r.dir,
+            None,
+            &w.release[0],
+            T0,
+            &["--drop", "4.0.0"],
+        ),
+        "feed refresh --drop",
+    );
+    let feed = w.read_feed(&r.dir);
+    assert!(feed.releases().is_empty());
+    assert!(feed.seq() > before);
+    assert_ok(&w.verify(&r.dir, Some(T0)), "verify an empty feed");
+}
+
+/// Test 6, fallback: the operator revoked first. The feed is deleted and the channel restarted; the
+/// new feed's seq stays above the old one only because the clock moved on.
+#[test]
+fn revocation_fallback_restarts_the_channel() {
+    let (w, dir, input, _feed1, seq1) = after_move_1();
+    let c = &w.release[2];
+
+    // Without the flag the guard refuses and names the feed.
+    let out = w.keys_set_with(&dir, &[c], T0, &[]);
+    let err = assert_fails(&out, 1, "keys set [C] without the override");
+    assert!(err.contains("feed-stable.json"), "{err:?}");
+
+    let out = w.keys_set_with(&dir, &[c], T0, &["--allow-unverifiable-feeds"]);
+    assert_ok(&out, "keys set [C] --allow-unverifiable-feeds");
+    assert!(
+        stderr(&out).contains("feed-stable.json"),
+        "{}",
+        stderr(&out)
+    );
+    assert_fails(&w.verify(&dir, Some(T0)), 1, "verify with an orphaned feed");
+
+    for (verb, version) in [("refresh", None), ("add", Some("1.0.0"))] {
+        let out = w.feed(verb, &dir, version, c, T0, &[]);
+        let err = assert_fails(&out, 1, "feed write over an unverifiable feed");
+        assert!(err.contains("delete it and run `feed add`"), "{err:?}");
+        assert!(err.contains("feed-stable.json"), "{err:?}");
+    }
+
+    fs::remove_file(dir.join("feed-stable.json")).unwrap();
+    let later = T0 + 60;
+    let out = w.pack_signed_at(later, input.path(), &dir, "1.1.0", WIN, &[c]);
+    assert_ok(&out, "pack 1.1.0 with C");
+    assert_ok(
+        &w.feed("add", &dir, Some("1.1.0"), c, later, &[]),
+        "feed add 1.1.0 with C",
+    );
+    assert_ok(&w.verify(&dir, Some(later)), "verify after the restart");
+    let seq = w.read_feed(&dir).seq();
+    assert!(seq > seq1, "{seq} {seq1}");
+}
+
+/// `keys rotate-root` runs the same guard as `keys set`.
+#[test]
+fn rotate_root_runs_the_guard() {
+    let r = released("4.0.0", &[WIN]);
+    let w = &r.w;
+    let new_root = w.new_key("root2");
+    let (old_spec, new_spec) = (spec(&w.root), spec(&new_root));
+    let args = [
+        "keys",
+        "rotate-root",
+        "--release-dir",
+        s(&r.dir),
+        "--new-root-key",
+        &new_root.public,
+        "--new-threshold",
+        "1",
+        "--sign",
+        &old_spec,
+        "--sign-new",
+        &new_spec,
+    ];
+    flip(&r.dir.join("feed-stable.json"));
+    let keys_before = fs::read(r.dir.join("keys.json")).unwrap();
+    let out = w.run_at(T0, &args);
+    let err = assert_fails(&out, 1, "rotate-root over a damaged feed");
+    assert!(err.contains("feed-stable.json"), "{err:?}");
+    assert!(!r.dir.join("root-2.json").exists());
+    assert_eq!(fs::read(r.dir.join("keys.json")).unwrap(), keys_before);
+
+    let mut forced = args.to_vec();
+    forced.push("--allow-unverifiable-feeds");
+    let out = w.run_at(T0, &forced);
+    assert_ok(&out, "rotate-root --allow-unverifiable-feeds");
+    assert!(
+        stderr(&out).contains("feed-stable.json"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(r.dir.join("root-2.json").exists());
 }
 
 /// Writer refusals of `feed add`.
