@@ -5,7 +5,10 @@
 
 use std::fmt;
 
+use crate::path::{PathError, TreeError};
+use crate::target::TargetError;
 use crate::traits::CodecId;
+use crate::version::VersionError;
 
 /// Result alias for the core.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -438,6 +441,62 @@ pub enum Error {
     /// A frame descriptor or frame was rejected.
     #[error("frame: {0}")]
     Frame(#[from] FrameError),
+    /// A path failed the path rules (FORMAT.md 10.1).
+    #[error("path: {0}")]
+    Path(#[from] PathError),
+    /// A manifest's entry set failed the tree rules (FORMAT.md 10.2).
+    #[error("tree: {0}")]
+    Tree(#[from] TreeError),
+    /// A version failed the version rules (FORMAT.md 10.3).
+    #[error("version: {0}")]
+    Version(#[from] VersionError),
+    /// A target id is not one of v1's (FORMAT.md 10.4).
+    #[error("target: {0}")]
+    Target(#[from] TargetError),
+    /// An artifact reference's path uses a character outside `[A-Za-z0-9._+-]` (FORMAT.md 7.1).
+    #[error("artifact reference path has a character outside [A-Za-z0-9._+-]")]
+    ReferenceChar,
+    /// More items than the format's cap.
+    #[error("{count} {what}, at most {max}")]
+    TooMany {
+        /// What was counted.
+        what: &'static str,
+        /// Items found.
+        count: usize,
+        /// The cap.
+        max: usize,
+    },
+    /// A feed's `channel` differs from the expected one. Neither is shown.
+    #[error("channel does not match the expected channel")]
+    ChannelMismatch,
+    /// A manifest's `target` differs from the feed entry's.
+    #[error("target {found} is not the expected {expected}")]
+    TargetMismatch {
+        /// The feed entry's target.
+        expected: &'static str,
+        /// The manifest's target.
+        found: &'static str,
+    },
+    /// A manifest's `version` is not byte-equal to the feed entry's.
+    #[error("manifest version does not match the feed")]
+    VersionMismatch,
+    /// Two feed releases with equal precedence (FORMAT.md 7).
+    #[error("two releases with equal precedence")]
+    DuplicateRelease,
+    /// An artifact's length differs from its reference's `size`.
+    #[error("artifact is {actual} bytes, the reference says {expected}")]
+    ArtifactSize {
+        /// The signed size.
+        expected: u64,
+        /// Bytes received.
+        actual: u64,
+    },
+    /// An artifact's SHA-256 differs from its reference's.
+    #[error("artifact hash does not match its reference")]
+    ArtifactHash,
+    /// A field rule of a feed or manifest (FORMAT.md 7, 8) is broken.
+    #[error("invalid field: {0}")]
+    Field(&'static str),
     /// A document is expired at the reader's `now` (FORMAT.md 11.3).
     #[error("{what} expired at {expires}, now is {now}")]
     Expired {

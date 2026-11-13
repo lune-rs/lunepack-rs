@@ -11,19 +11,27 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use lunepack_core::digest::{Sha256Digest, U53};
 use lunepack_core::encoding::base64_encode;
 use lunepack_core::error::{Base64Error, JsonError, SignatureError};
+use lunepack_core::path::RelPath;
 use lunepack_core::{
     AppId, Clock, ClockReading, EnvelopeSignature, Error, Hasher, KeyEntry, KeySetDocument,
     PayloadKind, PublicKey, ReleaseKeyEntry, RollbackFloor, RootDocument, TrustedRoot,
     VerifiedKeySet, Verifier, advance_root, pae, verify_key_set, write_envelope,
 };
+use lunepack_core::{
+    ArtifactRef, Channel, CodecId, EntryDoc, FeedDocument, FrameDesc, ManifestDocument, ReleaseDoc,
+    RolloutDoc, StreamDesc, Target,
+};
 
 use crate::clock::{FakeClock, YEAR_2100_UNIX_SECS};
+use crate::codec::FakeCodec;
 use crate::hasher::FakeHasher;
 use crate::suites::SignFixture;
 use crate::verifier::{FAKE_INVALID_KEYS, FakeKeyPair, FakeVerifier};
 
 /// The app id the suite's documents use.
 pub const SUITE_APP_ID: &str = "org.example.hello";
+/// The channel the suite's feeds use.
+pub const SUITE_CHANNEL: &str = "stable";
 /// The suite's base time: 2027-01-15T08:00:00Z.
 pub const SUITE_T0: u64 = 1_800_000_000;
 const DAY: u64 = 86_400;
@@ -167,6 +175,100 @@ impl ChainFixture<'_> {
         .expect("valid compiled-in root")
     }
 
+    /// A root (version 1, key of seed 0) and a key set (version 1, no expiry) whose release keys
+    /// are `release_seeds` with `threshold`, verified at [`SUITE_T0`].
+    pub fn verified_chain(
+        &self,
+        release_seeds: &[u8],
+        threshold: u64,
+    ) -> (TrustedRoot, VerifiedKeySet) {
+        let root = self.trusted_root(1, 1, &[0]);
+        let ks = self.keyset_document(1, 1, None, threshold, release_seeds);
+        let bytes = self.envelope(PayloadKind::Keys, &ks.to_payload(), &[0]);
+        let keys = verify_key_set(
+            &root,
+            &bytes,
+            &RollbackFloor::default(),
+            &ClockReading::read(&FakeClock::new(SUITE_T0), None),
+            self.hasher,
+            self.verifier,
+        )
+        .expect("valid key set");
+        (root, keys)
+    }
+
+    /// An artifact reference to `bytes` at `path`.
+    pub fn artifact_ref(&self, path: &str, bytes: &[u8]) -> ArtifactRef {
+        ArtifactRef {
+            path: path.to_owned(),
+            size: u53(bytes.len() as u64),
+            sha256: self.hasher.sha256(bytes),
+        }
+    }
+
+    /// A feed for [`SUITE_APP_ID`] on channel `stable`, issued at [`SUITE_T0`].
+    pub fn feed_document(
+        &self,
+        seq: u64,
+        expires: Option<u64>,
+        releases: Vec<ReleaseDoc>,
+    ) -> FeedDocument {
+        FeedDocument {
+            format: u53(1),
+            kind: "feed".to_owned(),
+            critical: Vec::new(),
+            app_id: app_id(),
+            channel: Channel::parse(SUITE_CHANNEL).expect("valid channel"),
+            seq: u53(seq),
+            issued: u53(SUITE_T0),
+            expires: expires.map(u53),
+            releases,
+        }
+    }
+
+    /// A release of `version` listing each `(target, manifest bytes)` at the writer's names.
+    pub fn release(
+        &self,
+        version: &str,
+        manifests: &[(Target, &[u8])],
+        rollout: Option<(u64, [u8; 32])>,
+    ) -> ReleaseDoc {
+        ReleaseDoc {
+            version: version.to_owned(),
+            targets: manifests
+                .iter()
+                .map(|(t, bytes)| {
+                    let path = format!("{version}/{}.manifest.json", t.as_str());
+                    (t.as_str().to_owned(), self.artifact_ref(&path, bytes))
+                })
+                .collect(),
+            rollout: rollout.map(|(bp, seed)| RolloutDoc {
+                basis_points: u53(bp),
+                seed: Sha256Digest::from_bytes(seed),
+            }),
+        }
+    }
+
+    /// A manifest for [`SUITE_APP_ID`] issued at [`SUITE_T0`] over `pack`'s entries.
+    pub fn manifest_document(
+        &self,
+        version: &str,
+        target: Target,
+        pack: &PackBuilder,
+    ) -> ManifestDocument {
+        ManifestDocument {
+            format: u53(1),
+            kind: "manifest".to_owned(),
+            critical: Vec::new(),
+            app_id: app_id(),
+            version: version.to_owned(),
+            target: target.as_str().to_owned(),
+            issued: u53(SUITE_T0),
+            pack: self.artifact_ref(&format!("{version}/{}.pack", target.as_str()), &pack.bytes),
+            entries: pack.entries.clone(),
+        }
+    }
+
     fn advance(&self, trusted: &TrustedRoot, bytes: &[u8]) -> Result<TrustedRoot, Error> {
         advance_root(trusted, bytes, self.hasher, self.verifier)
     }
@@ -179,6 +281,95 @@ impl ChainFixture<'_> {
         clock: ClockReading,
     ) -> Result<VerifiedKeySet, Error> {
         verify_key_set(root, bytes, &floor, &clock, self.hasher, self.verifier)
+    }
+}
+
+/// Builds a pack and its manifest entries the way the packager does: each file encoded by
+/// [`FakeCodec::encode`] and appended as one frame.
+#[derive(Debug, Clone, Default)]
+pub struct PackBuilder {
+    /// The pack's bytes.
+    pub bytes: Vec<u8>,
+    /// The manifest entries, in the order added.
+    pub entries: Vec<EntryDoc>,
+}
+
+impl PackBuilder {
+    /// An empty pack.
+    pub fn new() -> Self {
+        PackBuilder::default()
+    }
+
+    /// Adds a file; a non-empty one gets a frame of `codec` (dictionary 64 KiB).
+    pub fn file(
+        &mut self,
+        hasher: &dyn Hasher,
+        path: &str,
+        data: &[u8],
+        codec: CodecId,
+    ) -> &mut Self {
+        let frame = (!data.is_empty()).then(|| {
+            let enc = FakeCodec::encode(codec, data);
+            let lzma = !matches!(codec, CodecId::Stored | CodecId::Bcj2);
+            let desc = FrameDesc {
+                codec: codec.id().to_owned(),
+                offset: u53(self.bytes.len() as u64),
+                length: u53(enc.frame.len() as u64),
+                sha256: hasher.sha256(&enc.frame),
+                dict_size: lzma.then(|| u53(65_536)),
+                streams: (codec == CodecId::Bcj2).then(|| {
+                    enc.streams
+                        .iter()
+                        .enumerate()
+                        .map(|(i, st)| StreamDesc {
+                            length: u53(st.length as u64),
+                            decoded_size: u53(st.decoded_size),
+                            dict_size: (i < 3).then(|| u53(65_536)),
+                        })
+                        .collect()
+                }),
+            };
+            self.bytes.extend_from_slice(&enc.frame);
+            desc
+        });
+        self.entries.push(EntryDoc {
+            path: RelPath::parse(path).expect("valid path"),
+            kind: "file".to_owned(),
+            size: Some(u53(data.len() as u64)),
+            sha256: Some(hasher.sha256(data)),
+            exec: Some(false),
+            frame,
+            target: None,
+        });
+        self
+    }
+
+    /// Adds a directory entry.
+    pub fn dir(&mut self, path: &str) -> &mut Self {
+        self.entries.push(EntryDoc {
+            path: RelPath::parse(path).expect("valid path"),
+            kind: "dir".to_owned(),
+            size: None,
+            sha256: None,
+            exec: None,
+            frame: None,
+            target: None,
+        });
+        self
+    }
+
+    /// Adds a symlink entry.
+    pub fn symlink(&mut self, path: &str, target: &str) -> &mut Self {
+        self.entries.push(EntryDoc {
+            path: RelPath::parse(path).expect("valid path"),
+            kind: "symlink".to_owned(),
+            size: None,
+            sha256: None,
+            exec: None,
+            frame: None,
+            target: Some(target.to_owned()),
+        });
+        self
     }
 }
 
@@ -639,13 +830,13 @@ fn check_order(fx: &ChainFixture<'_>) {
     let payload = fx.keyset_document(1, 1, None, 1, &[5]).to_payload();
     let bytes = fx.envelope(PayloadKind::Feed, &payload, &[3]);
     assert_err!(
-        fx.keys(&root, &bytes, floor, now0()),
+        fx.keys(&root, &bytes, floor.clone(), now0()),
         Error::PayloadType { .. }
     );
     // Wrong type and zero signatures: still the type first.
     let bytes = write_envelope(PayloadKind::Feed.payload_type(), &payload, &[]);
     assert_err!(
-        fx.keys(&root, &bytes, floor, now0()),
+        fx.keys(&root, &bytes, floor.clone(), now0()),
         Error::PayloadType { .. }
     );
     // Nothing in an unauthenticated payload is looked at: garbage, an unknown critical feature
@@ -660,20 +851,23 @@ fn check_order(fx: &ChainFixture<'_>) {
     ] {
         let bytes = fx.envelope(PayloadKind::Keys, &unsigned, &[3]);
         assert_err!(
-            fx.keys(&root, &bytes, floor, now0()),
+            fx.keys(&root, &bytes, floor.clone(), now0()),
             Error::Threshold { .. }
         );
     }
     // Signed garbage reaches the payload parser and fails there.
     let bytes = fx.envelope(PayloadKind::Keys, b"not json", &[0]);
-    assert_err!(fx.keys(&root, &bytes, floor, now0()), Error::Json(_));
+    assert_err!(
+        fx.keys(&root, &bytes, floor.clone(), now0()),
+        Error::Json(_)
+    );
     let bytes = fx.envelope(
         PayloadKind::Keys,
         b"{\"format\":1,\"kind\":\"keys\",\"critical\":[],\"x\":1,\"x\":1}",
         &[0],
     );
     assert_err!(
-        fx.keys(&root, &bytes, floor, now0()),
+        fx.keys(&root, &bytes, floor.clone(), now0()),
         Error::Json(JsonError::DuplicateKey(_))
     );
     // format before kind before critical.
@@ -692,7 +886,7 @@ fn check_order(fx: &ChainFixture<'_>) {
         ),
     ] {
         let bytes = fx.envelope(PayloadKind::Keys, payload, &[0]);
-        let res = fx.keys(&root, &bytes, floor, now0());
+        let res = fx.keys(&root, &bytes, floor.clone(), now0());
         match which {
             0 => assert_err!(res, Error::FormatVersion { found: 2 }),
             1 => assert_err!(res, Error::Kind { .. }),
@@ -724,17 +918,27 @@ fn envelope_structure(fx: &ChainFixture<'_>) {
     let ty = PayloadKind::Keys.payload_type();
     let payload = fx.keyset_document(1, 1, None, 1, &[5]).to_payload();
     let good = fx.envelope(PayloadKind::Keys, &payload, &[0]);
-    fx.keys(&root, &good, floor, now0()).expect("baseline");
+    fx.keys(&root, &good, floor.clone(), now0())
+        .expect("baseline");
 
     // Unknown fields at either level.
     let bytes = replace(&good, "\"payloadType\"", "\"extra\": 1, \"payloadType\"");
-    assert_err!(fx.keys(&root, &bytes, floor, now0()), Error::Schema(_));
+    assert_err!(
+        fx.keys(&root, &bytes, floor.clone(), now0()),
+        Error::Schema(_)
+    );
     let bytes = replace(&good, "\"keyid\"", "\"extra\": 1, \"keyid\"");
-    assert_err!(fx.keys(&root, &bytes, floor, now0()), Error::Schema(_));
+    assert_err!(
+        fx.keys(&root, &bytes, floor.clone(), now0()),
+        Error::Schema(_)
+    );
     // Missing field.
     let keyid = fx.key_id(0).to_hex();
     let bytes = replace(&good, &format!("\"keyid\": \"{keyid}\","), "");
-    assert_err!(fx.keys(&root, &bytes, floor, now0()), Error::Schema(_));
+    assert_err!(
+        fx.keys(&root, &bytes, floor.clone(), now0()),
+        Error::Schema(_)
+    );
     // Duplicate member.
     let bytes = replace(
         &good,
@@ -742,31 +946,34 @@ fn envelope_structure(fx: &ChainFixture<'_>) {
         &format!("\"payloadType\": \"{ty}\", \"payloadType\""),
     );
     assert_err!(
-        fx.keys(&root, &bytes, floor, now0()),
+        fx.keys(&root, &bytes, floor.clone(), now0()),
         Error::Json(JsonError::DuplicateKey(_))
     );
     // Trailing data, not an object.
     let mut bytes = good.clone();
     bytes.extend_from_slice(b" {}");
-    assert_err!(fx.keys(&root, &bytes, floor, now0()), Error::Json(_));
-    assert_err!(fx.keys(&root, b"[]", floor, now0()), Error::Json(_));
+    assert_err!(
+        fx.keys(&root, &bytes, floor.clone(), now0()),
+        Error::Json(_)
+    );
+    assert_err!(fx.keys(&root, b"[]", floor.clone(), now0()), Error::Json(_));
 
     // Signature counts.
     let bytes = write_envelope(ty, &payload, &[]);
     assert_err!(
-        fx.keys(&root, &bytes, floor, now0()),
+        fx.keys(&root, &bytes, floor.clone(), now0()),
         Error::SignatureCount { count: 0, max: 16 }
     );
     let sig = fx.signature(0, ty, &payload);
     let bytes = write_envelope(ty, &payload, &[sig; 17]);
     assert_err!(
-        fx.keys(&root, &bytes, floor, now0()),
+        fx.keys(&root, &bytes, floor.clone(), now0()),
         Error::SignatureCount { count: 17, max: 16 }
     );
     fx.keys(
         &root,
         &write_envelope(ty, &payload, &[sig; 16]),
-        floor,
+        floor.clone(),
         now0(),
     )
     .expect("16 signatures");
@@ -779,7 +986,7 @@ fn envelope_structure(fx: &ChainFixture<'_>) {
         (String::new(), 0),
     ] {
         let bytes = replace(&good, &sig_b64, &bad);
-        match fx.keys(&root, &bytes, floor, now0()) {
+        match fx.keys(&root, &bytes, floor.clone(), now0()) {
             Err(Error::SignatureLength { len: l }) => assert_eq!(l, len),
             other => panic!("expected SignatureLength, got {:?}", other.err()),
         }
@@ -790,21 +997,30 @@ fn envelope_structure(fx: &ChainFixture<'_>) {
     let url = write_envelope(ty, &odd, &[sig]);
     let bytes = replace(&url, "+/8=", "-_8=");
     assert_err!(
-        fx.keys(&root, &bytes, floor, now0()),
+        fx.keys(&root, &bytes, floor.clone(), now0()),
         Error::Base64(Base64Error::InvalidCharacter { .. })
     );
     let bytes = replace(&url, "+/8=", "+/8");
-    assert_err!(fx.keys(&root, &bytes, floor, now0()), Error::Base64(_));
+    assert_err!(
+        fx.keys(&root, &bytes, floor.clone(), now0()),
+        Error::Base64(_)
+    );
     let bytes = replace(&url, "+/8=", "+/8=\\n");
-    assert_err!(fx.keys(&root, &bytes, floor, now0()), Error::Base64(_));
+    assert_err!(
+        fx.keys(&root, &bytes, floor.clone(), now0()),
+        Error::Base64(_)
+    );
     let bytes = replace(&good, &sig_b64, &sig_b64.replace('=', ""));
-    assert_err!(fx.keys(&root, &bytes, floor, now0()), Error::Base64(_));
+    assert_err!(
+        fx.keys(&root, &bytes, floor.clone(), now0()),
+        Error::Base64(_)
+    );
 
     // Size cap: one byte over 64 KiB fails before anything is parsed.
     let mut big = good.clone();
     big.resize(64 * 1024 + 1, b' ');
     assert_err!(
-        fx.keys(&root, &big, floor, now0()),
+        fx.keys(&root, &big, floor.clone(), now0()),
         Error::TooLarge {
             size: 65_537,
             cap: 65_536,
@@ -813,7 +1029,7 @@ fn envelope_structure(fx: &ChainFixture<'_>) {
     );
     let mut fits = good.clone();
     fits.resize(64 * 1024, b' ');
-    fx.keys(&root, &fits, floor, now0())
+    fx.keys(&root, &fits, floor.clone(), now0())
         .expect("trailing whitespace within the cap");
     let mut big_root = fx.envelope(
         PayloadKind::Root,

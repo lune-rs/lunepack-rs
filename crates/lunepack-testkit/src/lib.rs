@@ -15,7 +15,8 @@ mod verifier;
 pub use clock::{FakeClock, YEAR_2100_UNIX_SECS};
 pub use codec::{FakeCodec, FakeEncoded, FakeStreamLayout, Fault};
 pub use docs::{
-    ChainFixture, SUITE_APP_ID, SUITE_T0, TRUST_CHAIN_CASES, fake_sign, run_trust_chain_suite,
+    ChainFixture, PackBuilder, SUITE_APP_ID, SUITE_CHANNEL, SUITE_T0, TRUST_CHAIN_CASES, fake_sign,
+    run_trust_chain_suite,
 };
 pub use hasher::FakeHasher;
 pub use suites::{

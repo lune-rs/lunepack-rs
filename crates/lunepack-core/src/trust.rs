@@ -2,6 +2,7 @@
 //! envelope is authenticated against, the common payload header (FORMAT.md 3.2), the clock
 //! reading with its plausibility (FORMAT.md 11.3) and the anti-rollback floors (FORMAT.md 11.2).
 
+use std::collections::BTreeMap;
 use std::fmt;
 
 use serde::de::{self, Deserializer, Visitor};
@@ -11,6 +12,7 @@ use crate::digest::{Sha256Digest, U53};
 use crate::encoding::{hex_decode_array, hex_encode};
 use crate::envelope::PayloadKind;
 use crate::error::{Error, Result, SignatureError, Untrusted};
+use crate::ident::Channel;
 use crate::json::check_strict;
 use crate::traits::{Clock, Hasher, SignatureAlg, Verifier};
 
@@ -134,6 +136,19 @@ impl KeyRing {
     pub fn is_empty(&self) -> bool {
         self.keys.is_empty()
     }
+
+    /// The keys whose index `keep` accepts, in order (a sub-ring of validated keys).
+    pub(crate) fn subset(&self, keep: impl Fn(usize) -> bool) -> KeyRing {
+        KeyRing {
+            keys: self
+                .keys
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| keep(*i))
+                .map(|(_, k)| *k)
+                .collect(),
+        }
+    }
 }
 
 /// One key to validate: algorithm id text, public key and the id the document claims.
@@ -212,7 +227,7 @@ pub(crate) fn parse_payload<T: serde::de::DeserializeOwned>(
     from_checked(payload)
 }
 
-fn from_checked<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
+pub(crate) fn from_checked<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
     serde_json::from_slice(bytes).map_err(|e| Error::Schema(Untrusted::new(&e.to_string())))
 }
 
@@ -241,6 +256,13 @@ fn check_critical(critical: &[String]) -> Result<()> {
 
 /// Deserialises an optional integer field that, when present, must be an integer: `null` is
 /// rejected (FORMAT.md 3.1). Use with `#[serde(default)]`.
+pub(crate) fn present<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
+    deserializer: D,
+) -> Result<Option<T>, D::Error> {
+    T::deserialize(deserializer).map(Some)
+}
+
+/// [`present`] for integers.
 pub(crate) fn present_u53<'de, D: Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Option<U53>, D::Error> {
@@ -279,39 +301,68 @@ impl ClockReading {
     }
 }
 
-/// The anti-rollback floors a reader persists per app (FORMAT.md 11.2): the highest root version
-/// and key-set version it has verified. Equal values are accepted; lower ones are rollbacks.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// The anti-rollback floors a reader persists per app (FORMAT.md 11.2): the highest root version,
+/// key-set version and feed `seq` per channel it has verified. Equal values are accepted; lower
+/// ones are rollbacks.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RollbackFloor {
     root_version: u64,
     keyset_version: u64,
+    feed_seq: BTreeMap<Channel, u64>,
 }
 
 impl RollbackFloor {
-    /// Floors loaded from persisted state; `0` means none.
-    pub const fn new(root_version: u64, keyset_version: u64) -> Self {
+    /// Floors loaded from persisted state; `0` means none. Feed floors are added with
+    /// [`RollbackFloor::with_feed_seq`].
+    pub fn new(root_version: u64, keyset_version: u64) -> Self {
         RollbackFloor {
             root_version,
             keyset_version,
+            feed_seq: BTreeMap::new(),
         }
     }
 
+    /// Adds (or replaces) the persisted feed `seq` floor of `channel`.
+    pub fn with_feed_seq(mut self, channel: Channel, seq: u64) -> Self {
+        self.feed_seq.insert(channel, seq);
+        self
+    }
+
     /// The root-version floor.
-    pub const fn root_version(&self) -> u64 {
+    pub fn root_version(&self) -> u64 {
         self.root_version
     }
 
     /// The key-set-version floor.
-    pub const fn keyset_version(&self) -> u64 {
+    pub fn keyset_version(&self) -> u64 {
         self.keyset_version
+    }
+
+    /// The feed `seq` floor of `channel` (`0` when none was persisted).
+    pub fn feed_seq(&self, channel: &Channel) -> u64 {
+        self.feed_seq.get(channel).copied().unwrap_or(0)
     }
 
     /// The floors after `keys` (and the root it was verified under) passed: each floor is raised
     /// to the verified value, never lowered. Pure; the caller persists the result.
     pub fn raised_by(&self, keys: &crate::keyset::VerifiedKeySet) -> RollbackFloor {
-        RollbackFloor {
-            root_version: self.root_version.max(keys.root_version()),
-            keyset_version: self.keyset_version.max(keys.version()),
-        }
+        let mut out = self.clone();
+        out.root_version = out.root_version.max(keys.root_version());
+        out.keyset_version = out.keyset_version.max(keys.version());
+        out
+    }
+
+    /// The floors after a whole check passed (FORMAT.md 11.2): root and key-set versions from
+    /// `keys`, and the `seq` of `feed`'s channel, each raised and never lowered. Pure; the caller
+    /// persists the result only after the check succeeded.
+    pub fn raise(
+        &self,
+        keys: &crate::keyset::VerifiedKeySet,
+        feed: &crate::feed::VerifiedFeed,
+    ) -> RollbackFloor {
+        let mut out = self.raised_by(keys);
+        let seq = out.feed_seq(feed.channel()).max(feed.seq());
+        out.feed_seq.insert(feed.channel().clone(), seq);
+        out
     }
 }
