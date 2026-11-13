@@ -21,6 +21,7 @@ pub mod target;
 pub mod traits;
 pub mod trust;
 pub mod version;
+pub mod write;
 
 pub use digest::{Sha256Digest, U53};
 pub use envelope::{EnvelopeSignature, OpenedEnvelope, PayloadKind, pae, write_envelope};
@@ -47,3 +48,6 @@ pub use traits::{
 };
 pub use trust::{ClockReading, KeyEntry, KeyRing, PublicKey, RollbackFloor};
 pub use version::Version;
+pub use write::{
+    DEFAULT_FEED_LIFETIME_SECS, next_feed, next_key_set, rollout_seed, rotate_root, sign_envelope,
+};
