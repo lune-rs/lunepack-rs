@@ -248,6 +248,22 @@ pub enum SignerError {
     },
 }
 
+/// Why the packager's planning step (`pack_file`, `ReleaseLayout`) failed. No variant carries file
+/// content.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum PackError {
+    /// The same entry path was added twice.
+    #[error("entry {0} added twice")]
+    DuplicatePath(Untrusted),
+    /// A caller-supplied piece broke an invariant the planner relies on (a fixed text).
+    #[error("pack invariant broken: {0}")]
+    Invariant(&'static str),
+    /// The stored frame of a file failed its own round trip, so the codec or the hasher is broken.
+    #[error("the stored frame failed its round trip")]
+    StoredRoundTrip(#[source] Box<Error>),
+}
+
 /// Why a frame descriptor or a frame's bytes were rejected (FORMAT.md 9).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
@@ -387,6 +403,9 @@ pub enum Error {
     /// A signer failed or was the wrong signer.
     #[error("signer: {0}")]
     Signer(#[from] SignerError),
+    /// Planning a pack or a release layout failed.
+    #[error("pack: {0}")]
+    Pack(#[from] PackError),
     /// The code-signing hook failed.
     #[error("code signing failed")]
     CodeSign(#[source] Box<dyn std::error::Error + Send + Sync>),

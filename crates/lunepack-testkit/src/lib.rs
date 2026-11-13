@@ -8,6 +8,7 @@
 mod clock;
 mod codec;
 mod docs;
+pub mod exe_headers;
 mod hasher;
 mod seeds;
 mod signer;
