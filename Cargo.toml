@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
 members = ["crates/*", "xtask"]
-exclude = ["probes"]
+exclude = ["probes", "fuzz"]
 
 [workspace.package]
 version = "0.0.0"
@@ -22,7 +22,7 @@ todo = "deny"
 lunepack-core = { path = "crates/lunepack-core" }
 lunepack-testkit = { path = "crates/lunepack-testkit" }
 lunepack-crypto = { path = "crates/lunepack-crypto" }
-lunepack-codec-zstd = { path = "crates/lunepack-codec-zstd" }
+lunepack-codec-lzma = { path = "crates/lunepack-codec-lzma" }
 lunepack-fs = { path = "crates/lunepack-fs" }
 lunepack-http = { path = "crates/lunepack-http" }
 lunepack-os-windows = { path = "crates/lunepack-os-windows" }
@@ -31,3 +31,15 @@ lunepack-os-linux = { path = "crates/lunepack-os-linux" }
 lunepack = { path = "crates/lunepack" }
 lunepack-runtime = { path = "crates/lunepack-runtime" }
 lunepack-cli = { path = "crates/lunepack-cli" }
+
+# Core's pure external crates (M2-D1); the boundary check allowlists exactly these for lunepack-core.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+semver = "1"
+unicode-normalization = "0.1"
+thiserror = "2"
+
+# Crypto adapter (M2 step 7): pure Rust, no C. rand_core/getrandom are for tests only (crate dev-dependencies).
+sha2 = { version = "0.11", default-features = false }
+ed25519-dalek = { version = "3", default-features = false }

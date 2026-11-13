@@ -1,0 +1,1 @@
+{"format":1,"kind":"manifest","critical":[],"app_id":"org.example.hello","version":"1.0.0","target":"linux-x86_64","issued":1800000000,"pack":{"path":"1.0.0/linux-x86_64.pack","size":0,"sha256":"7a990c036fbf5ec7accd2e435ebc8aff32af574f064c3f330b929d13bdd66182"},"entries":[{"path":"lib/x","type":"symlink","target":"../../etc/passwd"}]}

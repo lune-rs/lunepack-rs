@@ -1,0 +1,10 @@
+{
+  "payloadType": "application/vnd.lunepack.feed.v1+json",
+  "payload": "eyJmb3JtYXQiOjEsImtpbmQiOiJmZWVkIiwiY3JpdGljYWwiOltdLCJhcHBfaWQiOiJvcmcuZXhhbXBsZS5oZWxsbyIsImNoYW5uZWwiOiJzdGFibGUiLCJzZXEiOjEsImlzc3VlZCI6MTgwMDAwMDAwMCwicmVsZWFzZXMiOlt7InZlcnNpb24iOiIxLjAuMCIsInRhcmdldHMiOnsibGludXgteDg2XzY0Ijp7InBhdGgiOiIxLjAuMC9saW51eC14ODZfNjQubWFuaWZlc3QuanNvbiIsInNpemUiOjM4LCJzaGEyNTYiOiJmYzRhNDg4NzI0MzJkMTgwNGM0MDMzYzg1MzVjOTM0MjEzODgxZGNkMTE5OTZhNDZiY2E3YTZmZGEyMTc1NTE3In19fV19",
+  "signatures": [
+    {
+      "keyid": "98458925ef3370388050a7896da4e6d7ca5a3fa9593a3406163f3cc0e6bd9ef8",
+      "sig": "EREREREREREREREREREREREREREREREREREREREREREREREREREREREREREREREREREREREREREREREREREREQ=="
+    }
+  ]
+}

@@ -31,7 +31,7 @@ pub const ROLES: &[(&str, Role)] = &[
     ("lunepack-core", Role::Core),
     ("lunepack-testkit", Role::Testkit),
     ("lunepack-crypto", Role::Adapter),
-    ("lunepack-codec-zstd", Role::Adapter),
+    ("lunepack-codec-lzma", Role::Adapter),
     ("lunepack-fs", Role::Adapter),
     ("lunepack-http", Role::Adapter),
     ("lunepack-os-windows", Role::Adapter),
@@ -51,8 +51,17 @@ pub const UNSAFE_ALLOWLIST: &[&str] = &[
     "lunepack-os-linux",
 ];
 
-/// External (non-workspace) dependencies `lunepack-core` may have. Empty in M1.
-pub const CORE_EXTERNAL_ALLOWLIST: &[&str] = &[];
+/// External (non-workspace) dependencies `lunepack-core` may have (M2-D1): the pure parsing,
+/// encoding and error crates the format needs. Hashing, signatures, clock and decoding stay
+/// behind core traits; nothing here does I/O.
+pub const CORE_EXTERNAL_ALLOWLIST: &[&str] = &[
+    "serde",
+    "serde_json",
+    "base64",
+    "semver",
+    "unicode-normalization",
+    "thiserror",
+];
 
 /// The `source` string cargo metadata reports for a crates.io dependency in this workspace.
 pub const CRATES_IO_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
@@ -112,6 +121,10 @@ pub struct Manifests {
     /// manifest and lock file. They build on runners with elevated rights, so their sources
     /// are held to the same rule.
     pub probes: Vec<ProbeCrate>,
+    /// The standalone fuzz project `fuzz/` (outside the workspace, M2-D9): label `fuzz`, its
+    /// manifest and lock. `None` when `fuzz/Cargo.toml` does not exist. Held to the probes' lock
+    /// rule, plus its path dependencies must be this repository's own workspace members.
+    pub fuzz: Option<ProbeCrate>,
 }
 
 /// A standalone crate under `probes/`.
@@ -191,6 +204,26 @@ fn entry_name(path: &Path) -> String {
         .unwrap_or_default()
 }
 
+/// `fuzz/Cargo.toml` and `fuzz/Cargo.lock`, when the manifest exists (a missing lock is reported
+/// by the lock rule, not here).
+fn load_fuzz_crate(workspace_root: &Path) -> Result<Option<ProbeCrate>> {
+    let dir = workspace_root.join("fuzz");
+    let manifest_path = dir.join("Cargo.toml");
+    if !manifest_path.is_file() {
+        return Ok(None);
+    }
+    let lock_path = dir.join("Cargo.lock");
+    Ok(Some(ProbeCrate {
+        label: "fuzz".to_string(),
+        manifest: read_table(&manifest_path)?,
+        lock: if lock_path.is_file() {
+            Some(read_table(&lock_path)?)
+        } else {
+            None
+        },
+    }))
+}
+
 /// Read the root manifest and every member manifest named by the metadata.
 pub fn load_manifests(metadata_json: &str) -> Result<Manifests> {
     let md = MetadataCommand::parse(metadata_json).context("cannot parse cargo metadata output")?;
@@ -205,6 +238,7 @@ pub fn load_manifests(metadata_json: &str) -> Result<Manifests> {
         members: BTreeMap::new(),
         lock,
         probes: load_probe_crates(md.workspace_root.as_std_path())?,
+        fuzz: load_fuzz_crate(md.workspace_root.as_std_path())?,
     };
     for pkg in &md.packages {
         let table = read_table(pkg.manifest_path.as_std_path())?;
@@ -249,6 +283,9 @@ pub fn check(metadata_json: &str, manifests: &Manifests) -> Result<Vec<Violation
 
     check_root(&md, manifests, &mut out)?;
     check_lock(&md, manifests, &mut out);
+    if let Some(fuzz) = &manifests.fuzz {
+        check_fuzz_deps(&md, fuzz, &member_dirs, &mut out);
+    }
     for pkg in &md.packages {
         check_package(pkg, &member_dirs, manifests, &mut out)?;
     }
@@ -286,22 +323,33 @@ fn check_root(md: &Metadata, manifests: &Manifests, out: &mut Vec<Violation>) ->
             "workspace.exclude must contain \"probes\"",
         ));
     }
+    if manifests.fuzz.is_some() {
+        let fuzz_excluded = ws
+            .get("exclude")
+            .and_then(|e| e.as_array())
+            .is_some_and(|a| a.iter().any(|x| x.as_str() == Some("fuzz")));
+        if !fuzz_excluded {
+            out.push(v(
+                WORKSPACE_LABEL,
+                "root-exclude",
+                "workspace.exclude must contain \"fuzz\" while fuzz/Cargo.toml exists",
+            ));
+        }
+    }
     for pkg in &md.packages {
-        let under_probes = pkg
+        let first_dir = pkg
             .manifest_path
             .strip_prefix(&md.workspace_root)
-            .map(|rel| {
-                rel.components()
-                    .next()
-                    .is_some_and(|c| c.as_str() == "probes")
-            })
-            .unwrap_or(false);
-        if under_probes {
-            out.push(v(
+            .ok()
+            .and_then(|rel| rel.components().next().map(|c| c.as_str().to_string()));
+        match first_dir.as_deref() {
+            Some("probes") => out.push(v(
                 &pkg.name,
                 "probes",
                 "workspace member lives under probes/",
-            ));
+            )),
+            Some("fuzz") => out.push(v(&pkg.name, "fuzz", "workspace member lives under fuzz/")),
+            _ => {}
         }
     }
     Ok(())
@@ -347,6 +395,127 @@ fn check_lock(md: &Metadata, manifests: &Manifests, out: &mut Vec<Violation>) {
             &members,
             out,
         );
+    }
+    if let Some(fuzz) = &manifests.fuzz {
+        // The fuzz lock may hold this workspace's own members (by name and version) plus the fuzz
+        // package itself.
+        let mut members = members;
+        match probe_member(&fuzz.manifest) {
+            Some(own) => {
+                members.insert(own);
+            }
+            None => out.push(v(
+                &fuzz.label,
+                "lockfile",
+                "the fuzz manifest has no string `[package] name` / `version`: its own lock entry cannot be identified",
+            )),
+        }
+        check_lock_for(
+            &fuzz.label,
+            &fuzz.manifest,
+            fuzz.lock.as_ref(),
+            &members,
+            out,
+        );
+    }
+}
+
+/// The fuzz manifest's dependencies: every one is a crates.io requirement or a `path` dependency
+/// on a workspace member of this repository (same package name, same directory). A `git`,
+/// `registry` or `workspace` key, a path anywhere else and any form this check does not recognise
+/// is a violation.
+fn check_fuzz_deps(
+    md: &Metadata,
+    fuzz: &ProbeCrate,
+    member_dirs: &BTreeMap<&str, PathBuf>,
+    out: &mut Vec<Violation>,
+) {
+    let fuzz_dir = md.workspace_root.as_std_path().join("fuzz");
+    let mut tables: Vec<(String, &toml::Value)> = Vec::new();
+    for kind in ["dependencies", "dev-dependencies", "build-dependencies"] {
+        if let Some(t) = fuzz.manifest.get(kind) {
+            tables.push((kind.to_string(), t));
+        }
+    }
+    if let Some(targets) = fuzz.manifest.get("target") {
+        match targets.as_table() {
+            Some(targets) => {
+                for (cfg, body) in targets {
+                    for kind in ["dependencies", "dev-dependencies", "build-dependencies"] {
+                        if let Some(t) = body.get(kind) {
+                            tables.push((format!("target.{cfg}.{kind}"), t));
+                        }
+                    }
+                }
+            }
+            None => out.push(v(&fuzz.label, "fuzz-dep", "`target` is not a table")),
+        }
+    }
+    for (table_name, table) in tables {
+        let Some(table) = table.as_table() else {
+            out.push(v(
+                &fuzz.label,
+                "fuzz-dep",
+                format!("[{table_name}] is not a table"),
+            ));
+            continue;
+        };
+        for (key, dep) in table {
+            match dep {
+                toml::Value::String(_) => {}
+                toml::Value::Table(t) => check_fuzz_dep_table(key, t, &fuzz_dir, member_dirs, out),
+                _ => out.push(v(
+                    key,
+                    "fuzz-dep",
+                    format!("[{table_name}] `{key}` has a form this check does not recognise"),
+                )),
+            }
+        }
+    }
+}
+
+fn check_fuzz_dep_table(
+    key: &str,
+    dep: &toml::Table,
+    fuzz_dir: &Path,
+    member_dirs: &BTreeMap<&str, PathBuf>,
+    out: &mut Vec<Violation>,
+) {
+    for banned in ["git", "registry", "registry-index", "workspace"] {
+        if dep.contains_key(banned) {
+            out.push(v(
+                key,
+                "fuzz-dep",
+                format!("fuzz dependency `{key}` uses `{banned}`: only crates.io and workspace paths are allowed"),
+            ));
+            return;
+        }
+    }
+    let Some(path) = dep.get("path") else {
+        return;
+    };
+    let real_name = match dep.get("package") {
+        None => key,
+        Some(toml::Value::String(name)) => name.as_str(),
+        Some(_) => {
+            out.push(v(key, "fuzz-dep", "`package` is not a string"));
+            return;
+        }
+    };
+    let Some(path) = path.as_str() else {
+        out.push(v(key, "fuzz-dep", "`path` is not a string"));
+        return;
+    };
+    let resolved = fuzz_dir.join(path);
+    if !member_dirs
+        .get(real_name)
+        .is_some_and(|member| same_dir(&resolved, member))
+    {
+        out.push(v(
+            key,
+            "fuzz-dep",
+            format!("fuzz dependency `{key}` has path `{path}`, which is not the workspace member `{real_name}`"),
+        ));
     }
 }
 

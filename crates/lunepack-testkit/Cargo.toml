@@ -12,3 +12,9 @@ workspace = true
 
 [dependencies]
 lunepack-core.workspace = true
+# Serialises frame descriptors for the fuzz seeds.
+serde_json = { workspace = true }
+
+[dev-dependencies]
+# Replay tests only: random and mutated inputs for the fuzz harnesses. No persistence, no fork.
+proptest = { version = "1", default-features = false, features = ["std"] }

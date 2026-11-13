@@ -1,30 +1,39 @@
 # State
 
-Last updated: 2026-11-12 (milestone 1, foundation)
+Last updated: 2026-11-13 (milestone 2, format and trust, done)
 
 ## Now
 
-Milestone 1 (foundation) is implemented on branch `orch/lunepack-v1` and not yet pushed:
+Milestone 2 (format v1 and the trust core) is done on branch `orch/lunepack-v1`, not pushed and not
+yet merged (review and gate pending):
 
-- Cargo workspace (edition 2024, toolchain 1.99.1, MSRV 1.88), 12 crate skeletons plus `xtask`.
-- `scripts/gate.sh`, the boundary check, the secret check with the optional local denylist scan, and shell tests.
-- Agent guards for key files in `.claude/` (Read denies and a Bash hook).
-- CI (`.github/workflows/ci.yml`: gate on Linux, build, clippy and tests on 3 OSes, MSRV check).
-- Early platform probes under `probes/` with their workflow (`.github/workflows/probes.yml`); verdicts come from the first CI run.
+- `docs/FORMAT.md` and `docs/THREAT-MODEL.md` approved by the user; the codec crate is
+  `lunepack-codec-lzma`.
+- `lunepack-core`: strict JSON, DSSE envelopes, root rotation, key set, feed and manifest
+  verification with freshness and rollback floors, the frame descriptor and verify-then-decode, the
+  shared path, version and target rules, and update policy (candidate selection, rollout bucket).
+- `lunepack-crypto`: SHA-256 and Ed25519 with strict verification; `lunepack-testkit`: fakes,
+  contract suites, document builders and fuzz seeds. A real-crypto test runs the whole chain and
+  rejects a one-byte change in every document.
+- `fuzz/`: ten harnesses (`lunepack_core::fuzz`) with cargo-fuzz targets and committed seeds;
+  the gate replays them on stable, and the boundary check holds `fuzz/Cargo.lock` to crates.io plus
+  workspace crates.
+- `docs/DECISIONS.md` carries the revised D6 and D17, D33 to D35, the user's answers on D9 to D13,
+  D19 and D39, and M2-D1 to M2-D9.
+- Not done: libFuzzer has not been run (installing `cargo-fuzz` was refused in the working
+  session); the targets compile on stable and the real runs move to the CI work in M13. No
+  Windows NTFS differential test has run yet; it first runs at M3's push.
 
 ## Next
 
-1. Push the branch (after the local denylist is reviewed), read the first CI and probe results, fix what the first run breaks.
-2. Milestone 2: format v1 and the trust core (format spec and threat model, core types, DSSE envelope, key set, feed and manifest verification, crypto adapter, testkit fakes). Its stop settles the open decisions below that need probe results.
+Milestone 3: the `lzma-rust2` codec in `lunepack-codec-lzma`, with its boundary rule and the
+CLAUDE.md hard rule 2 sentence in the same commit (D34). M3's push is the first push of this
+branch; the Windows NTFS path differential test first runs there.
 
 ## Blockers / open questions
 
-- Probe verdicts are pending the first CI run; the decisions they inform stay open until then.
-- Open decisions (see `docs/DECISIONS.md` for the settled ones), with the milestone they must be settled by:
-  - D9 Linux packaging targets, D11 Windows per-user layout, D13 lifecycle hooks, D19 runtime binary provenance: before M5.
-  - D10 macOS install and update model: before M7.
-  - D12 per-machine model on all three OSes: before M9 (the install state is scope-aware from M4 either way).
-  - D8 delta algorithm: before M11.
-  - D15 migration from other updaters: before M12.
-  - D9, D10, D11, D12, D13 and D19 are asked together at M2's stop.
+- Open decisions (settled ones are in `docs/DECISIONS.md`): D8 delta algorithm and its dictionary cap,
+  D15 migration from other updaters, D36 to D38, D40 and D41 (UI fallback, size budget, per-machine
+  first-install elevation, accessibility, silent mode), each asked at the stop of the milestone that
+  needs it.
 - Fact: the primary API is the native Rust crate API. Other-language bindings (C ABI, .NET, Node, ...) are the last roadmap step; the binding set is not decided.

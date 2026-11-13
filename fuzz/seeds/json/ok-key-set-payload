@@ -1,0 +1,1 @@
+{"format":1,"kind":"keys","critical":[],"app_id":"org.example.hello","root_version":1,"version":1,"threshold":1,"keys":[{"id":"545a9160af06ce7da4ee52d1022eaca25604363315cf651ebb1731ae76da5995","alg":"ed25519","public":"937058ab5c984acefa6292bc5c2361a6db300a7d2cd258ab542c1cfcb7e9ac0d","not_before":1799913600,"not_after":1886400000}]}
