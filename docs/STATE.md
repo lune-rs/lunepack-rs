@@ -1,34 +1,43 @@
 # State
 
-Last updated: 2026-11-13 (milestone 2, format and trust, done)
+Last updated: 2026-11-13 (milestone 3, packager MVP, done on the branch; push and review pending)
 
 ## Now
 
-Milestone 2 (format v1 and the trust core) is done on branch `orch/lunepack-v1`, not pushed and not
-yet merged (review and gate pending):
+Milestones 2 (format v1 and the trust core) and 3 (the packager) are done on branch
+`orch/lunepack-v1`, not pushed and not yet merged (review, gate and the first push pending):
 
-- `docs/FORMAT.md` and `docs/THREAT-MODEL.md` approved by the user; the codec crate is
-  `lunepack-codec-lzma`.
-- `lunepack-core`: strict JSON, DSSE envelopes, root rotation, key set, feed and manifest
-  verification with freshness and rollback floors, the frame descriptor and verify-then-decode, the
-  shared path, version and target rules, and update policy (candidate selection, rollout bucket).
-- `lunepack-crypto`: SHA-256 and Ed25519 with strict verification; `lunepack-testkit`: fakes,
-  contract suites, document builders and fuzz seeds. A real-crypto test runs the whole chain and
-  rejects a one-byte change in every document.
-- `fuzz/`: ten harnesses (`lunepack_core::fuzz`) with cargo-fuzz targets and committed seeds;
-  the gate replays them on stable, and the boundary check holds `fuzz/Cargo.lock` to crates.io plus
-  workspace crates.
-- `docs/DECISIONS.md` carries the revised D6 and D17, D33 to D35, the user's answers on D9 to D13,
-  D19 and D39, and M2-D1 to M2-D9.
-- Not done: libFuzzer has not been run (installing `cargo-fuzz` was refused in the working
-  session); the targets compile on stable and the real runs move to the CI work in M13. No
-  Windows NTFS differential test has run yet; it first runs at M3's push.
+- M2: `docs/FORMAT.md` and `docs/THREAT-MODEL.md`; `lunepack-core` (strict JSON, DSSE envelopes, root
+  rotation, key set, feed and manifest verification with freshness and rollback floors, frame
+  descriptors and verify-then-decode, shared rules, update policy); `lunepack-crypto`;
+  `lunepack-testkit`; `fuzz/` harnesses and seeds replayed by the gate. libFuzzer itself has not run
+  (CI work, M13).
+- M3: the `lunepack` CLI (`docs/CLI.md`): `init`, `keys gen|show|set|rotate-root`, `pack`,
+  `feed add|refresh`, `verify`, `inspect`. `pack` takes any app's build-output directory (M3-D13) and
+  writes a deterministic, signed pack and manifest; every output is verified with the client's own
+  verifiers before it is placed. Codec: `lunepack-codec-lzma` over `lzma-rust2` (stored, LZMA2, BCJ x86
+  and ARM64, BCJ2; decoder limits from the signed descriptor), confined to that crate by the boundary
+  check (M3-D11, D34). Signers in `lunepack-crypto` (PKCS#8 PEM file and env, command), `SystemClock`
+  in the facade. Revocation in two moves with a guard on `keys set` and `keys rotate-root`
+  (M3-R1-D1). Decisions M3-D1 to M3-D13 and M3-R1-D1 are in `docs/DECISIONS.md`.
+- Probe P-U1 (LuneUI on hosted runners) is in `probes/luneui/` and `probes.yml`; it has not run.
 
 ## Next
 
-Milestone 3: the `lzma-rust2` codec in `lunepack-codec-lzma`, with its boundary rule and the
-CLAUDE.md hard rule 2 sentence in the same commit (D34). M3's push is the first push of this
-branch; the Windows NTFS path differential test first runs there.
+Push of `orch/lunepack-v1` (the first push of M2 and M3; the user's stop), which runs CI on three OSes
+(including the MSRV job, the Windows NTFS path differential test and the cross-host encoder
+known-answer tests) and every probe job. Then M3's review and merge, then Milestone 4 (the installer
+stage and the apply engine over the release directory C2).
+
+## Known limits and open items from M3
+
+- Unverified until CI: the MSRV (1.88) build with the new dependencies; the encoder known-answer tests
+  on x86-64 against arm64 (if they differ, the determinism claim in `docs/CLI.md` needs a revision);
+  the Windows NTFS differential test; P-U1's verdicts.
+- The pack is built in memory, so a multi-gigabyte app needs that much RAM (M3-D8, `docs/CLI.md`).
+- A leaked release-key threshold can sign `seq` 2^53-1 and block `feed refresh` on that channel
+  (workaround: a new channel). Owner: the threat-model pass in M13.
+- How a non-Rust app triggers an update from inside the app is not decided (client milestone).
 
 ## Blockers / open questions
 
