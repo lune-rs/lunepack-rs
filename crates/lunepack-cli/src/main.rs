@@ -4,8 +4,10 @@
 //! usage error (clap). No command prints private-key material, an environment variable's value or
 //! a config value.
 
+mod cmd_feed;
 mod cmd_keys;
 mod cmd_pack;
+mod cmd_verify;
 mod config;
 mod pipeline;
 mod place;
@@ -43,6 +45,23 @@ enum Command {
     /// Package a build-output directory into a signed release: `<version>/<target>.pack` and
     /// `<version>/<target>.manifest.json` in the release directory.
     Pack(cmd_pack::PackArgs),
+    /// Manage the signed feed of a channel.
+    Feed {
+        #[command(subcommand)]
+        command: FeedCommand,
+    },
+    /// Check a release directory the way a client does: keys, feeds, manifests, packs and frames.
+    Verify(cmd_verify::VerifyArgs),
+    /// Verify a release directory, then show what it holds.
+    Inspect(cmd_verify::InspectArgs),
+}
+
+#[derive(Subcommand)]
+enum FeedCommand {
+    /// Add a release (or more targets of it) to a channel's feed.
+    Add(cmd_feed::AddArgs),
+    /// Re-sign a channel's feed with a new `seq` and expiry; the releases stay.
+    Refresh(cmd_feed::RefreshArgs),
 }
 
 #[derive(Subcommand)]
@@ -76,6 +95,12 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             KeysCommand::RotateRoot(args) => cmd_keys::rotate_root_cmd(&cli.config, &args),
         },
         Command::Pack(args) => cmd_pack::pack(&cli.config, &args, &NoCodeSign),
+        Command::Feed { command } => match command {
+            FeedCommand::Add(args) => cmd_feed::add(&cli.config, &args),
+            FeedCommand::Refresh(args) => cmd_feed::refresh(&cli.config, &args),
+        },
+        Command::Verify(args) => cmd_verify::verify(&cli.config, &args),
+        Command::Inspect(args) => cmd_verify::inspect(&cli.config, &args),
     }
 }
 

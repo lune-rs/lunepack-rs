@@ -76,7 +76,11 @@ fn key_id_hex(public: &[u8; 32]) -> String {
 
 /// The `--sign` signers must be distinct release keys, each inside its window at `now`, and reach
 /// the key set's threshold.
-fn check_signers(signers: &[Box<dyn Signer>], keys: &VerifiedKeySet, now: u64) -> Result<()> {
+pub(crate) fn check_signers(
+    signers: &[Box<dyn Signer>],
+    keys: &VerifiedKeySet,
+    now: u64,
+) -> Result<()> {
     let mut seen = BTreeSet::new();
     for s in signers {
         let public = s.public_key();
