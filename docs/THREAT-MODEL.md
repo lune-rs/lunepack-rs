@@ -186,6 +186,19 @@ is a publisher-side compromise (classes 2, 3 and 6), never something a client ha
   re-verified in full. A feed's `seq` is not secret and not protected from a writer holding the
   threshold of release keys: see the leaked-key class above and the `seq` = 2^53-1 limitation in
   `docs/CLI.md`.
+- **Replayed older documents (S1, M3-R2-D1).** The writers build on the previous feed and `keys.json`
+  in the release directory and read them with time checks skipped, so a class 1 attacker who puts back
+  a genuine older document there (the publisher fetched the directory from the host it can write to)
+  would have its releases, rollouts, keys, windows or threshold re-signed with a fresh `seq` or version
+  and no expiry to reveal it. The defence is the publisher state file (`docs/CLI.md`), kept with the
+  config and outside the release directory: every writer refuses a previous document older than the
+  recorded root version, key set version or feed `seq`, and one the file has no record of, unless the
+  operator overrides (`--allow-older-previous`, `--trust-release-dir`); `keys set` never carries over a
+  threshold the state does not vouch for, and prints what it changes. Writers trust the release
+  directory's previous documents for freshness only as far as the state file vouches: without it (a
+  lost file, or a run with `--trust-release-dir`), the directory must come from the publisher's own
+  storage, never from the public host. The state file is not secret but must be kept from the same
+  attacker; one who can edit it and the release directory both can still roll the writer back.
 - **The key set's extra minutes.** Revoking in two moves leaves the old key in the local `keys.json`
   between the moves. Nothing is uploaded between them; if the publisher uploads after the first move,
   the old key is still accepted by clients until the second.

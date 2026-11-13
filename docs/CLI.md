@@ -55,7 +55,45 @@ env = "LUNEPACK_SIGNING_KEY"     # PKCS#8 PEM in an environment variable
 [signers.hsm]
 command = ["my-signer", "--slot", "1"]
 public = "<64 lowercase hex characters>"   # the key the command signs for
+
+# Optional: where the publisher state file lives, relative to this file.
+# state = "lunepack-state.json"            # the default
 ```
+
+## The publisher state file (M3-R2-D1)
+
+`lunepack-state.json`, next to `lunepack.toml` unless the config's `state` names another path (relative
+to the config's directory). It records, per app id, what this publisher last signed or accepted: the
+version of the root the last walk ended at, the version and threshold of the last `keys.json`, and the
+`seq` of each channel's last feed. It holds these numbers only, never a key, a config value or a path.
+`init` creates it (an existing file is checked and kept). `feed add`, `feed refresh`, `keys set` and
+`keys rotate-root` update it, by temporary file and rename, after every document they place.
+
+Why: the writers build on the previous documents in the release directory (the releases and rollouts
+of the previous feed, the keys, windows and threshold of the previous `keys.json`), and they read them
+with time checks skipped so an expired one can be renewed. A genuine but older document put back in the
+directory would verify, and its values would be signed afresh with a new `seq` or version that clients
+accept: a halted rollout undone, a dropped release listed again, a raised threshold lowered. The state
+file is the publisher's own memory of what is current, kept where the release directory's writers
+cannot reach it.
+
+Before a writer builds on a previous document it compares the document with the record:
+
+- equal, or newer (another trusted machine wrote since): it proceeds and records the new values;
+- older than the record: it exits 1, writes nothing, and names the document, the recorded value and
+  the value found ("the release directory may hold a replayed older copy"). `--allow-older-previous`
+  builds on it anyway (recovery only), names each such document on stderr and records the new values;
+- no record (no state file, or a document it never saw, such as a feed of a channel another machine
+  started): it exits 1 and writes nothing. `--trust-release-dir` accepts the directory's current
+  documents as the baseline and records them. It trusts whatever the directory holds now, so use it only
+  on a directory from the publisher's own storage. An absent document is not compared: a feed that was
+  removed can be started again with `feed add`, whose `seq` must still rise above the recorded one.
+
+Where to keep it: with the config, in the publisher's own storage. In CI, commit it next to
+`lunepack.toml` and commit the update after each publish, or restore it from and save it to the CI's
+own storage around the job. Never fetch the release directory from the public host (bucket, CDN or
+mirror) as the base for writing without the state file: anyone with write access there can put an
+older document back.
 
 ## Signer specs
 
@@ -105,7 +143,8 @@ system clock. `verify` and `inspect` use the system clock or `--at <unix>`; they
 
 ### `lunepack init`
 
-Writes a config with the compiled-in root and no signers; refuses to overwrite.
+Writes a config with the compiled-in root and no signers; refuses to overwrite. Creates the publisher
+state file next to it when there is none (an existing one is checked and kept).
 
 ```
 lunepack init --app-id <APP_ID> --root-key <ROOT_KEYS> [--threshold <THRESHOLD>] [--config <CONFIG>]
@@ -139,11 +178,14 @@ Writes `keys.json`: exactly the listed release keys, signed by the root.
 ```
 lunepack keys set --release-dir <RELEASE_DIR> --release-key <RELEASE_KEYS> --sign <SIGN>
     [--threshold <THRESHOLD>] [--not-before <NOT_BEFORE>] [--not-after <NOT_AFTER>]
-    [--expires <EXPIRES>] [--allow-unverifiable-feeds] [--config <CONFIG>]
+    [--expires <EXPIRES>] [--allow-unverifiable-feeds] [--trust-release-dir]
+    [--allow-older-previous] [--config <CONFIG>]
 ```
 
 - `--release-key`: a release public key, 64 lowercase hex characters; repeat for several.
-- `--threshold`: release keys that must sign a feed or manifest (default: the current value, else 1).
+- `--threshold`: release keys that must sign a feed or manifest. Default 1 for a first key set. When a
+  `keys.json` exists, its threshold is kept only if the state file records the same value and the state
+  check passed without an override; otherwise `--threshold` is required.
 - `--not-before`, `--not-after`: Unix times. A key already in the previous key set keeps its window
   unless these are given; a new key defaults to `now` .. `now` + two years.
 - `--expires`: when the key set expires (Unix time); none by default.
@@ -153,6 +195,10 @@ lunepack keys set --release-dir <RELEASE_DIR> --release-key <RELEASE_KEYS> --sig
   each lists, against the new key set. If any would stop verifying it exits 1, places nothing and
   lists them (see Revoking a release key). `--allow-unverifiable-feeds` places `keys.json` anyway and
   names each feed that `verify` will now reject on stderr.
+- Before placing, it prints one line on stdout, `change: version <n> -> <n+1>: ...`, naming what
+  changes: the threshold, keys added and removed (by key id), changed windows and the expiry.
+- The previous `keys.json` and the root walk are checked against the state file first;
+  `--trust-release-dir` and `--allow-older-previous` as in The publisher state file.
 
 ### `lunepack keys rotate-root`
 
@@ -162,13 +208,14 @@ new root (same keys and windows, version + 1). The root file is placed first.
 ```
 lunepack keys rotate-root --release-dir <RELEASE_DIR> --new-root-key <NEW_ROOT_KEYS>
     --new-threshold <NEW_THRESHOLD> --sign <SIGN> --sign-new <SIGN_NEW>
-    [--allow-unverifiable-feeds] [--config <CONFIG>]
+    [--allow-unverifiable-feeds] [--trust-release-dir] [--allow-older-previous] [--config <CONFIG>]
 ```
 
 - `--new-root-key`: a public key of the new root; repeat for several.
 - `--sign`: signers of the current root; `--sign-new`: signers of the new root; each side must reach its
   own threshold. A key in both roots may be given on either side or both; it signs once.
-- It runs the same feed check as `keys set`, with the same `--allow-unverifiable-feeds` override.
+- It runs the same feed check as `keys set`, with the same `--allow-unverifiable-feeds` override, and
+  the same state file check, with the same `--trust-release-dir` and `--allow-older-previous`.
 
 Publish `root-<k+1>.json` before `keys.json` (see the upload order); clients walk the rotation from
 their compiled-in root. The config keeps the original root, and `verify` walks the same way.
@@ -218,7 +265,8 @@ Adds a release, or more targets of it, to a channel's feed (`feed-<channel>.json
 
 ```
 lunepack feed add --release-dir <RELEASE_DIR> --channel <CHANNEL> --version <VERSION> --sign <SIGN>
-    [--rollout <ROLLOUT>] [--rollout-seed <ROLLOUT_SEED>] [--expires-after-days <N>] [--config <CONFIG>]
+    [--rollout <ROLLOUT>] [--rollout-seed <ROLLOUT_SEED>] [--expires-after-days <N>]
+    [--trust-release-dir] [--allow-older-previous] [--config <CONFIG>]
 ```
 
 - The targets are every `<version>/<target>.manifest.json` in the directory. A release already in the
@@ -231,6 +279,8 @@ lunepack feed add --release-dir <RELEASE_DIR> --channel <CHANNEL> --version <VER
 - The previous feed is read with its signatures checked and its time checks skipped, so an expired feed
   can be extended. If it does not verify under `keys.json`, the command stops and says so; it never
   reads an unverified feed and never deletes one (see Revoking a release key).
+- The root walk, `keys.json` and the previous feed are then checked against the state file (see The
+  publisher state file); `--trust-release-dir` and `--allow-older-previous` are its overrides.
 - `seq` is `max(previous seq + 1, now in milliseconds)`. Releases are sorted by version precedence.
 - Before the feed is placed, the new feed is verified, and so is every release it lists: each manifest
   under the key set and each pack in full (size, SHA-256, every frame decoded). This is slower on a
@@ -242,7 +292,8 @@ Re-signs a channel's feed with a new `seq`, `issued` and `expires`; the releases
 
 ```
 lunepack feed refresh --release-dir <RELEASE_DIR> --channel <CHANNEL> --sign <SIGN>
-    [--expires-after-days <N>] [--drop <DROP>]... [--config <CONFIG>]
+    [--expires-after-days <N>] [--drop <DROP>]... [--trust-release-dir] [--allow-older-previous]
+    [--config <CONFIG>]
 ```
 
 - `--drop <version>`: removes that release from the feed (repeatable). The text must equal a release of
