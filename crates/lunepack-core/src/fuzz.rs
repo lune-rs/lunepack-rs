@@ -27,14 +27,14 @@ use crate::ident::{AppId, Channel};
 use crate::json::{check_strict, parse_strict};
 use crate::keyset::{KeySetDocument, ReleaseKeyEntry, VerifiedKeySet, verify_key_set};
 use crate::limits::Limits;
-use crate::manifest::verify_manifest;
+use crate::manifest::{ManifestDocument, verify_manifest};
 use crate::path::{EntryKind, RelPath, fold_key, validate_path, validate_tree};
-use crate::root::{TrustedRoot, advance_root};
+use crate::root::{RootDocument, TrustedRoot, advance_root};
 use crate::target::Target;
 use crate::traits::{
     Clock, Codec, CodecId, DecodeReport, FrameView, HashState, Hasher, SignatureAlg, Verifier,
 };
-use crate::trust::{ClockReading, PublicKey, RollbackFloor};
+use crate::trust::{ClockReading, PublicKey, RollbackFloor, parse_payload};
 use crate::version::Version;
 
 /// The app id of the fuzz fixtures.
@@ -97,6 +97,35 @@ pub fn accepts(name: &str, data: &[u8]) -> Option<bool> {
         "frame" => frame_run(data),
         _ => return None,
     })
+}
+
+/// Parses `data` as the document `kind` (`envelope`, `root`, `keys`, `feed` or `manifest`) with
+/// the reader's own syntax and schema checks (strict JSON, `format`, `kind`, `critical`, the typed
+/// fields; for `envelope` the key-independent checks of any of the four kinds), without keys or
+/// signatures. Used by the test that keeps the examples in `docs/FORMAT.md` parsing.
+pub fn parse_example(kind: &str, data: &[u8]) -> Result<(), String> {
+    let result = match kind {
+        "envelope" => {
+            let opened = KINDS
+                .iter()
+                .map(|&k| OpenedEnvelope::open(data, k, &Limits::V1))
+                .collect::<Vec<_>>();
+            if opened.iter().any(Result::is_ok) {
+                return Ok(());
+            }
+            opened
+                .into_iter()
+                .next()
+                .map(|r| r.map(|_| ()))
+                .unwrap_or(Ok(()))
+        }
+        "root" => parse_payload::<RootDocument>(data, PayloadKind::Root).map(|_| ()),
+        "keys" => parse_payload::<KeySetDocument>(data, PayloadKind::Keys).map(|_| ()),
+        "feed" => parse_payload::<FeedDocument>(data, PayloadKind::Feed).map(|_| ()),
+        "manifest" => parse_payload::<ManifestDocument>(data, PayloadKind::Manifest).map(|_| ()),
+        _ => return Err(format!("unknown example kind {kind:?}")),
+    };
+    result.map_err(|e| e.to_string())
 }
 
 /// `data` as an envelope of each kind: the key-independent checks, then the signatures.

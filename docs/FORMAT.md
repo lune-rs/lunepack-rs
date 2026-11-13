@@ -444,8 +444,8 @@ An artifact reference is `{path, size, sha256}`:
 | `issued` | time the manifest was written |
 | `pack` | artifact reference (7.1) to the release's pack; `size` may be 0 when no entry has a frame |
 | `entries` | 0 to 200,000 entries (8.1); the set passes the tree rules (10.2) |
-| `install` | reserved: defined by a later revision (install metadata: entry point, shortcuts, associations, minimum OS). v1 writers MUST NOT write it |
-| `deltas` | reserved: defined by a later revision (per-file delta assets). v1 writers MUST NOT write it |
+| `install` | reserved: defined by a later revision (install metadata: entry point, shortcuts, associations, minimum OS). v1 writers MUST NOT write it, and v1 readers reject a manifest that carries it |
+| `deltas` | reserved: defined by a later revision (per-file delta assets). v1 writers MUST NOT write it, and v1 readers reject a manifest that carries it |
 
 - The reader checks the manifest's byte length and SHA-256 against the feed's artifact reference
   **before** opening the envelope; then the envelope is signed by the key set's release threshold.
@@ -585,8 +585,8 @@ Accepted examples: `bin/app`, `Contents/MacOS/App`, `a b/c.d.e`, `ünïcode/文�
   - is non-empty, at most 1024 bytes, NFC, without `\`, NUL, C0 controls or DEL, and not absolute
     (does not start with `/`);
   - has no empty components;
-  - resolved lexically from the symlink's parent directory (`..` pops one component, any other
-    component is pushed), never leaves the tree (a `..` with nothing to pop is rejected);
+  - resolved lexically from the symlink's parent directory (`..` pops one component, `.` is skipped:
+    neither pushed nor popped, any other component is pushed), never leaves the tree (a `..` with nothing to pop is rejected);
   - never passes through another symlink entry as a non-final component (`s` → `.` together with
     `l` → `s/../x` is rejected), because lexical and physical resolution differ after a symlink.
   - Accepted: `Versions/Current` → `A`, `lib/x.so` → `x.so.1`. A target inside the tree that names no
