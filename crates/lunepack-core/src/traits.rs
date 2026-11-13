@@ -1,12 +1,14 @@
-//! The four traits behind everything external the verification code needs (hard rule 3):
-//! hashing, signature verification, the clock and frame decoding. Core code never reaches for a
-//! digest, a signature algorithm, the time or a decoder any other way. Each trait is object-safe
-//! and `Send + Sync`; implementations live in adapter crates, fakes in `lunepack-testkit`.
+//! The traits behind everything external the core needs (hard rule 3): hashing, signature
+//! verification, the clock and frame decoding on the reading side; frame encoding, signing and the
+//! code-signing hook on the producing side. Core code never reaches for a digest, a signature
+//! algorithm, the time, a codec or a private key any other way. Each trait is object-safe and
+//! `Send + Sync`; implementations live in adapter crates, fakes in `lunepack-testkit`.
 
 use std::io::Write;
 
 use crate::digest::Sha256Digest;
 use crate::error::{Error, Result};
+use crate::path::RelPath;
 
 /// A streaming SHA-256 computation, created by [`Hasher::sha256_start`].
 pub trait HashState: Send {
@@ -147,9 +149,78 @@ pub struct DecodeReport {
     pub consumed: Vec<u64>,
 }
 
-/// Frame decoding. The caller wraps `out` in an exact-size, hashing writer; the decoder must stop
-/// on the first write error and must not allocate beyond each stream's `dict_size`.
+/// Frame decoding. The caller wraps `out` in an exact-size, hashing writer.
+///
+/// A decoder must:
+/// - produce exactly `output_size` bytes;
+/// - make each stream decode to exactly its `decoded_size`, BCJ2's sub-streams included (core
+///   sees only the total, so it cannot check them; a stream that decodes to another size is
+///   [`CodecError::StreamSize`](crate::error::CodecError::StreamSize) even when the total fits);
+/// - report the input it really consumed, per stream;
+/// - allocate no more than each stream's `dict_size` (plus a fixed overhead);
+/// - stop on the first write error.
 pub trait Codec: Send + Sync {
     /// Decodes `frame` into `out` and reports the bytes consumed per stream.
     fn decode(&self, frame: &FrameView<'_>, out: &mut dyn Write) -> Result<DecodeReport, Error>;
+}
+
+/// One encoded stream of an [`EncodedFrame`] (BCJ2 only): what the manifest's `streams` records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EncodedStream {
+    /// Encoded bytes of the stream, at least 1.
+    pub length: u64,
+    /// Bytes the stream decodes to.
+    pub decoded_size: u64,
+    /// LZMA2 dictionary of MAIN, CALL and JUMP; `None` for RC.
+    pub dict_size: Option<u32>,
+}
+
+/// The result of encoding one file: the frame's bytes and the descriptor fields the encoder alone
+/// knows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EncodedFrame {
+    /// The codec the frame was encoded with.
+    pub codec: CodecId,
+    /// The frame's bytes (all streams back to back for BCJ2).
+    pub bytes: Vec<u8>,
+    /// The LZMA2 dictionary, for the LZMA2 variants; `None` for `stored` and `bcj2`.
+    pub dict_size: Option<u32>,
+    /// The four sub-streams, for `bcj2` only; `None` otherwise.
+    pub streams: Option<Vec<EncodedStream>>,
+}
+
+/// Frame encoding for one file. The output is deterministic: the same codec and input give the
+/// same bytes, whatever the host or the thread count.
+pub trait Encoder: Send + Sync {
+    /// Encodes `input` (at least one byte) with `codec`. An id the encoder does not implement is an
+    /// error.
+    fn encode(&self, codec: CodecId, input: &[u8]) -> Result<EncodedFrame, Error>;
+
+    /// An upper bound, in bytes, on the memory one [`Encoder::encode`] call of `codec` over
+    /// `input_len` bytes needs, excluding `input` itself.
+    fn encode_memory(&self, codec: CodecId, input_len: u64) -> u64;
+}
+
+/// An Ed25519 signer. The private key never leaves the implementation.
+///
+/// Signatures are deterministic (Ed25519, RFC 8032): signing the same message twice gives the same
+/// bytes. `Debug` is a supertrait so a signer can be logged, which is why an implementation's `Debug`
+/// must not print secret material.
+pub trait Signer: Send + Sync + std::fmt::Debug {
+    /// The signature algorithm.
+    fn alg(&self) -> SignatureAlg;
+
+    /// The public key.
+    fn public_key(&self) -> [u8; 32];
+
+    /// Signs `message`.
+    fn sign(&self, message: &[u8]) -> Result<[u8; 64], Error>;
+}
+
+/// The code-signing hook (C2 stage 2). It runs on the assembled tree before any file is hashed;
+/// `order` lists the paths to sign from inner to outer (a bundle's contents before the bundle).
+/// The identity implementation changes nothing.
+pub trait CodeSign: Send + Sync {
+    /// Signs the items of `order` under `root` in place.
+    fn sign_tree(&self, root: &std::path::Path, order: &[RelPath]) -> Result<(), Error>;
 }

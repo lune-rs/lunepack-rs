@@ -4,7 +4,7 @@ Status: **draft**, awaiting approval together with `docs/FORMAT.md`.
 
 What lunepack's update and install path defends against, and what it does not. The format rules
 referred to here are in `docs/FORMAT.md`; the decisions in `docs/DECISIONS.md` (D7, D17, D21, D24,
-D33, D34, D35).
+D33, D34, D35, M3-D1 to M3-D13).
 
 ## Assets
 
@@ -139,6 +139,77 @@ engine's events and returns the user's choices. The engine treats those choices 
 input: it validates them against what the verified manifest and the install scope allow, and no
 outcome of install, apply, confirm or rollback depends on the UI being present, alive or honest.
 The UI never runs elevated, so a fault in the GPU or window stack cannot act with elevated rights.
+
+## Packager and signing keys
+
+`lunepack` (`docs/CLI.md`) holds the signing keys' reach, not the keys' custody: it is run by the
+publisher, on the publisher's machine or CI runner, and trusts that machine. What it does and does not
+defend is below. Everything it writes is a document the format already authenticates, so a flaw here
+is a publisher-side compromise (classes 2, 3 and 6), never something a client has to trust.
+
+- **Key files at rest.** A key is Ed25519 as PKCS#8 PEM. `keys gen` creates it with `create_new` and
+  mode 0600 on Unix; loading refuses a file readable by group or others. On Windows the file
+  inherits its directory's ACL, which lunepack neither sets nor checks. Any process of the same user
+  can read the file: lunepack does not protect keys from their own user (class 4). Keep root keys
+  offline and out of CI; give CI only a release key with a short window.
+- **An env signer.** `env:<VAR>` reads a PEM from the environment. The value is visible to every
+  process of the same user that can read the process environment (on Linux, `/proc/<pid>/environ`) and
+  is inherited by every child the CI job starts. Prefer a file or a command signer where that matters.
+- **A command signer.** For HSM, KMS or a signing service. The message goes to the command's stdin and
+  the signature comes back on stdout; lunepack never sees the key. The argv is visible to other
+  processes of the same user, so it must not hold secrets: pass them in the command's environment. The
+  command's stderr goes to the terminal untouched, so a noisy command can print what it likes.
+- **Signatures are verified before use.** A command signer's output is checked against the configured
+  public key before it is placed in a document; a wrong, malformed or oversize answer fails the
+  command. A key is only accepted if it is a valid, non-small-order Ed25519 key, and only if it is in
+  the root or key set it signs for, inside its window, and counted once toward the threshold.
+- **Nothing secret is printed.** No command prints, logs or puts in an error a private key, a PEM line,
+  an environment value or a config value. Config errors name the file and line and never the text
+  of the line; a bad `SOURCE_DATE_EPOCH` is named, not echoed. An integration test scans stdout and
+  stderr of every command for each generated key in raw, hex (both cases), base64 (both alphabets, with
+  and without padding) and PEM-line form. It cannot see a secret that a command signer's own stderr
+  prints, or one the operator passes in an argv.
+- **Every output is verified before it is placed.** Each command builds its documents, then checks them
+  with the verifiers a client uses (root walk, key set, feed, manifest, the pack against its signed
+  size and hash, every frame through the decoder), and only then moves files into place (temporary file
+  in the destination directory, then rename). `pack` places the pack before the manifest and never
+  overwrites either; feeds and key sets are replaced atomically. A bug in the packager's encoder, layout
+  or writer therefore surfaces as a failed command, not as a release that clients reject.
+- **Input is treated as the publisher's own files.** `pack` copies the input to a private temporary
+  directory first, hashes the copy, and re-checks each file's hash when it is read for encoding, so a
+  file that changes during packaging is an error. It refuses special files (fifo, socket, device),
+  checks symlinks against the format's rules and does not follow them. It does not defend against a
+  hostile build output: a malicious binary in the input is packaged as is.
+- **Revocation is guarded.** `keys set` and `keys rotate-root` refuse to leave a feed that `verify`
+  would reject unless told to; no writer reads a feed it cannot verify (so a forged `seq` or release
+  list in an edited feed file never enters a new feed); every release a written feed lists is
+  re-verified in full. A feed's `seq` is not secret and not protected from a writer holding the
+  threshold of release keys: see the leaked-key class above and the `seq` = 2^53-1 limitation in
+  `docs/CLI.md`.
+- **Replayed older documents (S1, M3-R2-D1).** The writers build on the previous feed and `keys.json`
+  in the release directory and read them with time checks skipped, so a class 1 attacker who puts back
+  a genuine older document there (the publisher fetched the directory from the host it can write to)
+  would have its releases, rollouts, keys, windows or threshold re-signed with a fresh `seq` or version
+  and no expiry to reveal it. The defence is the publisher state file (`docs/CLI.md`), kept with the
+  config and outside the release directory: every writer refuses a previous document older than the
+  recorded root version, key set version or feed `seq`, and one the file has no record of, unless the
+  operator overrides (`--allow-older-previous`, `--trust-release-dir`); `keys set` never carries over a
+  threshold the state does not vouch for, and prints what it changes. Deletion is treated as the
+  oldest replay (F5, S2): a recorded `keys.json` or root that is missing is refused, and only
+  `--allow-older-previous` builds without it, with `--threshold` required, so deleting `keys.json` can
+  no longer yield a version-1 key set with a default threshold of 1 and a record lowered to match. No
+  writer lowers a recorded value without that override. A removed feed is the one document that may be
+  missing (the revocation fallback, M3-R1-D1); its restarted `seq` must still exceed the record. After an
+  operator lowers the record with the override, genuine documents between the new and the old recorded
+  values are no longer recognised as replays, so restore the release directory from the publisher's own
+  storage rather than override where possible. Writers trust the release
+  directory's previous documents for freshness only as far as the state file vouches: without it (a
+  lost file, or a run with `--trust-release-dir`), the directory must come from the publisher's own
+  storage, never from the public host. The state file is not secret but must be kept from the same
+  attacker; one who can edit it and the release directory both can still roll the writer back.
+- **The key set's extra minutes.** Revoking in two moves leaves the old key in the local `keys.json`
+  between the moves. Nothing is uploaded between them; if the publisher uploads after the first move,
+  the old key is still accepted by clients until the second.
 
 ## Denial-of-service bounds
 

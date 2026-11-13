@@ -62,6 +62,9 @@ undocumented_unsafe_blocks = "deny"
         crates: BTreeMap<String, String>,
         /// Extra `[[package]]` tables for the fixture's `Cargo.lock`; `None` writes no lock file.
         lock_extra: Option<String>,
+        /// Extra lines for a member's own `[[package]]` entry in the fixture lock (for example a
+        /// `dependencies = [...]` array), keyed by crate name.
+        lock_member_extra: BTreeMap<String, String>,
     }
 
     impl Fx {
@@ -100,6 +103,7 @@ undocumented_unsafe_blocks = "deny"
                 root: ROOT.to_string(),
                 crates,
                 lock_extra: Some(String::new()),
+                lock_member_extra: BTreeMap::new(),
             }
         }
 
@@ -136,7 +140,11 @@ undocumented_unsafe_blocks = "deny"
                 let mut lock = String::from("version = 4\n");
                 for name in self.crates.keys() {
                     lock.push_str(&format!(
-                        "\n[[package]]\nname = \"{name}\"\nversion = \"0.0.0\"\n"
+                        "\n[[package]]\nname = \"{name}\"\nversion = \"0.0.0\"\n{}",
+                        self.lock_member_extra
+                            .get(name)
+                            .map(String::as_str)
+                            .unwrap_or_default()
                     ));
                 }
                 lock.push_str(extra);
@@ -789,6 +797,185 @@ dependencies = ["libfuzzer-sys", "lunepack-core"]
         let mut fx = Fx::clean();
         fx.lock_extra = None;
         assert_has(&fx.run().1, "<workspace>", "lockfile");
+    }
+
+    // M3-D11: lzma-rust2 is confined to lunepack-codec-lzma, and pinned there ----------------------
+
+    const LZMA_DEP: &str = r#"lzma-rust2 = "=0.25.0""#;
+
+    /// A `[[package]]` text for a crates.io crate, optionally with a `dependencies` array.
+    fn lock_crate(name: &str, version: &str, deps: Option<&str>) -> String {
+        let deps = deps
+            .map(|d| format!("dependencies = {d}\n"))
+            .unwrap_or_default();
+        format!(
+            "\n[[package]]\nname = \"{name}\"\nversion = \"{version}\"\nsource = \"{CRATES_IO}\"\nchecksum = \"00\"\n{deps}"
+        )
+    }
+
+    /// The clean fixture plus a `lunepack-codec-lzma` that pins and locks lzma-rust2 correctly.
+    fn with_codec() -> Fx {
+        let mut fx = Fx::clean();
+        fx.crates.insert(
+            "lunepack-codec-lzma".into(),
+            manifest(
+                "lunepack-codec-lzma",
+                INHERIT,
+                &format!("lunepack-core = {{ path = \"../lunepack-core\" }}\n{LZMA_DEP}"),
+            ),
+        );
+        fx.lock_member_extra.insert(
+            "lunepack-codec-lzma".into(),
+            "dependencies = [\n \"lunepack-core\",\n \"lzma-rust2 0.25.0\",\n]\n".into(),
+        );
+        fx.lock_extra = Some(lock_crate("lzma-rust2", "0.25.0", None));
+        fx
+    }
+
+    #[test]
+    fn u_the_allowed_pinned_dependent_is_clean() {
+        let (n, vs) = with_codec().run();
+        assert_eq!(n, 7);
+        assert_clean(&vs);
+    }
+
+    #[test]
+    fn u_core_depending_on_a_confined_crate_is_rejected() {
+        let mut fx = with_codec();
+        fx.add_dep("lunepack-core", LZMA_DEP);
+        assert_has(&fx.run().1, "lunepack-core", "confined");
+    }
+
+    #[test]
+    fn u_testkit_dev_dependency_on_a_confined_crate_is_rejected() {
+        let mut fx = with_codec();
+        fx.append(
+            "lunepack-testkit",
+            &format!("[dev-dependencies]\n{LZMA_DEP}"),
+        );
+        assert_has(&fx.run().1, "lunepack-testkit", "confined");
+    }
+
+    #[test]
+    fn u_target_specific_build_dependency_on_a_confined_crate_is_rejected() {
+        let mut fx = with_codec();
+        fx.append(
+            "lunepack-http",
+            &format!("[target.'cfg(windows)'.build-dependencies]\n{LZMA_DEP}"),
+        );
+        assert_has(&fx.run().1, "lunepack-http", "confined");
+    }
+
+    #[test]
+    fn u_renamed_dependency_on_a_confined_crate_is_rejected() {
+        let mut fx = with_codec();
+        fx.crates.insert(
+            "lunepack-crypto".into(),
+            manifest(
+                "lunepack-crypto",
+                INHERIT,
+                r#"lunepack-core = { path = "../lunepack-core" }
+lz = { package = "lzma-rust2", version = "=0.25.0" }"#,
+            ),
+        );
+        assert_has(&fx.run().1, "lunepack-crypto", "confined");
+    }
+
+    #[test]
+    fn u_a_third_party_lock_entry_listing_a_confined_crate_is_rejected() {
+        let mut fx = with_codec();
+        fx.lock_extra = Some(format!(
+            "{}{}",
+            lock_crate("lzma-rust2", "0.25.0", None),
+            lock_crate("xz-thing", "1.0.0", Some("[\"lzma-rust2 0.25.0\"]"))
+        ));
+        assert_has(&fx.run().1, "xz-thing", "confined");
+    }
+
+    #[test]
+    fn u_a_non_allowed_member_listing_a_confined_crate_in_the_lock_is_rejected() {
+        let mut fx = with_codec();
+        fx.lock_member_extra.insert(
+            "lunepack-core".into(),
+            "dependencies = [\"lzma-rust2\"]\n".into(),
+        );
+        assert_has(&fx.run().1, "lunepack-core", "confined");
+    }
+
+    #[test]
+    fn u_a_source_ful_package_named_like_the_allowed_dependent_is_rejected() {
+        let mut fx = with_codec();
+        fx.lock_extra = Some(format!(
+            "{}{}",
+            lock_crate("lzma-rust2", "0.25.0", None),
+            lock_crate(
+                "lunepack-codec-lzma",
+                "9.9.9",
+                Some("[\"lzma-rust2 0.25.0\"]")
+            )
+        ));
+        assert_has(&fx.run().1, "lunepack-codec-lzma", "confined");
+    }
+
+    #[test]
+    fn u_a_malformed_lock_dependencies_value_fails_closed() {
+        let mut fx = with_codec();
+        fx.lock_member_extra
+            .insert("lunepack-core".into(), "dependencies = [1]\n".into());
+        assert_has(&fx.run().1, "lunepack-core", "confined");
+        let mut fx = with_codec();
+        fx.lock_member_extra.insert(
+            "lunepack-core".into(),
+            "dependencies = \"lzma-rust2\"\n".into(),
+        );
+        assert_has(&fx.run().1, "lunepack-core", "confined");
+    }
+
+    #[test]
+    fn u_a_probe_lock_listing_a_confined_crate_is_rejected() {
+        let dir = with_codec().write();
+        let probe = dir.path().join("probes").join("demo");
+        fs::create_dir_all(probe.join("src")).unwrap();
+        fs::write(probe.join("Cargo.toml"), manifest("demo", "", "")).unwrap();
+        fs::write(probe.join("src/lib.rs"), "").unwrap();
+        fs::write(
+            probe.join("Cargo.lock"),
+            format!(
+                "version = 4\n\n[[package]]\nname = \"demo\"\nversion = \"0.0.0\"\ndependencies = [\"lzma-rust2 0.25.0\"]\n{}",
+                lock_crate("lzma-rust2", "0.25.0", None)
+            ),
+        )
+        .unwrap();
+        let (_, vs) = check_workspace(dir.path()).expect("check");
+        assert_has(&vs, "demo", "confined");
+    }
+
+    #[test]
+    fn u_a_loose_requirement_is_not_the_exact_pin() {
+        for loose in ["0.25", "^0.25.0", "=0.25.1", ">=0.25.0, <0.26.0"] {
+            let mut fx = with_codec();
+            fx.edit("lunepack-codec-lzma", |m| {
+                *m = m.replace(LZMA_DEP, &format!("lzma-rust2 = \"{loose}\""))
+            });
+            assert_has(&fx.run().1, "lunepack-codec-lzma", "exact-pin");
+        }
+    }
+
+    #[test]
+    fn u_the_pinned_package_without_the_dependency_is_rejected() {
+        let mut fx = with_codec();
+        fx.edit("lunepack-codec-lzma", |m| *m = m.replace(LZMA_DEP, ""));
+        assert_has(&fx.run().1, "lunepack-codec-lzma", "exact-pin");
+    }
+
+    #[test]
+    fn u_a_second_loose_declaration_of_the_pinned_dependency_is_rejected() {
+        let mut fx = with_codec();
+        fx.append(
+            "lunepack-codec-lzma",
+            "[dev-dependencies]\nlzma-rust2 = \"0.25\"",
+        );
+        assert_has(&fx.run().1, "lunepack-codec-lzma", "exact-pin");
     }
 
     #[test]

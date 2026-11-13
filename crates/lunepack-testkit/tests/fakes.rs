@@ -2,7 +2,8 @@
 
 use lunepack_core::error::{CodecError, SignatureError};
 use lunepack_core::{
-    Clock, Codec, CodecId, Error, FrameView, Hasher, Sha256Digest, SignatureAlg, Verifier,
+    Clock, Codec, CodecId, DecodeReport, Encoder, Error, FrameView, Hasher, Sha256Digest,
+    SignatureAlg, Signer, StreamView, Verifier,
 };
 use lunepack_testkit::*;
 
@@ -259,4 +260,189 @@ fn write_error_is_reported_as_codec_write() {
     };
     let err = FakeCodec::new().decode(&frame, &mut Failing).unwrap_err();
     assert!(matches!(err, Error::Codec(CodecError::Write(_))));
+}
+
+#[test]
+fn fake_codec_passes_the_codec_suite() {
+    run_codec_suite(&FakeCodec::new(), &FakeCodec::new(), &FakeHasher);
+}
+
+/// A decoder that trusts what the streams really hold and ignores the signed per-stream sizes
+/// (an F6 violation), by rewriting `decoded_size` to the toy encoding's real sizes.
+struct IgnoresStreamSizes;
+
+impl Codec for IgnoresStreamSizes {
+    fn decode(
+        &self,
+        frame: &FrameView<'_>,
+        out: &mut dyn std::io::Write,
+    ) -> Result<DecodeReport, Error> {
+        let streams: Vec<StreamView<'_>> = frame
+            .streams
+            .iter()
+            .map(|s| StreamView {
+                decoded_size: (s.input.len() - usize::from(s.dict_size.is_some())) as u64,
+                ..*s
+            })
+            .collect();
+        FakeCodec::new().decode(
+            &FrameView {
+                streams: &streams,
+                ..*frame
+            },
+            out,
+        )
+    }
+}
+
+/// A decoder that allocates whatever it likes: it ignores the dictionary the descriptor signs.
+struct IgnoresDictionary;
+
+impl Codec for IgnoresDictionary {
+    fn decode(
+        &self,
+        frame: &FrameView<'_>,
+        out: &mut dyn std::io::Write,
+    ) -> Result<DecodeReport, Error> {
+        let streams: Vec<StreamView<'_>> = frame
+            .streams
+            .iter()
+            .map(|s| StreamView {
+                dict_size: s.dict_size.map(|_| 1 << 24),
+                ..*s
+            })
+            .collect();
+        FakeCodec::new().decode(
+            &FrameView {
+                streams: &streams,
+                ..*frame
+            },
+            out,
+        )
+    }
+}
+
+fn suite_panics(codec: &dyn Codec) -> String {
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_codec_suite(codec, &FakeCodec::new(), &FakeHasher)
+    }));
+    match caught {
+        Ok(()) => panic!("the suite accepted a broken decoder"),
+        Err(payload) => payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+            .unwrap_or_default(),
+    }
+}
+
+#[test]
+fn codec_suite_catches_a_decoder_that_ignores_stream_sizes() {
+    let message = suite_panics(&IgnoresStreamSizes);
+    assert!(message.contains("lying stream sizes decoded"), "{message}");
+}
+
+#[test]
+fn codec_suite_catches_a_decoder_that_ignores_the_dictionary() {
+    let message = suite_panics(&IgnoresDictionary);
+    assert!(
+        message.contains("decoded with a dictionary of 4096"),
+        "{message}"
+    );
+}
+
+#[test]
+fn codec_suite_catches_a_decoder_that_writes_after_a_write_error() {
+    // Retries every failed write: 12 must see a write after the failure.
+    let message = suite_panics(&FakeCodecRetrying);
+    assert!(message.contains("writes after the failure"), "{message}");
+}
+
+struct FakeCodecRetrying;
+
+impl Codec for FakeCodecRetrying {
+    fn decode(
+        &self,
+        frame: &FrameView<'_>,
+        out: &mut dyn std::io::Write,
+    ) -> Result<DecodeReport, Error> {
+        FakeCodec::with_fault(Fault::RetryAfterWriteError).decode(frame, out)
+    }
+}
+
+#[test]
+fn fake_encoder_emits_valid_descriptors_and_refuses_empty_input() {
+    let enc = Encoder::encode(&FakeCodec::new(), CodecId::Bcj2, &[7]).unwrap();
+    let streams = enc.streams.unwrap();
+    assert_eq!(streams.len(), 4);
+    assert!(streams.iter().all(|s| s.length >= 1));
+    assert_eq!(streams[3].dict_size, None);
+    assert_eq!(streams[0].dict_size, Some(4096));
+    assert!(Encoder::encode(&FakeCodec::new(), CodecId::Lzma2, &[]).is_err());
+    assert!(FakeCodec::new().encode_memory(CodecId::Lzma2, 1 << 20) >= 1 << 20);
+}
+
+#[test]
+fn fake_signer_passes_the_signer_suite() {
+    let signer = FakeSigner::new(7);
+    run_signer_suite(&signer, &FakeVerifier, &signer.secret());
+    assert_eq!(signer.alg(), SignatureAlg::Ed25519);
+    assert_eq!(signer.public_key(), FakeKeyPair::from_seed(7).public_key());
+    assert_ne!(signer.public_key(), FakeSigner::new(8).public_key());
+}
+
+struct LeakyDebug {
+    pair: FakeKeyPair,
+    secret: Vec<u8>,
+}
+
+impl std::fmt::Debug for LeakyDebug {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "LeakyDebug({:?})", self.secret)
+    }
+}
+
+impl Signer for LeakyDebug {
+    fn alg(&self) -> SignatureAlg {
+        SignatureAlg::Ed25519
+    }
+
+    fn public_key(&self) -> [u8; 32] {
+        self.pair.public_key()
+    }
+
+    fn sign(&self, message: &[u8]) -> Result<[u8; 64], Error> {
+        Ok(self.pair.sign(message))
+    }
+}
+
+#[test]
+fn signer_suite_catches_a_debug_that_prints_the_secret() {
+    let secret = FakeSigner::new(3).secret();
+    let leaky = LeakyDebug {
+        pair: FakeKeyPair::from_seed(3),
+        secret: secret.clone(),
+    };
+    let caught = std::panic::catch_unwind(|| run_signer_suite(&leaky, &FakeVerifier, &secret));
+    assert!(caught.is_err(), "a Debug that prints the secret passed");
+}
+
+#[test]
+fn signer_suite_catches_a_non_deterministic_or_wrong_signer() {
+    // Signs with a different key than it announces.
+    #[derive(Debug)]
+    struct WrongKey;
+    impl Signer for WrongKey {
+        fn alg(&self) -> SignatureAlg {
+            SignatureAlg::Ed25519
+        }
+        fn public_key(&self) -> [u8; 32] {
+            FakeKeyPair::from_seed(1).public_key()
+        }
+        fn sign(&self, message: &[u8]) -> Result<[u8; 64], Error> {
+            Ok(FakeKeyPair::from_seed(2).sign(message))
+        }
+    }
+    let caught = std::panic::catch_unwind(|| run_signer_suite(&WrongKey, &FakeVerifier, b"x"));
+    assert!(caught.is_err());
 }

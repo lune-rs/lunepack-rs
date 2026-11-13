@@ -1,6 +1,11 @@
-//! Hashing and signature-verification adapters implementing the core traits: [`Sha256Hasher`]
-//! (SHA-256) and [`Ed25519Verifier`] (Ed25519 with strict verification). Pure Rust; signing and
-//! randomness are not part of this crate's API.
+//! Hashing, signature-verification and signing adapters implementing the core traits:
+//! [`Sha256Hasher`] (SHA-256), [`Ed25519Verifier`] (Ed25519 with strict verification) and the
+//! signers of [`signer`] ([`Ed25519Signer`] over a PKCS#8 PEM key, [`CommandSigner`] over an
+//! external command, [`generate_key_file`]). Pure Rust.
+
+pub mod signer;
+
+pub use signer::{CommandSigner, Ed25519Signer, GeneratedKey, generate_key_file};
 
 use ed25519_dalek::{Signature, VerifyingKey};
 use lunepack_core::error::SignatureError;

@@ -43,3 +43,12 @@ thiserror = "2"
 # Crypto adapter (M2 step 7): pure Rust, no C. rand_core/getrandom are for tests only (crate dev-dependencies).
 sha2 = { version = "0.11", default-features = false }
 ed25519-dalek = { version = "3", default-features = false }
+# Signers (M3 step 6): key generation, key buffers that wipe themselves, and test directories.
+getrandom = "0.4"
+zeroize = { version = "1", default-features = false, features = ["alloc"] }
+tempfile = "3"
+
+# Command-line packager (M3 step 7).
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+toml = "1.2"

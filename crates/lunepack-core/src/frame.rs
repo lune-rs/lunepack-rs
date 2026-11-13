@@ -9,11 +9,12 @@
 
 use std::io::{self, Write};
 
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 
 use crate::digest::{Sha256Digest, U53};
 use crate::error::{Error, FrameError, Result, Untrusted};
 use crate::traits::{Codec, CodecId, FrameView, HashState, Hasher, StreamView};
+use crate::trust::present;
 
 /// Smallest LZMA2 dictionary a descriptor may declare.
 pub const MIN_DICT_SIZE: u64 = 4096;
@@ -68,13 +69,6 @@ pub struct FrameDesc {
         skip_serializing_if = "Option::is_none"
     )]
     pub streams: Option<Vec<StreamDesc>>,
-}
-
-/// An optional field that, when present, must hold a value: `null` is rejected (FORMAT.md 3.1).
-fn present<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
-    deserializer: D,
-) -> Result<Option<T>, D::Error> {
-    T::deserialize(deserializer).map(Some)
 }
 
 /// One stream of a checked frame: where it sits in the frame and what the decoder may use.
@@ -377,7 +371,12 @@ impl Write for ExactWriter<'_> {
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.inner.flush()
+        // A codec may ignore a flush error and return `Ok`, so it is latched like a write error.
+        if let Err(e) = self.inner.flush() {
+            self.failed.get_or_insert(e.kind());
+            return Err(e);
+        }
+        Ok(())
     }
 }
 

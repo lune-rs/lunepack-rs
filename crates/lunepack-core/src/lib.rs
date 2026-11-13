@@ -13,6 +13,7 @@ pub mod json;
 pub mod keyset;
 pub mod limits;
 pub mod manifest;
+pub mod pack;
 pub mod path;
 pub mod policy;
 pub mod root;
@@ -20,6 +21,7 @@ pub mod target;
 pub mod traits;
 pub mod trust;
 pub mod version;
+pub mod write;
 
 pub use digest::{Sha256Digest, U53};
 pub use envelope::{EnvelopeSignature, OpenedEnvelope, PayloadKind, pae, write_envelope};
@@ -35,13 +37,17 @@ pub use ident::{AppId, Channel};
 pub use keyset::{KeySetDocument, ReleaseKeyEntry, VerifiedKeySet, verify_key_set};
 pub use limits::Limits;
 pub use manifest::{EntryDoc, ManifestDocument, VerifiedEntry, VerifiedManifest, verify_manifest};
+pub use pack::{FileClass, PackedFile, ReleaseLayout, candidates, classify, pack_file};
 pub use path::{EntryKind, RelPath, validate_path, validate_tree};
 pub use policy::{Candidate, in_rollout, rollout_bucket, select_candidate};
 pub use root::{RootDocument, TrustedRoot, advance_root};
 pub use target::Target;
 pub use traits::{
-    Clock, Codec, CodecId, DecodeReport, FrameView, HashState, Hasher, SignatureAlg, StreamView,
-    Verifier,
+    Clock, CodeSign, Codec, CodecId, DecodeReport, EncodedFrame, EncodedStream, Encoder, FrameView,
+    HashState, Hasher, SignatureAlg, Signer, StreamView, Verifier,
 };
 pub use trust::{ClockReading, KeyEntry, KeyRing, PublicKey, RollbackFloor};
 pub use version::Version;
+pub use write::{
+    DEFAULT_FEED_LIFETIME_SECS, next_feed, next_key_set, rollout_seed, rotate_root, sign_envelope,
+};

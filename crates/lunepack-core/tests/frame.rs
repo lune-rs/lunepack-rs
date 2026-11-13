@@ -662,3 +662,61 @@ fn wrong_decoded_hash_fails() {
         assert_eq!(out, d);
     }
 }
+
+/// Decodes honestly through `FakeCodec`, then calls `flush` on the writer, ignores the error and
+/// returns `Ok` (a codec that swallows a flush failure).
+struct FlushIgnoringCodec;
+
+impl lunepack_core::Codec for FlushIgnoringCodec {
+    fn decode(
+        &self,
+        frame: &lunepack_core::FrameView<'_>,
+        out: &mut dyn std::io::Write,
+    ) -> Result<lunepack_core::DecodeReport, Error> {
+        let report = FakeCodec::new().decode(frame, out)?;
+        let _ = out.flush();
+        Ok(report)
+    }
+}
+
+/// Accepts every write; its `flush` fails.
+struct FlushFails(Vec<u8>);
+
+impl std::io::Write for FlushFails {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Err(std::io::Error::from(std::io::ErrorKind::StorageFull))
+    }
+}
+
+#[test]
+fn a_flush_failure_the_codec_swallows_is_still_reported() {
+    for id in ALL {
+        let (enc, frame) = checked(id);
+        let mut w = FlushFails(Vec::new());
+        let res = decode_verified(&frame, &enc.frame, &FakeHasher, &FlushIgnoringCodec, &mut w);
+        assert_eq!(
+            frame_err(res.unwrap_err()),
+            FrameError::OutputWrite {
+                kind: std::io::ErrorKind::StorageFull
+            },
+            "{id:?}"
+        );
+    }
+    // The same codec with a writer whose flush works still succeeds.
+    let (enc, frame) = checked(CodecId::Lzma2);
+    let mut out = Vec::new();
+    decode_verified(
+        &frame,
+        &enc.frame,
+        &FakeHasher,
+        &FlushIgnoringCodec,
+        &mut out,
+    )
+    .unwrap();
+    assert_eq!(out, data());
+}

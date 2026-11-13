@@ -1,9 +1,9 @@
 # Architecture
 
 How the workspace is split and how the split is enforced. Crate roles and the boundary rules
-are the current design; four traits are defined (below) and the rest stay provisional. The wire
+are the current design; seven traits are defined (below) and the rest stay provisional. The wire
 format is `docs/FORMAT.md` and its threat model `docs/THREAT-MODEL.md`. Decisions behind this are in
-`docs/DECISIONS.md` (D1, D6, D14, D17, D23, D26, D28, D30, D31, D33, M2-D1 to M2-D9).
+`docs/DECISIONS.md` (D1, D6, D14, D17, D23, D26, D28, D30, D31, D33, M2-D1 to M2-D9, M3-D1 to M3-D13).
 
 ## Crates
 
@@ -11,14 +11,14 @@ format is `docs/FORMAT.md` and its threat model `docs/THREAT-MODEL.md`. Decision
 |---|---|---|
 | `lunepack-core` | Types, rules, verification policy, planning, state machine, apply engine; owns every trait and the error enum. No I/O, clock, randomness or network of its own. Today: strict JSON, DSSE envelopes, root rotation, key sets, feeds, manifests, frame descriptors, the path, version and target rules, update policy, and the hidden `fuzz` harness module. | nothing external beyond an explicit allowlist: `serde`, `serde_json`, `base64`, `semver`, `unicode-normalization`, `thiserror` (M2-D1) |
 | `lunepack-testkit` | In-memory fakes and the contract suites. Today: a fake clock, hasher, signature scheme and codec (with fault knobs), the contract suites for the traits below, document builders over the core's real writer, and the fuzz seed writer; a crash-injecting filesystem and a faulty Range transport come with their traits. `publish = false`. | core |
-| `lunepack-crypto` | Hashing and signature verification adapters: SHA-256 and Ed25519 with strict verification (key-signing adapters come later). | core |
-| `lunepack-codec-lzma` | Compression and delta codec adapter. | core |
+| `lunepack-crypto` | Hashing and signature verification adapters: SHA-256 and Ed25519 with strict verification; and the signers (M3): `Ed25519Signer` over PKCS#8 PEM from a file or an environment variable, `generate_key_file`, and `CommandSigner` (an external command whose signature is verified before use). Nothing it prints or returns in an error holds key material. | core |
+| `lunepack-codec-lzma` | Compression adapter over `lzma-rust2` (confined to this crate, M3-D11): the `Codec` decoder with limits from the signed descriptor, and the `Encoder` at the 9e settings for all five codec ids (stored, LZMA2, BCJ x86 and ARM64 + LZMA2, BCJ2). Delta coding comes later. | core |
 | `lunepack-fs` | Filesystem adapter. | core |
 | `lunepack-http` | Release source and network adapter. | core |
 | `lunepack-os-windows`, `lunepack-os-macos`, `lunepack-os-linux` | OS install, shortcut, autostart and process adapters. | core |
-| `lunepack` | The app-facing facade and the composition root for apps that embed lunepack: a builder wires the default adapters, each swappable. | core, adapters |
+| `lunepack` | The app-facing facade and the composition root for apps that embed lunepack: a builder wires the default adapters, each swappable. Today it holds `SystemClock` (M3-D5), the only wall-clock `Clock`. | core, adapters |
 | `lunepack-runtime` | Binary: launcher, updater, installer, uninstaller, service. | core, adapters, facade |
-| `lunepack-cli` | Binary `lunepack`: the packager and feed tooling. | core, adapters, facade |
+| `lunepack-cli` | Binary `lunepack` and the packager's composition root: `init`, `keys`, `pack`, `feed add` and `refresh`, `verify` and `inspect` (`docs/CLI.md`). It holds the I/O the core must not have: `lunepack.toml`, signer specs, the release-directory walk, the pack pipeline (assemble a temporary copy, code-sign, hash, pack on a worker pool within a memory budget, sign), self-verification of every output with the core verifiers, and placement by temp file and rename. Pure rules (codec choice, layout, manifest, signing, document writers) stay in the core (M3-D1). | core, adapters, facade |
 | `xtask` | Repository tooling: the boundary check, the key-container file check and the optional denylist scan. | nothing in the workspace |
 
 A language binding (a C ABI crate, later others) is one more adapter crate over the core and adds no logic.
@@ -38,11 +38,18 @@ Owned by the core, implemented by adapters, faked in the testkit. Defined today:
 - `Verifier` (`verify` with strict Ed25519 semantics, and the required `check_public_key` that
   rejects non-canonical and small-order keys), implemented by `lunepack-crypto`;
 - `Clock` (`now_unix_secs`; the only source of time in the core);
-- `Codec` (decodes one verified frame into a writer and reports the bytes consumed per stream).
+- `Codec` (decodes one verified frame into a writer and reports the bytes consumed per stream);
+- `Encoder` (encodes one file with a given codec id, and estimates the memory it needs; the producer
+  side, so `Codec` stays decode-only, M3-D2), implemented by `lunepack-codec-lzma`;
+- `Signer` (an Ed25519 public key and a signature over a message), implemented by
+  `lunepack-crypto`;
+- `CodeSign` (the pipeline's OS code-signing hook, run on the assembled tree before hashing; the
+  identity in the CLI's composition root until the OS adapters provide real ones).
 
-Each has a contract suite in the testkit that the real implementation's `tests/` runs, and a fake
-in the testkit. The others are provisional and arrive with their milestones: `Fs`, `Transport`,
-`Signer`, `Rng`, `OsIntegration`, `Process`. `Transport` is object-safe with boxed `Send` futures
+`Clock` is implemented by `lunepack::SystemClock` and by the testkit's fake; the CLI adds a fixed
+clock for `SOURCE_DATE_EPOCH`. Each trait has a contract suite in the testkit that the real
+implementation's `tests/` runs, and a fake in the testkit. The others are provisional and arrive with
+their milestones: `Fs`, `Transport`, `Rng`, `OsIntegration`, `Process`. `Transport` is object-safe with boxed `Send` futures
 so a host app can inject its own client (D23).
 
 ## Composition roots
@@ -81,6 +88,13 @@ check does not recognise is a violation, and an internal error exits 2, never 0.
   target-specific) must be crates.io requirements or `path` dependencies on a workspace member
   (same package name, same directory); a `git`, `registry` or `workspace` key, any other path and
   any form the check does not recognise is a violation.
+- confined crates (M3-D11, `CONFINED` in `xtask/src/boundaries.rs`): `lzma-rust2` may be named only
+  by `lunepack-codec-lzma`. No other workspace package may depend on it in any kind, target or
+  rename (matched on the package name `cargo metadata` reports); in every lock the check reads
+  (the workspace's, `probes/*/`, `fuzz/`), any `[[package]]` whose `dependencies` names it must be
+  `lunepack-codec-lzma` as a source-less member, which catches pulls through third-party crates;
+  an unparseable `dependencies` value is a violation. The codec crate's requirement must be exactly
+  `=0.25.0` (`EXACT_PINS`).
 
 Adding a crate is one line in `ROLES` in `xtask/src/boundaries.rs`.
 

@@ -295,7 +295,7 @@ impl FeedTargetEntry {
     }
 }
 
-fn check_release(doc: &ReleaseDoc) -> Result<VerifiedRelease> {
+pub(crate) fn check_release(doc: &ReleaseDoc) -> Result<VerifiedRelease> {
     let version = Version::parse(&doc.version)?;
     if doc.targets.is_empty() {
         return Err(Error::Field("release lists no target"));

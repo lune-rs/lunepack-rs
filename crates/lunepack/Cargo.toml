@@ -12,3 +12,6 @@ workspace = true
 
 [dependencies]
 lunepack-core.workspace = true
+
+[dev-dependencies]
+lunepack-testkit.workspace = true

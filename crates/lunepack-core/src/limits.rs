@@ -1,5 +1,10 @@
 //! The size and count caps of FORMAT.md section 4. Readers enforce them before the work they bound.
 
+use crate::frame::MAX_DICT_SIZE;
+
+// `Limits::V1.lzma2_dict_bytes` is `MAX_DICT_SIZE`; it must fit the `u32` field.
+const _: () = assert!(MAX_DICT_SIZE <= u32::MAX as u64);
+
 /// Largest integer a document may carry: 2^53 - 1 (FORMAT.md 3.1).
 pub const MAX_JSON_INT: u64 = (1 << 53) - 1;
 
@@ -45,7 +50,7 @@ impl Limits {
         release_keys: 64,
         releases_per_feed: 10_000,
         manifest_entries: 200_000,
-        lzma2_dict_bytes: 16 * 1024 * 1024,
+        lzma2_dict_bytes: MAX_DICT_SIZE as u32,
         json_depth: MAX_JSON_DEPTH,
     };
 }
