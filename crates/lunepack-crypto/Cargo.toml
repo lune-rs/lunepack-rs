@@ -12,3 +12,11 @@ workspace = true
 
 [dependencies]
 lunepack-core.workspace = true
+sha2 = { workspace = true }
+ed25519-dalek = { workspace = true }
+
+[dev-dependencies]
+lunepack-testkit.workspace = true
+# Test keys are generated at test time; signing and randomness are not part of this crate's API.
+ed25519-dalek = { workspace = true, features = ["rand_core", "signature"] }
+getrandom = { version = "0.4", features = ["sys_rng"] }

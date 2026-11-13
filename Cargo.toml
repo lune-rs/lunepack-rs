@@ -39,3 +39,7 @@ base64 = "0.22"
 semver = "1"
 unicode-normalization = "0.1"
 thiserror = "2"
+
+# Crypto adapter (M2 step 7): pure Rust, no C. rand_core/getrandom are for tests only (crate dev-dependencies).
+sha2 = { version = "0.11", default-features = false }
+ed25519-dalek = { version = "3", default-features = false }
