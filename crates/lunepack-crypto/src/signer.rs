@@ -409,20 +409,24 @@ impl Signer for CommandSigner {
         let mut output = Vec::with_capacity(MAX_COMMAND_OUTPUT_BYTES + 1);
         let read = std::thread::scope(|scope| {
             scope.spawn(move || {
-                // A command that stops reading early closes the pipe: its exit status and output
-                // say what went wrong, so this error is dropped.
+                // A command that stops reading early closes the pipe (or is killed below): its exit
+                // status and output say what went wrong, so this error is dropped.
                 let _ = stdin.write_all(message);
             });
-            (&mut stdout)
+            let read = (&mut stdout)
                 .take(MAX_COMMAND_OUTPUT_BYTES as u64 + 1)
-                .read_to_end(&mut output)
+                .read_to_end(&mut output);
+            if output.len() > MAX_COMMAND_OUTPUT_BYTES || read.is_err() {
+                // Stop the command before the scope joins the writer: a command still producing
+                // output and not reading its input would otherwise block on a full stdout pipe
+                // while the writer blocks on a full stdin pipe, and neither would ever return.
+                // Killing it closes its end of stdin, so the writer's `write_all` fails and ends.
+                let _ = child.kill();
+            }
+            drop(stdout);
+            read
         });
         let too_long = output.len() > MAX_COMMAND_OUTPUT_BYTES;
-        if too_long || read.is_err() {
-            // A command still producing output would block in exit; stop it.
-            let _ = child.kill();
-        }
-        drop(stdout);
         let status = child.wait().map_err(|e| {
             self.fail_io(
                 "waiting for the signing command failed",

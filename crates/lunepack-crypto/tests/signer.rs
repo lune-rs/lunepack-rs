@@ -684,6 +684,9 @@ fn command_signer_never_hangs() {
     assert!(fx.command("exit1").sign(&big).is_err());
     // A command that never stops writing: stopped at the cap.
     assert!(fx.command("flood").sign(b"m").is_err());
+    // Both at once with a message larger than any pipe buffer: the command blocks on a full
+    // stdout while the writer blocks on a full stdin, unless the signer stops the command first.
+    assert!(fx.command("flood").sign(&big).is_err());
     // A command that reads everything and answers late is fine (covered by the suite's 1 MiB).
 }
 
