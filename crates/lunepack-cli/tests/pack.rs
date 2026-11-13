@@ -316,6 +316,7 @@ fn codec_of(m: &VerifiedManifest, path: &str) -> Option<CodecId> {
     }
 }
 
+#[cfg(unix)]
 fn exec_of(m: &VerifiedManifest, path: &str) -> bool {
     match file_entry(m, path) {
         VerifiedEntry::File { exec, .. } => *exec,
