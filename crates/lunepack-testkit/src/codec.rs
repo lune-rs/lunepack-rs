@@ -22,7 +22,19 @@ pub enum Fault {
     WrongConsumed,
     /// Writes half of the first stream's output, then fails.
     ErrorMidStream,
+    /// Panics if `decode` is called at all (for "the codec is never called" checks).
+    PanicIfCalled,
+    /// Writes the output, then keeps writing 4 KiB chunks until a write fails, and returns that
+    /// error (an over-producing decoder that stops on the first write error). Gives up and returns
+    /// `Ok` after 64 MiB of extra output, so a writer that never fails cannot hang a test.
+    Flood,
+    /// Writes one byte more than the output, ignores the write error and returns `Ok` (a decoder
+    /// that swallows write errors).
+    ExtraBytesIgnoringErrors,
 }
+
+/// Extra 4 KiB chunks [`Fault::Flood`] writes at most.
+const FLOOD_CHUNKS: usize = 16 * 1024;
 
 /// The fake codec. `Stored` is the real thing. A compressed id is encoded by [`FakeCodec::encode`]
 /// as `data ^ 0x5A` followed by one end byte, per stream; BCJ2 is four such streams (the last one
@@ -139,6 +151,10 @@ impl FakeEncoded {
 
 impl Codec for FakeCodec {
     fn decode(&self, frame: &FrameView<'_>, out: &mut dyn Write) -> Result<DecodeReport, Error> {
+        assert!(
+            self.fault != Some(Fault::PanicIfCalled),
+            "FakeCodec::decode called with Fault::PanicIfCalled"
+        );
         let expected_streams = if frame.codec == CodecId::Bcj2 { 4 } else { 1 };
         if frame.streams.len() != expected_streams {
             return Err(CodecError::Corrupt("wrong stream count").into());
@@ -185,6 +201,14 @@ impl Codec for FakeCodec {
         }
         if self.fault == Some(Fault::ExtraBytes) {
             write(out, &[0])?;
+        }
+        if self.fault == Some(Fault::Flood) {
+            for _ in 0..FLOOD_CHUNKS {
+                write(out, &[0x77; 4096])?;
+            }
+        }
+        if self.fault == Some(Fault::ExtraBytesIgnoringErrors) {
+            let _ = out.write_all(&[0]);
         }
         if self.fault == Some(Fault::WrongConsumed) {
             consumed[0] = if consumed[0] == 0 { 1 } else { consumed[0] - 1 };

@@ -207,6 +207,101 @@ pub enum CodecError {
     Write(#[source] std::io::Error),
 }
 
+/// Why a frame descriptor or a frame's bytes were rejected (FORMAT.md 9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum FrameError {
+    /// A non-empty file without a frame, or an empty file with one.
+    #[error("frame must be present exactly when the file is not empty")]
+    Presence,
+    /// A field that belongs to another codec.
+    #[error("field {field} does not belong to codec {codec}")]
+    ForeignField {
+        /// The field.
+        field: &'static str,
+        /// The codec id.
+        codec: &'static str,
+    },
+    /// A field the codec requires is missing.
+    #[error("codec {codec} requires field {field}")]
+    MissingField {
+        /// The field.
+        field: &'static str,
+        /// The codec id.
+        codec: &'static str,
+    },
+    /// A dictionary size that is not a power of two in `4096 ..= 16 MiB`.
+    #[error("dictionary size {value} is not a power of two from 4096 to 16777216")]
+    DictSize {
+        /// The declared size.
+        value: u64,
+    },
+    /// A frame or stream length of 0.
+    #[error("frame length is 0")]
+    ZeroLength,
+    /// `offset + length` is past the pack's size (or overflows).
+    #[error("frame ends past the pack")]
+    OutOfPack,
+    /// A `stored` frame whose length or hash differs from its file's.
+    #[error("stored frame does not match its file")]
+    StoredMismatch,
+    /// A `bcj2` frame without exactly four streams.
+    #[error("bcj2 needs 4 streams, found {count}")]
+    StreamCount {
+        /// Streams found.
+        count: usize,
+    },
+    /// A BCJ2 sub-stream breaks a rule of FORMAT.md 9.1.
+    #[error("bcj2 stream {index}: {reason}")]
+    Stream {
+        /// Stream index (0 MAIN, 1 CALL, 2 JUMP, 3 RC).
+        index: usize,
+        /// The rule broken.
+        reason: &'static str,
+    },
+    /// BCJ2 sub-stream lengths do not sum to the frame length (or overflow).
+    #[error("stream lengths do not sum to the frame length")]
+    LengthSum,
+    /// The frame bytes handed in are not exactly `length` bytes.
+    #[error("frame is {actual} bytes, expected {expected}")]
+    ByteCount {
+        /// The signed length.
+        expected: u64,
+        /// Bytes received.
+        actual: u64,
+    },
+    /// The frame's SHA-256 differs from the signed one.
+    #[error("frame hash does not match")]
+    FrameHash,
+    /// The decoder tried to write more than the file's size.
+    #[error("decoded output exceeds {size} bytes")]
+    OutputTooLong {
+        /// The file's size.
+        size: u64,
+    },
+    /// The decoder wrote fewer bytes than the file's size.
+    #[error("decoded {actual} of {expected} bytes")]
+    OutputTooShort {
+        /// The file's size.
+        expected: u64,
+        /// Bytes written.
+        actual: u64,
+    },
+    /// A stream was not consumed exactly (or the report has the wrong number of entries).
+    #[error("stream {index} consumed {consumed} of {length} bytes")]
+    Consumed {
+        /// Stream index.
+        index: usize,
+        /// Bytes the decoder reports consumed.
+        consumed: u64,
+        /// The stream's length.
+        length: u64,
+    },
+    /// The decoded file's SHA-256 differs from the signed one.
+    #[error("decoded file hash does not match")]
+    FileHash,
+}
+
 /// Every way the core rejects input or fails.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -337,6 +432,12 @@ pub enum Error {
         /// The value found.
         found: u64,
     },
+    /// A codec id outside the closed set of FORMAT.md 9.0 (another case included).
+    #[error("unknown codec {0}")]
+    UnknownCodec(Untrusted),
+    /// A frame descriptor or frame was rejected.
+    #[error("frame: {0}")]
+    Frame(#[from] FrameError),
     /// A document is expired at the reader's `now` (FORMAT.md 11.3).
     #[error("{what} expired at {expires}, now is {now}")]
     Expired {

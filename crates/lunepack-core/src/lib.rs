@@ -4,6 +4,7 @@ pub mod digest;
 pub mod encoding;
 pub mod envelope;
 pub mod error;
+pub mod frame;
 pub mod ident;
 pub mod json;
 pub mod keyset;
@@ -18,6 +19,9 @@ pub mod version;
 pub use digest::{Sha256Digest, U53};
 pub use envelope::{EnvelopeSignature, OpenedEnvelope, PayloadKind, pae, write_envelope};
 pub use error::{Error, Result};
+pub use frame::{
+    CheckedFrame, FrameDesc, StreamDesc, check_file_frame, decode_verified, decoder_memory,
+};
 pub use ident::{AppId, Channel};
 pub use keyset::{KeySetDocument, ReleaseKeyEntry, VerifiedKeySet, verify_key_set};
 pub use limits::Limits;
