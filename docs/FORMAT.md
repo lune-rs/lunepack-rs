@@ -575,8 +575,9 @@ Accepted examples: `bin/app`, `Contents/MacOS/App`, `a b/c.d.e`, `ünïcode/文�
 ### 10.2 Trees (the entry set of one manifest)
 
 - **Case folding.** No two entries have equal fold keys, where `fold(p) = NFC(lowercase(uppercase(p)))`
-  with Unicode full case mapping. So `A` and `a`, `Straße` and `STRASSE`, `K` (U+212A KELVIN SIGN)
-  and `k`, `Dir/x` and `dir/x` collide. Over-rejects on purpose: names that differ only in case or
+  with Unicode full case mapping, applied repeatedly until the string stops changing (one pass is
+  not stable for U+1E9E: it gives `ß`, which gives `ss`). So `A` and `a`, `Straße` and `STRASSE`,
+  `ẞ` (U+1E9E), `ß` and `ss`, `K` (U+212A KELVIN SIGN) and `k`, `Dir/x` and `dir/x` collide. Over-rejects on purpose: names that differ only in case or
   in case-folding forms are rejected even where the filesystem would keep them apart.
 - **Nothing under a non-directory.** No entry's path has a proper prefix (by components, compared
   by fold key) that is a `file` or `symlink` entry (`a` as a file and `a/b`).

@@ -288,6 +288,11 @@ fn tree_rejects_case_fold_collisions() {
         ("ǅ", "ǆ"),
         ("ΑΣ", "ας"),
         ("ﬁle", "FILE"),
+        ("ẞ", "ß"),
+        ("ẞ", "ss"),
+        ("Straẞe", "STRASSE"),
+        ("Straẞe", "Straße"),
+        ("ß", "ss"),
     ] {
         let r = tree(&[(a, K::F), (b, K::F)], MAC);
         assert!(
@@ -313,6 +318,60 @@ fn tree_rejects_case_fold_collisions() {
     ));
 }
 
+/// Reference fold: the single pass of FORMAT.md 10.2 repeated until it stops changing.
+fn fold_to_fixed_point(text: &str) -> String {
+    let mut key = text.to_owned();
+    loop {
+        let next: String = key.to_uppercase().to_lowercase().nfc().collect();
+        if next == key {
+            return key;
+        }
+        key = next;
+    }
+}
+
+#[test]
+fn fold_key_is_idempotent_over_every_char() {
+    // Exhaustive: every scalar value alone, and next to a context char (final-sigma, NFC).
+    let mut buf = [0u8; 4];
+    for c in ('\0'..=char::MAX).filter(|c| !matches!(*c as u32, 0xD800..=0xDFFF)) {
+        let s: &str = c.encode_utf8(&mut buf);
+        let k = fold_key(s);
+        assert_eq!(fold_key(&k), k, "U+{:04X}", c as u32);
+    }
+    for s in ["ẞ", "ß", "ss", "Σ", "ΑΣ", "ǅ", "ﬁ", "İ", "\u{1E9E}\u{301}"] {
+        let k = fold_key(s);
+        assert_eq!(fold_key(&k), k, "{s:?}");
+    }
+    assert_eq!(fold_key("ẞ"), "ss");
+    assert_eq!(fold_key("ß"), "ss");
+    assert_eq!(fold_key("ss"), "ss");
+}
+
+#[test]
+fn tree_rejects_the_apfs_eszett_escape() {
+    // S1: `a/ß` is the link `a/ẞ` -> `a` on a case-insensitive filesystem, so the link `ẞ` ->
+    // `a/ß/../..` would leave the tree; `ss/evil` would then be written through it.
+    let r = tree(
+        &[
+            ("a", K::D),
+            ("a/ẞ", K::L(".")),
+            ("ẞ", K::L("a/ß/../..")),
+            ("ss/evil", K::F),
+        ],
+        MAC,
+    );
+    assert!(r.is_err(), "{r:?}");
+    // Each defence on its own, by fold key.
+    let r = tree(&[("ẞ", K::L("x")), ("ss/evil", K::F)], MAC);
+    assert!(
+        matches!(r, Err(TreeError::UnderNonDirectory { .. })),
+        "{r:?}"
+    );
+    let e = link_err(&[("ss", K::L(".")), ("l", K::L("ẞ/../x"))]);
+    assert!(matches!(e, LinkTargetError::ThroughSymlink(_)), "{e:?}");
+}
+
 #[test]
 fn fold_key_is_per_component() {
     // The tree check relies on fold(p) being the folds of p's components joined by `/`.
@@ -324,7 +383,7 @@ fn fold_key_is_per_component() {
         "a.Σ/Σ",
         "Ω/\u{1E9E}",
     ] {
-        let whole: String = p.to_uppercase().to_lowercase().nfc().collect();
+        let whole = fold_to_fixed_point(p);
         let parts: Vec<String> = p.split('/').map(fold_key).collect();
         assert_eq!(fold_key(p), whole, "{p:?}");
         assert_eq!(parts.join("/"), whole, "{p:?}");

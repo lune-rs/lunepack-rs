@@ -254,11 +254,21 @@ pub(crate) fn is_device_name(name: &str) -> bool {
     }
 }
 
-/// `NFC(lowercase(uppercase(text)))` with Unicode full case mapping (FORMAT.md 10.2). Case mapping
-/// never produces or removes `/`, and `/` is neither cased nor case-ignorable, so the key of a path
-/// is the keys of its components joined by `/`.
+/// The fold of FORMAT.md 10.2: `NFC(lowercase(uppercase(text)))` with Unicode full case mapping,
+/// applied until the string stops changing. One pass is not a fixed point for U+1E9E (it gives
+/// `ß`, and `ß` gives `ss`), and `ẞ`, `ß` and `ss` are one name on a case-insensitive filesystem,
+/// so the fold repeats until stable (it is idempotent: `fold_key(fold_key(x)) == fold_key(x)`).
+/// Case mapping never produces or removes `/`, and `/` is neither cased nor case-ignorable, so the
+/// key of a path is the keys of its components joined by `/`.
 pub fn fold_key(text: &str) -> String {
-    text.to_uppercase().to_lowercase().nfc().collect()
+    let mut key: String = text.to_uppercase().to_lowercase().nfc().collect();
+    loop {
+        let next: String = key.to_uppercase().to_lowercase().nfc().collect();
+        if next == key {
+            return key;
+        }
+        key = next;
+    }
 }
 
 /// The kind of one manifest entry, as [`validate_tree`] needs it.

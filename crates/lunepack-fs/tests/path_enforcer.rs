@@ -155,8 +155,11 @@ fn accepted_names_round_trip_and_never_alias() {
 const COLLIDING: &[(&str, &str)] = &[
     ("A", "a"),
     ("Straße", "STRASSE"),
-    ("k", "\u{212A}"),                    // KELVIN SIGN: not NFC, folds to `k`
-    ("é", "e\u{301}"),                    // NFC and NFD: APFS treats them as one name
+    ("k", "\u{212A}"), // KELVIN SIGN: not NFC, folds to `k`
+    ("é", "e\u{301}"), // NFC and NFD: APFS treats them as one name
+    ("ẞ", "ß"),        // capital sharp s: APFS folds it to ss
+    ("ẞ", "ss"),
+    ("ß", "ss"),
     ("Ω", "\u{2126}"),                    // OHM SIGN: not NFC
     ("x", "x."),                          // Win32 strips a trailing dot
     ("y", "y "),                          // and a trailing space
