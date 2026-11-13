@@ -51,8 +51,17 @@ pub const UNSAFE_ALLOWLIST: &[&str] = &[
     "lunepack-os-linux",
 ];
 
-/// External (non-workspace) dependencies `lunepack-core` may have. Empty in M1.
-pub const CORE_EXTERNAL_ALLOWLIST: &[&str] = &[];
+/// External (non-workspace) dependencies `lunepack-core` may have (M2-D1): the pure parsing,
+/// encoding and error crates the format needs. Hashing, signatures, clock and decoding stay
+/// behind core traits; nothing here does I/O.
+pub const CORE_EXTERNAL_ALLOWLIST: &[&str] = &[
+    "serde",
+    "serde_json",
+    "base64",
+    "semver",
+    "unicode-normalization",
+    "thiserror",
+];
 
 /// The `source` string cargo metadata reports for a crates.io dependency in this workspace.
 pub const CRATES_IO_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";

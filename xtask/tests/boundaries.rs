@@ -342,12 +342,19 @@ undocumented_unsafe_blocks = "deny"
     #[test]
     fn l_core_external_dep_must_be_allowlisted() {
         let mut fx = Fx::clean();
-        fx.add_dep("lunepack-core", r#"serde = "1""#);
+        fx.add_dep("lunepack-core", r#"rand = "0.9""#);
         assert_has(&fx.run().1, "lunepack-core", "core-external");
         // The same crates.io dependency is fine elsewhere.
         let mut fx = Fx::clean();
-        fx.add_dep("lunepack-http", r#"serde = "1""#);
+        fx.add_dep("lunepack-http", r#"rand = "0.9""#);
         assert_clean(&fx.run().1);
+        // An allowlisted one is fine in core (M2-D1), a lookalike name is not.
+        let mut fx = Fx::clean();
+        fx.add_dep("lunepack-core", r#"serde = "1""#);
+        assert_clean(&fx.run().1);
+        let mut fx = Fx::clean();
+        fx.add_dep("lunepack-core", r#"serde_derive = "1""#);
+        assert_has(&fx.run().1, "lunepack-core", "core-external");
     }
 
     #[test]

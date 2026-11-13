@@ -1,25 +1,24 @@
 # State
 
-Last updated: 2026-11-13 (milestone 2, format and trust, step 1)
+Last updated: 2026-11-13 (milestone 2, format and trust, step 4)
 
 ## Now
 
 Milestone 1 (foundation) is merged to `main`. Milestone 2 (format v1 and the trust core) is in
 progress on branch `orch/lunepack-v1`, not pushed:
 
-- Step 1 done: `docs/FORMAT.md` (format v1 draft: envelope, documents, caps, frames and codecs,
-  path/version/target rules, verification order and policy) and `docs/THREAT-MODEL.md` (draft).
-- Awaiting the user's approval of both documents. No code that encodes the wire format is written
-  before that approval.
+- Steps 1-3 done: `docs/FORMAT.md` and `docs/THREAT-MODEL.md` approved by the user; the codec crate
+  is `lunepack-codec-lzma`.
+- Step 4 done: core foundation in `lunepack-core` (strict JSON pre-pass, hex and canonical base64,
+  `Sha256Digest`, `U53`, `Limits`, the `Hasher`/`Verifier`/`Clock`/`Codec` traits, the error enum);
+  the boundary check allowlists core's six pure external crates.
 
 ## Next
 
-1. User stop: approve or change `docs/FORMAT.md` and `docs/THREAT-MODEL.md`; decide D9, D10, D11,
-   D12, D13 and D19 (D39 may be asked early).
-2. Milestone 2 steps 4–12: core foundation (strict JSON, encodings, traits), shared path/version/
-   target rules, testkit fakes and contract suites, the crypto adapter, envelope/root/key-set
-   verification, the frame parser, feed and manifest verification and policy, fuzz targets, and the
-   DECISIONS/ARCHITECTURE updates with a test that keeps FORMAT.md's examples parsing.
+Milestone 2 steps 5-12: shared path/version/target rules, testkit fakes and contract suites, the
+crypto adapter, envelope/root/key-set verification, the frame parser, feed and manifest
+verification and policy, fuzz targets, and the DECISIONS/ARCHITECTURE updates with a test that
+keeps FORMAT.md's examples parsing.
 
 ## Blockers / open questions
 
