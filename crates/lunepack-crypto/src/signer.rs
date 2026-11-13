@@ -112,11 +112,25 @@ impl Ed25519Signer {
     ///
     /// On Unix a file readable by group or others (`mode & 0o077 != 0`) is refused, and the error
     /// names the path and `chmod 600`. The permission and size are read from the opened file, not
-    /// from the path, so the file cannot be swapped between the check and the read. The text is
+    /// from the path, so the file cannot be swapped between the check and the read (a directory or
+    /// other non-regular file is also refused before the open, so the open cannot block or fail with
+    /// an unrelated error). The text is
     /// read into a buffer that is wiped after parsing. (Windows inherits the directory's ACL; it is
     /// not checked.)
     pub fn from_key_file(path: &Path) -> Result<Self, Error> {
         let shown = path.display();
+        // Classified before opening: Windows cannot open a directory with `File::open` ("Access is
+        // denied"), and opening a FIFO on Unix blocks. A path that cannot be inspected falls through
+        // to the open, which reports the real cause (a missing file keeps its `NotFound`). The
+        // check on the opened handle below stays authoritative.
+        if let Ok(before) = std::fs::metadata(path)
+            && !before.is_file()
+        {
+            return Err(failed(
+                "the signing key path is not a regular file",
+                Some(Detail::new(format!("key file {shown}"))),
+            ));
+        }
         let mut file = File::open(path).map_err(|e| {
             failed(
                 "the signing key file could not be opened",

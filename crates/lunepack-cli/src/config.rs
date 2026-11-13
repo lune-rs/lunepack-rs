@@ -6,7 +6,7 @@
 //! the line.
 
 use std::collections::BTreeMap;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -101,6 +101,12 @@ impl Config {
     /// Reads and validates the config at `path`.
     pub fn load(path: &Path) -> Result<Config> {
         let mut text = String::new();
+        // Classified before opening: Windows cannot open a directory, and a FIFO blocks on open.
+        if let Ok(meta) = fs::metadata(path)
+            && !meta.is_file()
+        {
+            bail!("{} is not a regular file", path.display());
+        }
         let file = File::open(path).with_context(|| format!("cannot read {}", path.display()))?;
         file.take(MAX_CONFIG_BYTES + 1)
             .read_to_string(&mut text)
@@ -245,5 +251,17 @@ pub fn writer_clock() -> Result<Box<dyn Clock>> {
     match secs {
         Some(n) => Ok(Box::new(FixedClock(n))),
         None => bail!("SOURCE_DATE_EPOCH is not a decimal number of seconds in 0..=2^53-1"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_directory_is_not_a_regular_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = Config::load(dir.path()).unwrap_err();
+        assert!(format!("{e:#}").contains("not a regular file"), "{e:#}");
     }
 }

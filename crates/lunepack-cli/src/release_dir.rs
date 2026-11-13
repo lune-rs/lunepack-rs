@@ -5,7 +5,7 @@
 //! Callers that write pass a time-skipping reading (`ClockReading::read(clock, Some(u64::MAX))`,
 //! M3-D9) so an expired key set can still be replaced; callers that only read pass the real one.
 
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
@@ -39,6 +39,12 @@ pub fn keys_path(dir: &Path) -> PathBuf {
 
 /// Reads a file of at most `cap` bytes; `None` if it does not exist.
 pub fn read_capped(path: &Path, cap: u64) -> Result<Option<Vec<u8>>> {
+    // Classified before opening: Windows cannot open a directory, and a FIFO blocks on open.
+    if let Ok(meta) = fs::metadata(path)
+        && !meta.is_file()
+    {
+        bail!("{} is not a regular file", path.display());
+    }
     let file = match File::open(path) {
         Ok(f) => f,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -98,4 +104,21 @@ pub fn open(
         root_doc_k,
         keys,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_directory_is_not_a_regular_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = read_capped(dir.path(), 10).unwrap_err();
+        assert!(format!("{e:#}").contains("not a regular file"), "{e:#}");
+        assert!(
+            read_capped(&dir.path().join("absent"), 10)
+                .unwrap()
+                .is_none()
+        );
+    }
 }
