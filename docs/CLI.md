@@ -83,11 +83,28 @@ Before a writer builds on a previous document it compares the document with the 
 - older than the record: it exits 1, writes nothing, and names the document, the recorded value and
   the value found ("the release directory may hold a replayed older copy"). `--allow-older-previous`
   builds on it anyway (recovery only), names each such document on stderr and records the new values;
+- missing although recorded (a `keys.json` or `root-<k>.json` the state file records is not in the
+  directory): treated like an older one. It exits 1, writes nothing, and names the document and the
+  recorded value ("the release directory may be incomplete or tampered with"). Deleting `keys.json`
+  would otherwise start the key set over at version 1, with a default threshold, under a record lowered
+  to match. `--allow-older-previous` builds without it (to start over on purpose); `keys set` then
+  requires `--threshold`, and the new key set's version 1 is below what clients that saw the old one
+  accept, so restoring the missing file from the publisher's own storage is usually the better fix;
 - no record (no state file, or a document it never saw, such as a feed of a channel another machine
   started): it exits 1 and writes nothing. `--trust-release-dir` accepts the directory's current
   documents as the baseline and records them. It trusts whatever the directory holds now, so use it only
-  on a directory from the publisher's own storage. An absent document is not compared: a feed that was
-  removed can be started again with `feed add`, whose `seq` must still rise above the recorded one.
+  on a directory from the publisher's own storage. It does not cover a recorded document that is
+  missing. A missing feed is the one exception: a feed that was removed can be started again with
+  `feed add` (see Revoking a release key), and its new `seq` must still rise above the recorded one, or
+  it exits 1 and writes nothing (`--allow-older-previous` overrides).
+
+No writer lowers a recorded value (a root or `keys.json` version, a feed `seq`), or changes the recorded
+threshold without a newer `keys.json`, unless `--allow-older-previous` is given; with it, each lowered
+value is named on stderr. The record follows only what was placed.
+
+One state file records one release directory per app: a second release directory of the same app
+(staging and production, say) needs its own config directory or its own `state` path, or its writers
+will be refused for the documents the other directory recorded.
 
 Where to keep it: with the config, in the publisher's own storage. In CI, commit it next to
 `lunepack.toml` and commit the update after each publish, or restore it from and save it to the CI's
@@ -183,9 +200,11 @@ lunepack keys set --release-dir <RELEASE_DIR> --release-key <RELEASE_KEYS> --sig
 ```
 
 - `--release-key`: a release public key, 64 lowercase hex characters; repeat for several.
-- `--threshold`: release keys that must sign a feed or manifest. Default 1 for a first key set. When a
-  `keys.json` exists, its threshold is kept only if the state file records the same value and the state
-  check passed without an override; otherwise `--threshold` is required.
+- `--threshold`: release keys that must sign a feed or manifest. Default 1 for a first key set (no
+  `keys.json` and none recorded). When a `keys.json` exists, its threshold is kept only if the state
+  file records the same value and the state check passed without an override; otherwise `--threshold`
+  is required. It is also required when the state file records a key set that is missing (only
+  reachable with `--allow-older-previous`).
 - `--not-before`, `--not-after`: Unix times. A key already in the previous key set keeps its window
   unless these are given; a new key defaults to `now` .. `now` + two years.
 - `--expires`: when the key set expires (Unix time); none by default.

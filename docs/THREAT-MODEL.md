@@ -194,7 +194,15 @@ is a publisher-side compromise (classes 2, 3 and 6), never something a client ha
   config and outside the release directory: every writer refuses a previous document older than the
   recorded root version, key set version or feed `seq`, and one the file has no record of, unless the
   operator overrides (`--allow-older-previous`, `--trust-release-dir`); `keys set` never carries over a
-  threshold the state does not vouch for, and prints what it changes. Writers trust the release
+  threshold the state does not vouch for, and prints what it changes. Deletion is treated as the
+  oldest replay (F5, S2): a recorded `keys.json` or root that is missing is refused, and only
+  `--allow-older-previous` builds without it, with `--threshold` required, so deleting `keys.json` can
+  no longer yield a version-1 key set with a default threshold of 1 and a record lowered to match. No
+  writer lowers a recorded value without that override. A removed feed is the one document that may be
+  missing (the revocation fallback, M3-R1-D1); its restarted `seq` must still exceed the record. After an
+  operator lowers the record with the override, genuine documents between the new and the old recorded
+  values are no longer recognised as replays, so restore the release directory from the publisher's own
+  storage rather than override where possible. Writers trust the release
   directory's previous documents for freshness only as far as the state file vouches: without it (a
   lost file, or a run with `--trust-release-dir`), the directory must come from the publisher's own
   storage, never from the public host. The state file is not secret but must be kept from the same
