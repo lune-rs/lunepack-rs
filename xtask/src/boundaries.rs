@@ -63,6 +63,16 @@ pub const CORE_EXTERNAL_ALLOWLIST: &[&str] = &[
     "thiserror",
 ];
 
+/// Confined dependencies (M3-D11): `(crate, packages allowed to depend on it)`. The crate brings
+/// unsafe code or asm that docs/DECISIONS.md allows only in the named adapter (D17, D34). Adding a
+/// later confined crate is one line. Matched on the package name, never the rename.
+pub const CONFINED: &[(&str, &[&str])] = &[("lzma-rust2", &["lunepack-codec-lzma"])];
+
+/// Exact version pins: `(package, dependency, requirement string as cargo reports it)`. The
+/// package must exist in the workspace and must declare the dependency, always with this
+/// requirement.
+pub const EXACT_PINS: &[(&str, &str, &str)] = &[("lunepack-codec-lzma", "lzma-rust2", "=0.25.0")];
+
 /// The `source` string cargo metadata reports for a crates.io dependency in this workspace.
 pub const CRATES_IO_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
 
@@ -283,6 +293,8 @@ pub fn check(metadata_json: &str, manifests: &Manifests) -> Result<Vec<Violation
 
     check_root(&md, manifests, &mut out)?;
     check_lock(&md, manifests, &mut out);
+    check_confined_metadata(&md, &mut out);
+    check_exact_pins(&md, &mut out);
     if let Some(fuzz) = &manifests.fuzz {
         check_fuzz_deps(&md, fuzz, &member_dirs, &mut out);
     }
@@ -417,6 +429,112 @@ fn check_lock(md: &Metadata, manifests: &Manifests, out: &mut Vec<Violation>) {
             &members,
             out,
         );
+    }
+}
+
+/// Rule `confined` over the workspace metadata: no package outside a confined crate's allowed list
+/// declares it in any dependency kind, target-specific or renamed (cargo reports the real
+/// package name in `Dependency::name`). Transitive pulls through third-party crates are caught by
+/// [`check_confined_entry`] in the lock files.
+fn check_confined_metadata(md: &Metadata, out: &mut Vec<Violation>) {
+    for pkg in &md.packages {
+        for dep in &pkg.dependencies {
+            let Some((_, allowed)) = CONFINED.iter().find(|(c, _)| *c == dep.name.as_str()) else {
+                continue;
+            };
+            if !allowed.contains(&pkg.name.as_str()) {
+                out.push(v(
+                    &pkg.name,
+                    "confined",
+                    format!(
+                        "depends on the confined crate `{}`; only {} may",
+                        dep.name,
+                        allowed.join(", ")
+                    ),
+                ));
+            }
+        }
+    }
+}
+
+/// Rule `exact-pin`: each `EXACT_PINS` package that is a workspace member declares the dependency,
+/// and every declaration of it carries exactly the pinned requirement.
+fn check_exact_pins(md: &Metadata, out: &mut Vec<Violation>) {
+    for (package, dependency, req) in EXACT_PINS {
+        let Some(pkg) = md.packages.iter().find(|p| p.name.as_str() == *package) else {
+            continue;
+        };
+        let reqs: Vec<String> = pkg
+            .dependencies
+            .iter()
+            .filter(|d| d.name.as_str() == *dependency)
+            .map(|d| d.req.to_string())
+            .collect();
+        if reqs.is_empty() {
+            out.push(v(
+                package,
+                "exact-pin",
+                format!("must depend on `{dependency}` with the requirement `{req}`"),
+            ));
+        }
+        for got in reqs.iter().filter(|r| r.as_str() != *req) {
+            out.push(v(
+                package,
+                "exact-pin",
+                format!("`{dependency}` requirement is `{got}`, must be exactly `{req}`"),
+            ));
+        }
+    }
+}
+
+/// Rule `confined` over one `[[package]]` entry of a lock file: every `dependencies` entry (a
+/// string whose first space-separated token is the package name) naming a confined crate must come
+/// from an allowed dependent that has no `source` and is a member of that lock. A `dependencies`
+/// value that is not an array of strings fails closed.
+fn check_confined_entry(
+    label: &str,
+    name: &str,
+    table: &toml::Table,
+    members: &BTreeSet<(String, String)>,
+    out: &mut Vec<Violation>,
+) {
+    let Some(deps) = table.get("dependencies") else {
+        return;
+    };
+    let Some(deps) = deps.as_array() else {
+        out.push(v(
+            name,
+            "confined",
+            format!("Cargo.lock ({label}): `dependencies` of `{name}` is not an array"),
+        ));
+        return;
+    };
+    let version = table.get("version").and_then(|x| x.as_str()).unwrap_or("");
+    for dep in deps {
+        let Some(dep) = dep.as_str() else {
+            out.push(v(
+                name,
+                "confined",
+                format!("Cargo.lock ({label}): a `dependencies` entry of `{name}` is not a string"),
+            ));
+            continue;
+        };
+        let token = dep.split(' ').next().unwrap_or("");
+        let Some((_, allowed)) = CONFINED.iter().find(|(c, _)| *c == token) else {
+            continue;
+        };
+        let source_less_member = !table.contains_key("source")
+            && members.contains(&(name.to_string(), version.to_string()));
+        if !(allowed.contains(&name) && source_less_member) {
+            out.push(v(
+                name,
+                "confined",
+                format!(
+                    "Cargo.lock ({label}): `{name}` {version} depends on the confined crate `{token}`; only {} (a workspace member) may",
+                    allowed.join(", ")
+                ),
+            ));
+        }
     }
 }
 
@@ -568,6 +686,7 @@ fn check_lock_for(
             out.push(v(label, "lockfile", "a [[package]] entry has no name"));
             continue;
         };
+        check_confined_entry(label, name, table, members, out);
         match table.get("source") {
             None => {
                 let version = table.get("version").and_then(|x| x.as_str()).unwrap_or("");

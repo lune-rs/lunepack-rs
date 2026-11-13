@@ -81,6 +81,13 @@ check does not recognise is a violation, and an internal error exits 2, never 0.
   target-specific) must be crates.io requirements or `path` dependencies on a workspace member
   (same package name, same directory); a `git`, `registry` or `workspace` key, any other path and
   any form the check does not recognise is a violation.
+- confined crates (M3-D11, `CONFINED` in `xtask/src/boundaries.rs`): `lzma-rust2` may be named only
+  by `lunepack-codec-lzma`. No other workspace package may depend on it in any kind, target or
+  rename (matched on the package name `cargo metadata` reports); in every lock the check reads
+  (the workspace's, `probes/*/`, `fuzz/`), any `[[package]]` whose `dependencies` names it must be
+  `lunepack-codec-lzma` as a source-less member, which catches pulls through third-party crates;
+  an unparseable `dependencies` value is a violation. The codec crate's requirement must be exactly
+  `=0.25.0` (`EXACT_PINS`).
 
 Adding a crate is one line in `ROLES` in `xtask/src/boundaries.rs`.
 

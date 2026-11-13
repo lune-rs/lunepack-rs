@@ -12,3 +12,4 @@ workspace = true
 
 [dependencies]
 lunepack-core.workspace = true
+lzma-rust2 = "=0.25.0"

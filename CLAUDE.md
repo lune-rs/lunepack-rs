@@ -39,7 +39,7 @@ Crate roles are in `docs/ARCHITECTURE.md`; the boundary check enforces them.
 ## Hard rules
 
 1. Public repo: never commit a secret, signing key, token or real credential, not even in tests (generate test keys at test time). Checked by `./scripts/check-secrets.sh --staged` in Check and Gate; `.claude/settings.json` denies reading `.env*` and key files, and a Bash hook blocks commands that name them.
-2. `unsafe_code = "forbid"` in `[workspace.lints.rust]`; only `lunepack-fs`, the `lunepack-os-*` crates and the future FFI crate may lift it (the boundary check allows no other crate to), each block with a `// SAFETY:` comment.
+2. `unsafe_code = "forbid"` in `[workspace.lints.rust]`; only `lunepack-fs`, the `lunepack-os-*` crates and the future FFI crate may lift it (the boundary check allows no other crate to), each block with a `// SAFETY:` comment. Unsafe code or asm inside a dependency is allowed only where `docs/DECISIONS.md` names it (today `lzma-rust2`'s `optimization` feature in `lunepack-codec-lzma`, confined by the boundary check, and `ring` via rustls in `lunepack-http`).
 3. The core has no ambient clock, randomness, filesystem or network access; it goes through its traits so tests and replays are deterministic.
 4. Errors: `thiserror` enum per library crate, causes kept; `anyhow` only in binaries. Libraries log through `tracing` and never install a subscriber; never log secrets or user data.
 5. Cargo features are additive; no feature switches an adapter on or off in a way that changes core behaviour.
