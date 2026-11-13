@@ -409,6 +409,7 @@ dependencies = [
  "lunepack-codec-lzma",
  "lunepack-core",
  "lunepack-crypto",
+ "lunepack-testkit",
  "serde",
  "tempfile",
  "toml",

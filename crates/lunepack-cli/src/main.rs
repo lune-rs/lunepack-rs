@@ -5,7 +5,9 @@
 //! a config value.
 
 mod cmd_keys;
+mod cmd_pack;
 mod config;
+mod pipeline;
 mod place;
 mod release_dir;
 
@@ -13,6 +15,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+use lunepack_core::{CodeSign, Error, RelPath};
 
 #[derive(Parser)]
 #[command(
@@ -37,6 +40,9 @@ enum Command {
         #[command(subcommand)]
         command: KeysCommand,
     },
+    /// Package a build-output directory into a signed release: `<version>/<target>.pack` and
+    /// `<version>/<target>.manifest.json` in the release directory.
+    Pack(cmd_pack::PackArgs),
 }
 
 #[derive(Subcommand)]
@@ -51,6 +57,15 @@ enum KeysCommand {
     RotateRoot(cmd_keys::RotateArgs),
 }
 
+/// The code-signing hook of C2 stage 2 in M3: the identity, which changes nothing.
+struct NoCodeSign;
+
+impl CodeSign for NoCodeSign {
+    fn sign_tree(&self, _root: &std::path::Path, _order: &[RelPath]) -> Result<(), Error> {
+        Ok(())
+    }
+}
+
 fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
         Command::Init(args) => cmd_keys::init(&cli.config, &args),
@@ -60,6 +75,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             KeysCommand::Set(args) => cmd_keys::set_keys(&cli.config, &args),
             KeysCommand::RotateRoot(args) => cmd_keys::rotate_root_cmd(&cli.config, &args),
         },
+        Command::Pack(args) => cmd_pack::pack(&cli.config, &args, &NoCodeSign),
     }
 }
 
