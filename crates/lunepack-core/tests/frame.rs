@@ -550,6 +550,66 @@ fn over_producing_decoder_is_stopped_at_the_file_size() {
     }
 }
 
+/// Accepts `keep` bytes of its first write, fails that write, then works normally.
+struct FailsOncePartway {
+    out: Vec<u8>,
+    keep: usize,
+    failed: bool,
+}
+
+impl std::io::Write for FailsOncePartway {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if !self.failed {
+            self.failed = true;
+            self.out.extend_from_slice(&buf[..self.keep.min(buf.len())]);
+            return Err(std::io::Error::from(std::io::ErrorKind::StorageFull));
+        }
+        self.out.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn output_writer_failure_is_reported_even_when_the_codec_swallows_it() {
+    for id in ALL {
+        let (enc, frame) = checked(id);
+        let mut w = FailsOncePartway {
+            out: Vec::new(),
+            keep: 3,
+            failed: false,
+        };
+        let res = decode_verified(
+            &frame,
+            &enc.frame,
+            &FakeHasher,
+            &FakeCodec::with_fault(Fault::RetryAfterWriteError),
+            &mut w,
+        );
+        assert_eq!(
+            frame_err(res.unwrap_err()),
+            FrameError::OutputWrite {
+                kind: std::io::ErrorKind::StorageFull
+            },
+            "{id:?}"
+        );
+        // The writer holds partial bytes plus the retry: size would match, content does not.
+        assert!(w.failed, "{id:?}");
+    }
+    // A writer that never fails still succeeds with the same codec.
+    let (enc, frame) = checked(CodecId::Lzma2);
+    let (res, out) = run(
+        &FakeCodec::with_fault(Fault::RetryAfterWriteError),
+        &frame,
+        &enc.frame,
+    );
+    res.unwrap();
+    assert_eq!(out, data());
+}
+
 #[test]
 fn short_output_wrong_consumed_and_codec_errors_fail() {
     for id in ALL {

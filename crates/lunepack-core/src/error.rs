@@ -282,6 +282,12 @@ pub enum FrameError {
         /// The file's size.
         size: u64,
     },
+    /// The caller's output writer failed; what it holds is not the file.
+    #[error("the output writer failed: {kind}")]
+    OutputWrite {
+        /// The writer's error kind.
+        kind: std::io::ErrorKind,
+    },
     /// The decoder wrote fewer bytes than the file's size.
     #[error("decoded {actual} of {expected} bytes")]
     OutputTooShort {

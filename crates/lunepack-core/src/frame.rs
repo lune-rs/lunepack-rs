@@ -349,6 +349,9 @@ struct ExactWriter<'w> {
     remaining: u64,
     written: u64,
     overflowed: bool,
+    /// The kind of the first error the caller's writer returned: remembered because a codec may
+    /// swallow it and keep writing, and `written` and the hash cover only accepted buffers.
+    failed: Option<io::ErrorKind>,
     hash: Option<Box<dyn HashState>>,
 }
 
@@ -358,7 +361,13 @@ impl Write for ExactWriter<'_> {
             self.overflowed = true;
             return Err(io::Error::other("decoded output exceeds the file size"));
         }
-        self.inner.write_all(buf)?;
+        if self.failed.is_some() {
+            return Err(io::Error::other("the output writer failed earlier"));
+        }
+        if let Err(e) = self.inner.write_all(buf) {
+            self.failed = Some(e.kind());
+            return Err(e);
+        }
         if let Some(hash) = self.hash.as_mut() {
             hash.update(buf);
         }
@@ -404,6 +413,7 @@ pub fn decode_verified(
         remaining: frame.file_size,
         written: 0,
         overflowed: false,
+        failed: None,
         hash: Some(hasher.sha256_start()),
     };
     let result = codec.decode(&parsed.view(), &mut writer);
@@ -413,6 +423,10 @@ pub fn decode_verified(
             size: frame.file_size,
         }
         .into());
+    }
+    // So is a failure of the caller's writer: `out` may hold part of a rejected buffer.
+    if let Some(kind) = writer.failed {
+        return Err(FrameError::OutputWrite { kind }.into());
     }
     let report = result?;
     if writer.written != frame.file_size {

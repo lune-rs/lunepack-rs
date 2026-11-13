@@ -31,6 +31,9 @@ pub enum Fault {
     /// Writes one byte more than the output, ignores the write error and returns `Ok` (a decoder
     /// that swallows write errors).
     ExtraBytesIgnoringErrors,
+    /// Writes every stream's output; when a write fails it ignores the error and writes the same
+    /// bytes again (a decoder that swallows write errors and retries), then returns `Ok`.
+    RetryAfterWriteError,
 }
 
 /// Extra 4 KiB chunks [`Fault::Flood`] writes at most.
@@ -192,6 +195,13 @@ impl Codec for FakeCodec {
             Some(Fault::TooFewBytes) => {
                 let all: Vec<u8> = decoded.concat();
                 write(out, &all[..all.len().saturating_sub(1)])?;
+            }
+            Some(Fault::RetryAfterWriteError) => {
+                for part in &decoded {
+                    if out.write_all(part).is_err() {
+                        let _ = out.write_all(part);
+                    }
+                }
             }
             _ => {
                 for part in &decoded {
