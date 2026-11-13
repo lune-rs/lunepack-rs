@@ -7,15 +7,19 @@
 
 mod clock;
 mod codec;
+mod docs;
 mod hasher;
 mod suites;
 mod verifier;
 
 pub use clock::{FakeClock, YEAR_2100_UNIX_SECS};
 pub use codec::{FakeCodec, FakeEncoded, FakeStreamLayout, Fault};
+pub use docs::{
+    ChainFixture, SUITE_APP_ID, SUITE_T0, TRUST_CHAIN_CASES, fake_sign, run_trust_chain_suite,
+};
 pub use hasher::FakeHasher;
 pub use suites::{
     HashKat, SHA256_KATS, SignFixture, VerifyKat, run_clock_suite, run_hasher_suite,
     run_verifier_suite,
 };
-pub use verifier::{FakeKeyPair, FakeVerifier};
+pub use verifier::{FAKE_INVALID_KEYS, FakeKeyPair, FakeVerifier};

@@ -435,6 +435,9 @@ fn traits_are_object_safe_send_and_sync() {
         ) -> Result<(), Error> {
             Err(SignatureError::Mismatch.into())
         }
+        fn check_public_key(&self, _: SignatureAlg, _: &[u8; 32]) -> Result<(), Error> {
+            Err(SignatureError::InvalidPublicKey.into())
+        }
     }
     struct NullCodec;
     impl Codec for NullCodec {

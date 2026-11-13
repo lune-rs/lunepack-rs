@@ -256,6 +256,7 @@ name = "lunepack-core"
 version = "0.0.0"
 dependencies = [
  "base64",
+ "lunepack-testkit",
  "semver",
  "serde",
  "serde_json",

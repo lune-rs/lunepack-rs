@@ -15,5 +15,9 @@ semver = { workspace = true }
 unicode-normalization = { workspace = true }
 thiserror = { workspace = true }
 
+[dev-dependencies]
+# Integration tests only (tests/): a unit test would see two copies of the core types.
+lunepack-testkit.workspace = true
+
 [lints]
 workspace = true

@@ -242,4 +242,109 @@ pub enum Error {
     /// A codec failed.
     #[error("codec: {0}")]
     Codec(#[from] CodecError),
+    /// The envelope's `payloadType` is not the expected kind's type (FORMAT.md 2.2). The found
+    /// type is untrusted and never shown.
+    #[error("payload type is not {expected}")]
+    PayloadType {
+        /// The type the reader expected.
+        expected: &'static str,
+    },
+    /// An envelope carries no signature or more than the cap (FORMAT.md 2.1).
+    #[error("{count} signatures, expected 1 to {max}")]
+    SignatureCount {
+        /// Signatures found.
+        count: usize,
+        /// The cap.
+        max: usize,
+    },
+    /// An envelope `sig` does not decode to exactly 64 bytes.
+    #[error("signature is {len} bytes, expected 64")]
+    SignatureLength {
+        /// Decoded length.
+        len: usize,
+    },
+    /// An envelope `keyid` is not 64 lowercase hex characters (FORMAT.md 2.5).
+    #[error("malformed key id: {0}")]
+    KeyIdSyntax(HexError),
+    /// Fewer distinct keys verified than the threshold requires.
+    #[error("{got} of {need} required distinct keys verified")]
+    Threshold {
+        /// Distinct verified keys required.
+        need: usize,
+        /// Distinct verified keys found.
+        got: usize,
+    },
+    /// The payload's `format` is not 1.
+    #[error("format {found} is not supported")]
+    FormatVersion {
+        /// The format found.
+        found: u64,
+    },
+    /// The payload's `kind` does not match its payload type.
+    #[error("payload kind is not {expected}")]
+    Kind {
+        /// The kind expected.
+        expected: &'static str,
+    },
+    /// The payload names a critical feature this reader does not implement (FORMAT.md 3.2).
+    #[error("unknown critical feature {0}")]
+    UnknownCritical(Untrusted),
+    /// A key list entry's `id` is not the SHA-256 of its public key.
+    #[error("key id does not match its public key")]
+    KeyIdMismatch,
+    /// A key list holds the same public key twice.
+    #[error("public key listed twice")]
+    DuplicatePublicKey,
+    /// A key list's size or threshold is out of range (`1 <= threshold <= keys <= max`).
+    #[error("threshold {threshold} with {keys} keys is out of range (at most {max} keys)")]
+    KeyThreshold {
+        /// The threshold.
+        threshold: u64,
+        /// Keys in the list.
+        keys: usize,
+        /// The key cap.
+        max: usize,
+    },
+    /// A release key's `not_before` is not before its `not_after`.
+    #[error("release key validity window is empty")]
+    KeyWindow,
+    /// A root document is not the next root version (FORMAT.md 5.2).
+    #[error("root version {found} is not the next version {expected}")]
+    RootVersion {
+        /// The only accepted version.
+        expected: u64,
+        /// The version found.
+        found: u64,
+    },
+    /// A document's `app_id` differs from the trusted root's. Neither id is shown.
+    #[error("app id does not match the trusted root")]
+    AppIdMismatch,
+    /// A key set names a root version other than the trusted root's (FORMAT.md 6).
+    #[error("key set names root version {found}, trusted root is {expected}")]
+    KeySetRootVersion {
+        /// The trusted root's version.
+        expected: u64,
+        /// The version named.
+        found: u64,
+    },
+    /// A value is below its anti-rollback floor (FORMAT.md 11.2).
+    #[error("{what} {found} is below the floor {floor}")]
+    Rollback {
+        /// What was compared.
+        what: &'static str,
+        /// The floor.
+        floor: u64,
+        /// The value found.
+        found: u64,
+    },
+    /// A document is expired at the reader's `now` (FORMAT.md 11.3).
+    #[error("{what} expired at {expires}, now is {now}")]
+    Expired {
+        /// What expired.
+        what: &'static str,
+        /// Its `expires`.
+        expires: u64,
+        /// The clock's reading.
+        now: u64,
+    },
 }

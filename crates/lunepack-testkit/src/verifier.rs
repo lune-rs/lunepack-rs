@@ -48,7 +48,12 @@ impl FakeKeyPair {
     }
 }
 
-/// Verifies signatures made by [`FakeKeyPair`]; anything else is a mismatch.
+/// Keys [`FakeVerifier`] treats as invalid, standing in for a small-order point (all zero) and a
+/// non-canonical encoding (all `0xff`). `FakeKeyPair` never yields them for the seeds tests use.
+pub const FAKE_INVALID_KEYS: [[u8; 32]; 2] = [[0x00; 32], [0xff; 32]];
+
+/// Verifies signatures made by [`FakeKeyPair`]; anything else is a mismatch. Keys in
+/// [`FAKE_INVALID_KEYS`] fail both `check_public_key` and `verify`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FakeVerifier;
 
@@ -65,6 +70,7 @@ impl Verifier for FakeVerifier {
             #[allow(unreachable_patterns)]
             _ => return Err(SignatureError::UnsupportedAlgorithm.into()),
         }
+        self.check_public_key(alg, public_key)?;
         // Both halves are always compared so a mismatch does not depend on where it is.
         let expected = fake_signature(public_key, message);
         let mut diff = 0u8;
@@ -75,6 +81,19 @@ impl Verifier for FakeVerifier {
             Ok(())
         } else {
             Err(SignatureError::Mismatch.into())
+        }
+    }
+
+    fn check_public_key(&self, alg: SignatureAlg, public_key: &[u8; 32]) -> Result<(), Error> {
+        match alg {
+            SignatureAlg::Ed25519 => {}
+            #[allow(unreachable_patterns)]
+            _ => return Err(SignatureError::UnsupportedAlgorithm.into()),
+        }
+        if FAKE_INVALID_KEYS.contains(public_key) {
+            Err(SignatureError::InvalidPublicKey.into())
+        } else {
+            Ok(())
         }
     }
 }

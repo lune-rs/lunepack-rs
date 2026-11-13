@@ -76,4 +76,12 @@ impl Verifier for Ed25519Verifier {
             .map_err(|_| SignatureError::Mismatch)?;
         Ok(())
     }
+
+    fn check_public_key(&self, alg: SignatureAlg, public_key: &[u8; 32]) -> Result<(), Error> {
+        match alg {
+            SignatureAlg::Ed25519 => Ed25519Verifier::check_public_key(public_key),
+            #[allow(unreachable_patterns)]
+            _ => Err(SignatureError::UnsupportedAlgorithm.into()),
+        }
+    }
 }

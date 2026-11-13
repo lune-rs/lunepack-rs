@@ -105,11 +105,19 @@ pub type SignFixture<'a> = dyn Fn(u8, &[u8]) -> ([u8; 32], [u8; 64]) + 'a;
 /// adapter's fixture derives from `seed`; different seeds must give different keys. Checks that a
 /// valid signature is accepted, that a flipped message bit, signature bit or key bit, a signature
 /// made under another key, and an empty-for-non-empty message swap are rejected, and that every
-/// entry of `kats` is accepted.
+/// entry of `kats` is accepted. Key validation (FORMAT.md 2.5): every fixture key and KAT key
+/// passes `check_public_key`; every entry of `invalid_keys` (the adapter supplies at least a
+/// small-order and a non-canonical key) fails `check_public_key` and fails `verify` even with a
+/// signature the fixture made.
 ///
 /// A signature of the wrong length is not testable here: the trait takes `&[u8; 64]`, so a wrong
 /// length cannot be expressed; the types enforce it.
-pub fn run_verifier_suite(verifier: &dyn Verifier, sign: &SignFixture<'_>, kats: &[VerifyKat]) {
+pub fn run_verifier_suite(
+    verifier: &dyn Verifier,
+    sign: &SignFixture<'_>,
+    kats: &[VerifyKat],
+    invalid_keys: &[[u8; 32]],
+) {
     let alg = SignatureAlg::Ed25519;
     let messages: [Vec<u8>; 3] = [Vec::new(), b"lunepack".to_vec(), pattern(1024)];
     for message in &messages {
@@ -162,6 +170,31 @@ pub fn run_verifier_suite(verifier: &dyn Verifier, sign: &SignFixture<'_>, kats:
         verifier
             .verify(alg, &kat.public_key, &kat.message, &kat.signature)
             .unwrap_or_else(|e| panic!("known answer {i} rejected: {e}"));
+        verifier
+            .check_public_key(alg, &kat.public_key)
+            .unwrap_or_else(|e| panic!("known answer {i} key rejected: {e}"));
+    }
+
+    assert!(
+        invalid_keys.len() >= 2,
+        "supply at least a small-order and a non-canonical key"
+    );
+    for seed in 1..=2u8 {
+        let (pk, _) = sign(seed, b"");
+        verifier
+            .check_public_key(alg, &pk)
+            .unwrap_or_else(|e| panic!("fixture key {seed} rejected: {e}"));
+    }
+    let (_, sig) = sign(1, b"lunepack");
+    for (i, key) in invalid_keys.iter().enumerate() {
+        assert!(
+            verifier.check_public_key(alg, key).is_err(),
+            "invalid key {i} passed check_public_key"
+        );
+        assert!(
+            verifier.verify(alg, key, b"lunepack", &sig).is_err(),
+            "invalid key {i} accepted by verify"
+        );
     }
 }
 

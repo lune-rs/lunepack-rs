@@ -65,6 +65,11 @@ pub trait Verifier: Send + Sync {
         message: &[u8],
         signature: &[u8; 64],
     ) -> Result<(), Error>;
+
+    /// `Ok(())` when `public_key` is a valid key for `alg`: for Ed25519 a canonical point
+    /// encoding that is not small-order (FORMAT.md 2.5). Readers call it on every key of a key
+    /// list before the list is trusted.
+    fn check_public_key(&self, alg: SignatureAlg, public_key: &[u8; 32]) -> Result<(), Error>;
 }
 
 /// The reader's clock; the only source of `now` (FORMAT.md 11.3).

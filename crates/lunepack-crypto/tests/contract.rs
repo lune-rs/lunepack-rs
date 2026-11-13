@@ -92,7 +92,18 @@ fn ed25519_passes_suite_with_real_keys_and_rfc8032_vectors() {
         &Ed25519Verifier,
         &|seed, msg| keys.sign(seed, msg),
         &rfc8032_kats(),
+        &invalid_keys(),
     );
+}
+
+/// The identity point (small order) and `y = p + 1` (a non-canonical encoding of it).
+fn invalid_keys() -> [[u8; 32]; 2] {
+    let mut identity = [0u8; 32];
+    identity[0] = 1;
+    let mut non_canonical = [0xffu8; 32];
+    non_canonical[0] = 0xee;
+    non_canonical[31] = 0x7f;
+    [identity, non_canonical]
 }
 
 #[test]

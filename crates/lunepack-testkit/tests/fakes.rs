@@ -59,7 +59,7 @@ fn fake_verifier_passes_suite() {
         signature: pair.sign(&message),
         message,
     }];
-    run_verifier_suite(&FakeVerifier, &fake_sign, &kats);
+    run_verifier_suite(&FakeVerifier, &fake_sign, &kats, &FAKE_INVALID_KEYS);
 }
 
 #[test]
@@ -71,7 +71,7 @@ fn verifier_suite_catches_a_bad_known_answer() {
         signature: [0; 64],
         message: b"x".to_vec(),
     }];
-    run_verifier_suite(&FakeVerifier, &fake_sign, &kats);
+    run_verifier_suite(&FakeVerifier, &fake_sign, &kats, &FAKE_INVALID_KEYS);
 }
 
 #[test]
@@ -101,8 +101,13 @@ fn verifier_suite_catches_an_accept_everything_verifier() {
         ) -> Result<(), Error> {
             Ok(())
         }
+        fn check_public_key(&self, _: SignatureAlg, _: &[u8; 32]) -> Result<(), Error> {
+            Ok(())
+        }
     }
-    let caught = std::panic::catch_unwind(|| run_verifier_suite(&AcceptAll, &fake_sign, &[]));
+    let caught = std::panic::catch_unwind(|| {
+        run_verifier_suite(&AcceptAll, &fake_sign, &[], &FAKE_INVALID_KEYS)
+    });
     assert!(
         caught.is_err(),
         "the suite must reject an accept-everything verifier"
