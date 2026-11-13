@@ -22,3 +22,8 @@ probe-results/
 *.pk8
 *.pkcs12
 *.ppk
+# fuzz/: libFuzzer's working corpus, crashes and build output are local (the committed seeds are fuzz/seeds/)
+/fuzz/corpus/
+/fuzz/artifacts/
+/fuzz/target/
+/fuzz/coverage/

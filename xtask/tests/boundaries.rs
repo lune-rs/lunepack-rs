@@ -625,6 +625,165 @@ undocumented_unsafe_blocks = "deny"
         assert_has(&vs, "demo", "lock-source");
     }
 
+    // M2-D9: the standalone fuzz project `fuzz/` is held to the probes' lock rule ----------------
+
+    const FUZZ_MANIFEST: &str = r#"[package]
+name = "lunepack-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+libfuzzer-sys = "0.4"
+lunepack-core = { path = "../crates/lunepack-core" }
+
+[workspace]
+"#;
+
+    const FUZZ_LOCK_HEAD: &str = r#"version = 4
+
+[[package]]
+name = "libfuzzer-sys"
+version = "0.4.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+
+[[package]]
+name = "lunepack-core"
+version = "0.0.0"
+
+[[package]]
+name = "lunepack-fuzz"
+version = "0.0.0"
+dependencies = ["libfuzzer-sys", "lunepack-core"]
+"#;
+
+    /// A fixture workspace with a `fuzz/` project: the manifest and (optionally) the lock text.
+    fn with_fuzz(manifest: &str, lock: Option<&str>) -> (usize, Vec<Violation>) {
+        let mut fx = Fx::clean();
+        fx.root = fx
+            .root
+            .replace("exclude = [\"probes\"]", "exclude = [\"probes\", \"fuzz\"]");
+        let dir = fx.write();
+        fuzz_files(&dir, manifest, lock);
+        check_workspace(dir.path()).expect("check")
+    }
+
+    fn fuzz_files(dir: &Ws, manifest: &str, lock: Option<&str>) {
+        let fuzz = dir.path().join("fuzz");
+        fs::create_dir_all(&fuzz).unwrap();
+        fs::write(fuzz.join("Cargo.toml"), manifest).unwrap();
+        if let Some(lock) = lock {
+            fs::write(fuzz.join("Cargo.lock"), lock).unwrap();
+        }
+    }
+
+    #[test]
+    fn t_clean_fuzz_project_passes() {
+        let (n, vs) = with_fuzz(FUZZ_MANIFEST, Some(FUZZ_LOCK_HEAD));
+        assert_eq!(n, 6, "the fuzz project is not a workspace member");
+        assert_clean(&vs);
+    }
+
+    #[test]
+    fn t_fuzz_git_source_in_the_lock_is_rejected() {
+        let lock = format!(
+            "{FUZZ_LOCK_HEAD}\n[[package]]\nname = \"libfuzzer-sys\"\nversion = \"0.4.10\"\nsource = \"git+https://example.invalid/libfuzzer-sys#abc\"\n"
+        );
+        let (_, vs) = with_fuzz(FUZZ_MANIFEST, Some(&lock));
+        assert_has(&vs, "libfuzzer-sys", "lock-source");
+    }
+
+    #[test]
+    fn t_fuzz_path_dependency_outside_the_workspace_is_rejected_in_the_lock() {
+        let lock =
+            format!("{FUZZ_LOCK_HEAD}\n[[package]]\nname = \"outside\"\nversion = \"0.0.0\"\n");
+        let (_, vs) = with_fuzz(FUZZ_MANIFEST, Some(&lock));
+        assert_has(&vs, "outside", "lock-source");
+        // A member name at another version is no member either.
+        let lock = FUZZ_LOCK_HEAD.replace(
+            "name = \"lunepack-core\"\nversion = \"0.0.0\"",
+            "name = \"lunepack-core\"\nversion = \"9.9.9\"",
+        );
+        let (_, vs) = with_fuzz(FUZZ_MANIFEST, Some(&lock));
+        assert_has(&vs, "lunepack-core", "lock-source");
+    }
+
+    #[test]
+    fn t_fuzz_manifest_without_a_lock_is_rejected() {
+        let (_, vs) = with_fuzz(FUZZ_MANIFEST, None);
+        assert_has(&vs, "fuzz", "lockfile");
+    }
+
+    #[test]
+    fn t_fuzz_dependencies_must_be_crates_io_or_workspace_members() {
+        for (dep, why) in [
+            (
+                "evil = { path = \"../../outside\" }",
+                "a path outside the repository",
+            ),
+            (
+                "lunepack-core = { path = \"../../outside\" }",
+                "a member name pointing elsewhere",
+            ),
+            (
+                "lunepack-core = { path = \"../crates/lunepack-http\" }",
+                "a member name pointing at another member",
+            ),
+            (
+                "evil = { git = \"https://example.invalid/evil\" }",
+                "a git dependency",
+            ),
+            (
+                "evil = { registry = \"other\", version = \"1\" }",
+                "another registry",
+            ),
+            ("evil = { workspace = true }", "an inherited dependency"),
+            ("evil = 3", "an unrecognised form"),
+        ] {
+            let name = dep.split(' ').next().unwrap();
+            let manifest = if name == "lunepack-core" {
+                FUZZ_MANIFEST.replace(
+                    "lunepack-core = { path = \"../crates/lunepack-core\" }",
+                    dep,
+                )
+            } else {
+                FUZZ_MANIFEST.replace(
+                    "libfuzzer-sys = \"0.4\"",
+                    &format!("libfuzzer-sys = \"0.4\"\n{dep}"),
+                )
+            };
+            let (_, vs) = with_fuzz(&manifest, Some(FUZZ_LOCK_HEAD));
+            assert!(has(&vs, name, "fuzz-dep"), "{why}: got\n{}", render(&vs));
+        }
+        // The good forms: a crates.io table with a version, and a renamed member path.
+        let manifest = FUZZ_MANIFEST.replace(
+            "libfuzzer-sys = \"0.4\"",
+            "libfuzzer-sys = { version = \"0.4\", default-features = false }\ncore-too = { path = \"../crates/lunepack-core\", package = \"lunepack-core\" }",
+        );
+        let (_, vs) = with_fuzz(&manifest, Some(FUZZ_LOCK_HEAD));
+        assert_clean(&vs);
+        // The same rules apply to dev, build and target-specific tables.
+        let manifest = format!(
+            "{}\n[target.'cfg(unix)'.dev-dependencies]\nevil = {{ git = \"https://example.invalid/evil\" }}\n",
+            FUZZ_MANIFEST.replace("\n[workspace]\n", "")
+        ) + "\n[workspace]\n";
+        let (_, vs) = with_fuzz(&manifest, Some(FUZZ_LOCK_HEAD));
+        assert_has(&vs, "evil", "fuzz-dep");
+    }
+
+    #[test]
+    fn t_fuzz_must_be_excluded_and_patch_free() {
+        let fx = Fx::clean();
+        let dir = fx.write();
+        fuzz_files(&dir, FUZZ_MANIFEST, Some(FUZZ_LOCK_HEAD));
+        let (_, vs) = check_workspace(dir.path()).expect("check");
+        assert_has(&vs, "<workspace>", "root-exclude");
+        let manifest =
+            format!("{FUZZ_MANIFEST}\n[patch.crates-io]\nserde = {{ path = \"../x\" }}\n");
+        let (_, vs) = with_fuzz(&manifest, Some(FUZZ_LOCK_HEAD));
+        assert_has(&vs, "fuzz", "patch");
+    }
+
     #[test]
     fn t_missing_lock_file_is_a_violation() {
         let mut fx = Fx::clean();

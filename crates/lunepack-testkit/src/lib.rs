@@ -9,6 +9,7 @@ mod clock;
 mod codec;
 mod docs;
 mod hasher;
+mod seeds;
 mod suites;
 mod verifier;
 
@@ -19,6 +20,7 @@ pub use docs::{
     run_trust_chain_suite,
 };
 pub use hasher::FakeHasher;
+pub use seeds::{Seed, fuzz_seeds};
 pub use suites::{
     HashKat, SHA256_KATS, SignFixture, VerifyKat, run_clock_suite, run_hasher_suite,
     run_verifier_suite,

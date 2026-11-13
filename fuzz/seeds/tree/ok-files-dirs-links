@@ -1,0 +1,5 @@
+f bin/app
+d share
+f share/a.txt
+l lib/x.so>x.so.1
+f lib/x.so.1

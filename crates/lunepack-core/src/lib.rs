@@ -6,6 +6,8 @@ pub mod envelope;
 pub mod error;
 pub mod feed;
 pub mod frame;
+#[doc(hidden)]
+pub mod fuzz;
 pub mod ident;
 pub mod json;
 pub mod keyset;
