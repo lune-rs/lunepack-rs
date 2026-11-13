@@ -353,6 +353,8 @@ length) and the layout are fixed, and Ed25519 signatures are deterministic. Not 
 
 The pack is built in memory (M3-D8): peak use is about the compressed pack plus the encoder budget
 (`--memory-budget-mib`). An encoder at the highest preset holds about ten times its dictionary (at most
-16 MiB), and each file in flight holds its input and up to twice its size in output, so very large single
-files and multi-gigabyte apps need that much free RAM until a streaming pack writer exists. Raise
+16 MiB), and each file in flight is counted at its input, up to twice its size for the best candidate so
+far and the running candidate's output (an x86 executable's `bcj2` candidate is counted at up to five
+times its size more, for its split streams), so very large single files and multi-gigabyte apps need
+that much free RAM until a streaming pack writer exists. Raise
 `--jobs` only if the budget allows it; lower the budget to trade speed for memory.

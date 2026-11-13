@@ -28,10 +28,13 @@ impl Encoder for LzmaCodec {
         encode::encode(codec, input)
     }
 
-    /// An upper bound on the encoder's own state: for the LZMA2 variants, `lzma-rust2`'s
-    /// estimate (`LzmaOptions::get_memory_usage`, KiB) for the dictionary `input_len` selects;
-    /// for `bcj2`, the largest of its three LZMA2 encoders (each bounded as if its stream were
-    /// `input_len` long) plus the BCJ2 writer's four 16 KiB buffers; for `stored`, the copy.
+    /// An upper bound on everything one `encode` call holds besides its input: for the LZMA2
+    /// variants, `lzma-rust2`'s estimate (`LzmaOptions::get_memory_usage`, KiB) for the
+    /// dictionary `input_len` selects plus the output buffer (reserved up front at
+    /// `input_len + input_len / 1024 + 64`, so it never grows) and the BCJ filter's buffer; for
+    /// `bcj2`, that state plus the BCJ2 writer's four 16 KiB buffers plus
+    /// `5 × input_len + input_len / 512 + 512` for its raw split streams, their encoded forms and
+    /// the assembled frame (derived in `encode::memory`); for `stored`, the copy.
     fn encode_memory(&self, codec: CodecId, input_len: u64) -> u64 {
         encode::memory(codec, input_len)
     }

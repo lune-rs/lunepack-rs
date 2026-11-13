@@ -288,10 +288,13 @@ pub struct Job {
     pub sha256: Sha256Digest,
 }
 
-/// The memory one job may need, in bytes: the input, twice the input for the encoder's output
-/// (growth included), the largest encoder state of any codec, and [`JOB_OVERHEAD`]. The largest
-/// over all codecs bounds the largest over the file's own candidates, which are known only once
-/// its bytes are read.
+/// The memory one job may need, in bytes: the input, twice the input for the best candidate
+/// `pack_file` keeps while the next one runs (a frame is kept only when shorter than the input,
+/// and `LzmaCodec`'s buffer is at most twice the input from 65 bytes up; below that it fits
+/// [`JOB_OVERHEAD`]), the largest `encode_memory` of any codec (one running `encode` call, its
+/// intermediate and output buffers included), and [`JOB_OVERHEAD`]. The largest over all codecs
+/// bounds the largest over the file's own candidates, which are known only once its bytes are
+/// read.
 pub fn estimate(size: u64, encoder: &dyn Encoder) -> u64 {
     let state = ENCODED_CODECS
         .iter()
