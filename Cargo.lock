@@ -411,6 +411,7 @@ dependencies = [
  "lunepack-crypto",
  "lunepack-testkit",
  "serde",
+ "serde_json",
  "tempfile",
  "toml",
 ]

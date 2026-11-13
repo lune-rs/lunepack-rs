@@ -66,7 +66,7 @@ pub struct TargetCheck {
     pub manifest_path: String,
     /// The verified manifest.
     pub manifest: VerifiedManifest,
-    /// Distinct frames decoded.
+    /// File entries decoded (one per entry with a frame, shared frames counted per entry).
     pub frames: usize,
 }
 
@@ -143,8 +143,10 @@ pub fn check_target(
         .check_bytes(&pack, &hasher)
         .with_context(|| format!("{} does not match the manifest", pack_ref.path()))?;
 
-    // Identical files share a frame; each distinct frame is decoded once.
-    let mut seen = BTreeSet::new();
+    // Every file entry is decoded under its own descriptor, size and SHA-256, as a client does.
+    // Entries may share or overlap frame bytes (FORMAT.md 9.2) and still differ in codec,
+    // dictionary, streams or the file they claim, so no entry is skipped for sharing bytes.
+    let mut frames = 0;
     for e in manifest.entries() {
         let VerifiedEntry::File {
             path,
@@ -154,9 +156,6 @@ pub fn check_target(
         else {
             continue;
         };
-        if !seen.insert((frame.offset(), frame.length())) {
-            continue;
-        }
         let start = usize::try_from(frame.offset())?;
         let end = start + usize::try_from(frame.length())?;
         let slice = pack
@@ -164,12 +163,13 @@ pub fn check_target(
             .context("a frame lies outside the pack")?;
         decode_verified(frame, slice, &hasher, &LzmaCodec, &mut io::sink())
             .with_context(|| format!("{}: {path} does not decode", pack_ref.path()))?;
+        frames += 1;
     }
     Ok(TargetCheck {
         target: entry.target(),
         manifest_path: reference.path().to_owned(),
         manifest,
-        frames: seen.len(),
+        frames,
     })
 }
 

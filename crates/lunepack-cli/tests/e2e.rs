@@ -13,14 +13,17 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Output;
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use common::*;
 use ed25519_dalek::SigningKey;
 use ed25519_dalek::pkcs8::DecodePrivateKey;
 use lunepack_core::{
-    AppId, Channel, Clock, ClockReading, RollbackFloor, TrustedRoot, VerifiedFeed, VerifiedKeySet,
-    verify_feed, verify_key_set,
+    AppId, ArtifactRef, Channel, Clock, ClockReading, Hasher, ManifestDocument, PayloadKind,
+    ReleaseDoc, RollbackFloor, Sha256Digest, Signer, TrustedRoot, U53, VerifiedFeed,
+    VerifiedKeySet, next_feed, sign_envelope, verify_feed, verify_key_set,
 };
-use lunepack_crypto::{Ed25519Verifier, Sha256Hasher};
+use lunepack_crypto::{Ed25519Signer, Ed25519Verifier, Sha256Hasher};
 use lunepack_testkit::exe_headers;
 
 const APP: &str = "org.example.hello";
@@ -479,6 +482,127 @@ fn tampering_fails_verify() {
         );
     }
     assert_ok(&w.verify(&r.dir, Some(T0)), "the original is untouched");
+}
+
+/// F1: entries that share one frame's bytes are each checked under their own size, SHA-256 and
+/// descriptor. The packer never writes two entries with one frame and different hashes, so the
+/// manifest is re-signed in-test with the release key, and the feed is signed in-test so `verify`
+/// and `inspect` reach it; `feed add` refuses it through its own check. The unchanged re-signed
+/// manifest passes every path, so the failure comes from the second entry alone.
+#[test]
+fn shared_frame_entries_are_each_checked() {
+    let w = World::new(1);
+    let input = tempfile::tempdir().unwrap();
+    write(input.path(), "a.txt", &text(3_000));
+    write(input.path(), "b.txt", &text(3_000));
+    let dir = w.release_dir("rel", &[&w.release[0]]);
+    assert_ok(
+        &w.pack(input.path(), &dir, "4.0.0", WIN, &w.release[0]),
+        "pack",
+    );
+    let signer = Ed25519Signer::from_key_file(&w.release[0].path).unwrap();
+    let signers: [&dyn Signer; 1] = [&signer];
+    let manifest_rel = format!("4.0.0/{WIN}.manifest.json");
+
+    for tamper in [false, true] {
+        let what = if tamper {
+            "second entry's sha256"
+        } else {
+            "unchanged"
+        };
+        let copy = w.dir.path().join(format!("shared-{tamper}"));
+        copy_dir(&dir, &copy);
+        let path = copy.join(&manifest_rel);
+        let envelope: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let payload = STANDARD
+            .decode(envelope["payload"].as_str().unwrap())
+            .unwrap();
+        let mut doc: ManifestDocument = serde_json::from_slice(&payload).unwrap();
+        let files: Vec<usize> = (0..doc.entries.len())
+            .filter(|&i| doc.entries[i].kind == "file")
+            .collect();
+        assert_eq!(files.len(), 2, "{what}");
+        let (a, b) = (&doc.entries[files[0]], &doc.entries[files[1]]);
+        assert!(
+            a.frame.is_some() && a.frame == b.frame,
+            "{what}: one shared frame"
+        );
+        if tamper {
+            doc.entries[files[1]].sha256 = Some(Sha256Digest::from_bytes([0x5a; 32]));
+        }
+        let manifest = sign_envelope(
+            PayloadKind::Manifest,
+            &doc.to_payload(),
+            &signers,
+            &Sha256Hasher,
+            &Ed25519Verifier,
+        )
+        .unwrap();
+        fs::write(&path, &manifest).unwrap();
+
+        // The feed writers' check (I1) runs before anything is placed.
+        let out = w.feed("add", &copy, Some("4.0.0"), &w.release[0], T0, &[]);
+        if tamper {
+            let err = assert_fails(&out, 1, "feed add");
+            assert!(err.contains("b.txt does not decode"), "{err:?}");
+            assert!(!copy.join("feed-stable.json").exists());
+        } else {
+            assert_ok(&out, "feed add");
+        }
+
+        // A feed listing the manifest, signed in-test, for `verify` and `inspect`.
+        let mut targets = std::collections::BTreeMap::new();
+        targets.insert(
+            WIN.to_owned(),
+            ArtifactRef {
+                path: manifest_rel.clone(),
+                size: U53::new(manifest.len() as u64).unwrap(),
+                sha256: Sha256Hasher.sha256(&manifest),
+            },
+        );
+        let release = ReleaseDoc {
+            version: "4.0.0".to_owned(),
+            targets,
+            rollout: None,
+        };
+        let feed = next_feed(
+            None,
+            &AppId::parse(APP).unwrap(),
+            &Channel::parse("stable").unwrap(),
+            T0,
+            vec![release],
+            None,
+        )
+        .unwrap();
+        let feed = sign_envelope(
+            PayloadKind::Feed,
+            &feed.to_payload(),
+            &signers,
+            &Sha256Hasher,
+            &Ed25519Verifier,
+        )
+        .unwrap();
+        fs::write(copy.join("feed-stable.json"), feed).unwrap();
+
+        let verify = w.verify(&copy, Some(T0));
+        let inspect = w.run(&["inspect", s(&copy), "--at", &T0.to_string()], &[]);
+        if tamper {
+            let err = assert_fails(&verify, 1, "verify");
+            assert!(err.contains("b.txt does not decode"), "{err:?}");
+            assert_fails(&inspect, 1, "inspect");
+            assert!(stdout(&inspect).is_empty(), "{}", stdout(&inspect));
+        } else {
+            assert_ok(&verify, "verify");
+            // Both entries are decoded, though they share one frame.
+            assert!(
+                stdout(&verify).contains("manifest and pack ok (2 frame(s) decoded)"),
+                "{}",
+                stdout(&verify)
+            );
+            assert_ok(&inspect, "inspect");
+        }
+    }
 }
 
 /// Test 3: an expired feed fails `verify`; `feed refresh` at the later time fixes it.
