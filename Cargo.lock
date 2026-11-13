@@ -279,7 +279,9 @@ name = "lunepack-codec-lzma"
 version = "0.0.0"
 dependencies = [
  "lunepack-core",
+ "lunepack-testkit",
  "lzma-rust2",
+ "sha2",
 ]
 
 [[package]]
