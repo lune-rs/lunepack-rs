@@ -23,6 +23,7 @@ use crate::cmd_verify::check_target;
 use crate::config::{Config, hex32, resolve_signer, writer_clock};
 use crate::place;
 use crate::release_dir::{self, read_capped};
+use crate::state::{Compared, Record, State, StateArgs};
 
 const SECS_PER_DAY: u64 = 86_400;
 /// About a century; a bound so the day count cannot overflow the second count.
@@ -56,6 +57,8 @@ pub struct AddArgs {
     /// key set's threshold.
     #[arg(long = "sign", required = true)]
     sign: Vec<String>,
+    #[command(flatten)]
+    state: StateArgs,
 }
 
 /// Arguments of `feed refresh`.
@@ -77,6 +80,8 @@ pub struct RefreshArgs {
     /// A release signer: a name from the config, `file:<path>` or `env:<VAR>`.
     #[arg(long = "sign", required = true)]
     sign: Vec<String>,
+    #[command(flatten)]
+    state: StateArgs,
 }
 
 fn say(line: &str) -> Result<()> {
@@ -92,6 +97,11 @@ struct Prepared {
     keys: VerifiedKeySet,
     signers: Vec<Box<dyn Signer>>,
     prev: Option<VerifiedFeed>,
+    /// The publisher state file (M3-R2-D1), its record of this app, and the walked root.
+    state: State,
+    record: Record,
+    root_k: u64,
+    over: StateArgs,
 }
 
 fn feed_file_name(channel: &Channel) -> String {
@@ -104,6 +114,7 @@ fn prepare(
     channel: &str,
     sign: &[String],
     require_prev: bool,
+    over: StateArgs,
 ) -> Result<Prepared> {
     let config = Config::load(config_path)?;
     let channel = Channel::parse(channel).context("--channel is not a valid channel name")?;
@@ -149,6 +160,22 @@ fn prepare(
     if require_prev && prev.is_none() {
         bail!("{name} does not exist; use `feed add` to create the channel");
     }
+    // Nothing read above is built on until it matches what this publisher last signed (S1).
+    let state = State::load(&config.state_path)?;
+    let record = state.record(&config.app_id);
+    state.check(
+        &[
+            record.root_compared(opened.root_doc_k, config.root_version),
+            record.keys_compared(Some(&keys)),
+            Compared {
+                document: name,
+                field: "seq",
+                recorded: record.feeds.get(channel.as_str()).copied(),
+                found: prev.as_ref().map(VerifiedFeed::seq),
+            },
+        ],
+        over,
+    )?;
     Ok(Prepared {
         app_id: config.app_id,
         channel,
@@ -157,6 +184,10 @@ fn prepare(
         keys,
         signers,
         prev,
+        state,
+        record,
+        root_k: opened.root_doc_k,
+        over,
     })
 }
 
@@ -190,7 +221,7 @@ fn release_doc(r: &VerifiedRelease) -> Result<ReleaseDoc> {
 
 /// Builds, signs, verifies and places the feed with `releases`.
 fn finish(
-    p: &Prepared,
+    mut p: Prepared,
     dir: &Path,
     releases: Vec<ReleaseDoc>,
     expires_after_days: Option<u64>,
@@ -227,7 +258,6 @@ fn finish(
     if p.prev.as_ref().is_some_and(|prev| feed.seq() <= prev.seq()) {
         bail!("the new feed's seq does not rise (nothing was written)");
     }
-
     // Every release the new feed lists must have a manifest that verifies under the current key
     // set and a pack that decodes (Revision 1, I1), not only the one just added.
     let mut manifests = 0usize;
@@ -250,7 +280,30 @@ fn finish(
         }
     }
 
+    // A channel restarted after its feed was removed must still rise above the recorded seq.
+    let recorded_seq = p.record.feeds.get(p.channel.as_str()).copied();
+    if let Some(recorded) = recorded_seq
+        && feed.seq() <= recorded
+    {
+        if !p.over.allow_older_previous {
+            bail!(
+                "the new {name} would have seq {}, not above the recorded {recorded} (nothing was written); write with a later clock",
+                feed.seq()
+            );
+        }
+        eprintln!(
+            "warning: the new {name} has seq {}, not above the recorded {recorded} (--allow-older-previous)",
+            feed.seq()
+        );
+    }
+
     place::replace(&dir.join(&name), &bytes)?;
+    let mut record = p.record.clone();
+    record.set_keys(p.root_k, &p.keys);
+    record
+        .feeds
+        .insert(p.channel.as_str().to_owned(), feed.seq());
+    p.state.save(&p.app_id, record)?;
     say(&format!(
         "placed: {name} (seq {}, {} release(s), {manifests} manifest(s) verified)",
         feed.seq(),
@@ -316,6 +369,7 @@ pub fn add(config_path: &Path, args: &AddArgs) -> Result<()> {
         &args.channel,
         &args.sign,
         false,
+        args.state,
     )?;
     let new_targets = manifests_of(&args.release_dir, &args.version)?;
 
@@ -373,7 +427,7 @@ pub fn add(config_path: &Path, args: &AddArgs) -> Result<()> {
         });
     }
     releases.push(doc);
-    finish(&p, &args.release_dir, releases, args.expires_after_days)
+    finish(p, &args.release_dir, releases, args.expires_after_days)
 }
 
 /// `feed refresh`: the same releases under a new `seq`, `issued` and `expires`.
@@ -384,6 +438,7 @@ pub fn refresh(config_path: &Path, args: &RefreshArgs) -> Result<()> {
         &args.channel,
         &args.sign,
         true,
+        args.state,
     )?;
     let prev = p
         .prev
@@ -403,5 +458,5 @@ pub fn refresh(config_path: &Path, args: &RefreshArgs) -> Result<()> {
         .filter(|r| !args.drop.iter().any(|d| d == r.version_text()))
         .map(release_doc)
         .collect::<Result<Vec<_>>>()?;
-    finish(&p, &args.release_dir, releases, args.expires_after_days)
+    finish(p, &args.release_dir, releases, args.expires_after_days)
 }

@@ -29,6 +29,8 @@ struct RawConfig {
     root: RawRoot,
     #[serde(default)]
     signers: BTreeMap<String, RawSigner>,
+    /// The publisher state file (M3-R2-D1), relative to the config's directory.
+    state: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -80,6 +82,9 @@ pub struct Config {
     pub root_threshold: u64,
     /// The compiled-in root's public keys.
     pub root_keys: Vec<[u8; 32]>,
+    /// The publisher state file (M3-R2-D1): `state` resolved against the config's directory, or
+    /// `lunepack-state.json` next to the config.
+    pub state_path: PathBuf,
     signers: BTreeMap<String, SignerSpec>,
 }
 
@@ -176,11 +181,17 @@ impl Config {
             };
             signers.insert(name, spec);
         }
+        let state_path = match raw.state {
+            Some(s) if s.is_empty() => bail!("{}: state is empty", ctx()),
+            Some(s) => dir.join(s),
+            None => dir.join(crate::state::DEFAULT_STATE),
+        };
         Ok(Config {
             app_id,
             root_version: raw.root.version,
             root_threshold: raw.root.threshold,
             root_keys,
+            state_path,
             signers,
         })
     }

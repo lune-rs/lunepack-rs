@@ -24,13 +24,13 @@ clap = { workspace = true }
 anyhow = { workspace = true }
 toml = { workspace = true }
 serde = { workspace = true }
+# The publisher state file (M3-R2-D1).
+serde_json = { workspace = true }
 tempfile = { workspace = true }
 
 [dev-dependencies]
 lunepack-testkit.workspace = true
 base64 = { workspace = true }
-# Tests rebuild a manifest payload to sign entries the packer never writes.
-serde_json = { workspace = true }
 tempfile = { workspace = true }
 # Tests read the documents the binary wrote back through the real verifiers.
 ed25519-dalek = { workspace = true, features = ["pkcs8", "pem"] }

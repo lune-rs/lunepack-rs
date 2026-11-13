@@ -20,6 +20,7 @@ use crate::cmd_verify::unverifiable_feeds;
 use crate::config::{Config, hex32, resolve_signer, writer_clock};
 use crate::place;
 use crate::release_dir::{self, Opened};
+use crate::state::{State, StateArgs};
 
 /// Two years, the default length of a new release key's window.
 const DEFAULT_KEY_WINDOW_SECS: u64 = 63_072_000;
@@ -129,8 +130,14 @@ pub fn init(config_path: &Path, args: &InitArgs) -> Result<()> {
     );
     let config = Config::parse(config_path, &text)?;
     config.trusted_root(&Sha256Hasher, &Ed25519Verifier)?;
+    // An existing state file is checked and kept, so a re-init cannot erase what it records.
+    State::load(&config.state_path)?;
     place::write_new(config_path, text.as_bytes())?;
-    say(&format!("wrote {}", config_path.display()))
+    say(&format!("wrote {}", config_path.display()))?;
+    if State::create_for_init(&config.state_path, &config.app_id)? {
+        say(&format!("wrote {}", config.state_path.display()))?;
+    }
+    Ok(())
 }
 
 // ---- keys gen / show --------------------------------------------------------------------------------
@@ -176,7 +183,9 @@ pub struct SetArgs {
     /// exactly these.
     #[arg(long = "release-key", required = true)]
     release_keys: Vec<String>,
-    /// Release keys that must sign a feed or manifest (default: the current value, else 1).
+    /// Release keys that must sign a feed or manifest. Default 1 for a first key set; when
+    /// keys.json exists, its threshold is kept only if the state file records the same value and
+    /// the state check passed without an override, else this is required.
     #[arg(long)]
     threshold: Option<u64>,
     /// First second the keys are valid (Unix time). Applies to new keys, and to existing keys when
@@ -198,6 +207,8 @@ pub struct SetArgs {
     /// each such feed is named on stderr.
     #[arg(long = "allow-unverifiable-feeds")]
     allow_unverifiable_feeds: bool,
+    #[command(flatten)]
+    state: StateArgs,
 }
 
 /// The release keys of a verified key set, as entries.
@@ -268,6 +279,16 @@ pub fn set_keys(config_path: &Path, args: &SetArgs) -> Result<()> {
         root_doc_k,
         keys: prev,
     } = release_dir::open(&args.release_dir, &config, &hasher, &verifier, &reading)?;
+    // Nothing read above is built on until it matches what this publisher last signed (S1).
+    let mut state = State::load(&config.state_path)?;
+    let mut record = state.record(&config.app_id);
+    let clean = state.check(
+        &[
+            record.root_compared(root_doc_k, config.root_version),
+            record.keys_compared(prev.as_ref()),
+        ],
+        args.state,
+    )?;
 
     let signers = signers(config_path, &args.sign)?;
     check_signers(&signers, root.keys(), root.threshold(), "root")?;
@@ -300,10 +321,28 @@ pub fn set_keys(config_path: &Path, args: &SetArgs) -> Result<()> {
             not_after: U53::new(na)?,
         });
     }
-    let threshold = args
-        .threshold
-        .or_else(|| prev.as_ref().map(|p| p.threshold() as u64))
-        .unwrap_or(1);
+    // The threshold is never inherited from a document the state check did not vouch for.
+    let threshold = match (args.threshold, &prev) {
+        (Some(t), _) => t,
+        (None, None) => 1,
+        (None, Some(p)) => {
+            let t = p.threshold() as u64;
+            if !clean {
+                bail!(
+                    "keys.json was accepted only through --trust-release-dir or --allow-older-previous, so its threshold ({t}) is not carried over: pass --threshold (nothing was written)"
+                );
+            }
+            if record.keys_threshold != Some(t) {
+                let recorded = record
+                    .keys_threshold
+                    .map_or_else(|| "none".to_owned(), |r| r.to_string());
+                bail!(
+                    "the previous keys.json has threshold {t}, but the state file records {recorded}: pass --threshold to choose (nothing was written)"
+                );
+            }
+            t
+        }
+    };
 
     let doc = next_key_set(
         prev.as_ref(),
@@ -339,13 +378,79 @@ pub fn set_keys(config_path: &Path, args: &SetArgs) -> Result<()> {
         args.allow_unverifiable_feeds,
         "keys set",
     )?;
+    say(&format!(
+        "change: {}",
+        key_set_diff(prev.as_ref(), &verified)
+    ))?;
     place::replace(&release_dir::keys_path(&args.release_dir), &bytes)?;
+    record.set_keys(root_doc_k, &verified);
+    state.save(&config.app_id, record)?;
     say(&format!(
         "keys.json: version {}, root {root_doc_k}, {} key(s), threshold {}",
         verified.version(),
         verified.keys().len(),
         verified.threshold()
     ))
+}
+
+/// What `next` changes against `prev`, on one line: threshold, keys added and removed, windows and
+/// expiry. Key ids and times only.
+fn key_set_diff(prev: Option<&VerifiedKeySet>, next: &VerifiedKeySet) -> String {
+    let Some(prev) = prev else {
+        return format!(
+            "a first key set: {} key(s), threshold {}",
+            next.keys().len(),
+            next.threshold()
+        );
+    };
+    let window_of = |ks: &VerifiedKeySet, id: &str| {
+        ks.keys()
+            .keys()
+            .iter()
+            .zip(ks.windows())
+            .find(|(k, _)| k.id().to_hex() == id)
+            .map(|(_, w)| (w.not_before, w.not_after))
+    };
+    let ids = |ks: &VerifiedKeySet| -> BTreeSet<String> {
+        ks.keys().keys().iter().map(|k| k.id().to_hex()).collect()
+    };
+    let (old, new) = (ids(prev), ids(next));
+    let mut parts = Vec::new();
+    if prev.threshold() != next.threshold() {
+        parts.push(format!(
+            "threshold {} -> {}",
+            prev.threshold(),
+            next.threshold()
+        ));
+    }
+    for id in new.difference(&old) {
+        parts.push(format!("added {id}"));
+    }
+    for id in old.difference(&new) {
+        parts.push(format!("removed {id}"));
+    }
+    for id in old.intersection(&new) {
+        let (a, b) = (window_of(prev, id), window_of(next, id));
+        if a != b
+            && let (Some((a0, a1)), Some((b0, b1))) = (a, b)
+        {
+            parts.push(format!("window of {id} {a0}..{a1} -> {b0}..{b1}"));
+        }
+    }
+    if prev.expires() != next.expires() {
+        let show = |e: Option<u64>| e.map_or_else(|| "none".to_owned(), |t| t.to_string());
+        parts.push(format!(
+            "expires {} -> {}",
+            show(prev.expires()),
+            show(next.expires())
+        ));
+    }
+    let what = if parts.is_empty() {
+        "no change to keys, windows, threshold or expiry".to_owned()
+    } else {
+        parts.join("; ")
+    };
+    format!("version {} -> {}: {what}", prev.version(), next.version())
 }
 
 // ---- keys rotate-root -------------------------------------------------------------------------------
@@ -373,6 +478,8 @@ pub struct RotateArgs {
     /// feed is named on stderr.
     #[arg(long = "allow-unverifiable-feeds")]
     allow_unverifiable_feeds: bool,
+    #[command(flatten)]
+    state: StateArgs,
 }
 
 fn root_document(root: &TrustedRoot) -> Result<RootDocument> {
@@ -404,8 +511,20 @@ pub fn rotate_root_cmd(config_path: &Path, args: &RotateArgs) -> Result<()> {
     let reading = ClockReading::read(clock.as_ref(), Some(u64::MAX));
     let (hasher, verifier) = (Sha256Hasher, Ed25519Verifier);
     let Opened {
-        root, keys: prev, ..
+        root,
+        root_doc_k,
+        keys: prev,
     } = release_dir::open(&args.release_dir, &config, &hasher, &verifier, &reading)?;
+    // Nothing read above is built on until it matches what this publisher last signed (S1).
+    let mut state = State::load(&config.state_path)?;
+    let mut record = state.record(&config.app_id);
+    state.check(
+        &[
+            record.root_compared(root_doc_k, config.root_version),
+            record.keys_compared(prev.as_ref()),
+        ],
+        args.state,
+    )?;
 
     let new_publics = args
         .new_root_keys
@@ -474,7 +593,7 @@ pub fn rotate_root_cmd(config_path: &Path, args: &RotateArgs) -> Result<()> {
         .context("the new root does not verify (nothing was written)")?;
 
     // keys.json is re-signed under the new root: same keys and windows, version + 1.
-    let keys_bytes = match &prev {
+    let resigned = match &prev {
         None => None,
         Some(prev) => {
             let doc = next_key_set(
@@ -511,7 +630,7 @@ pub fn rotate_root_cmd(config_path: &Path, args: &RotateArgs) -> Result<()> {
                 args.allow_unverifiable_feeds,
                 "keys rotate-root",
             )?;
-            Some(bytes)
+            Some((bytes, verified))
         }
     };
 
@@ -519,11 +638,16 @@ pub fn rotate_root_cmd(config_path: &Path, args: &RotateArgs) -> Result<()> {
         &release_dir::root_path(&args.release_dir, new_root.version()),
         &root_bytes,
     )?;
-    if let Some(bytes) = &keys_bytes {
-        place::replace(&release_dir::keys_path(&args.release_dir), bytes)?;
+    match &resigned {
+        Some((bytes, verified)) => {
+            place::replace(&release_dir::keys_path(&args.release_dir), bytes)?;
+            record.set_keys(new_root.version(), verified);
+        }
+        None => record.root_version = Some(new_root.version()),
     }
+    state.save(&config.app_id, record)?;
     say(&format!("root-{}.json written", new_root.version()))?;
-    if keys_bytes.is_some() {
+    if resigned.is_some() {
         say("keys.json re-signed under the new root")?;
     }
     Ok(())

@@ -12,6 +12,7 @@ mod config;
 mod pipeline;
 mod place;
 mod release_dir;
+mod state;
 
 use std::path::PathBuf;
 use std::process::ExitCode;

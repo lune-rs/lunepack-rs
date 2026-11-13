@@ -1003,3 +1003,302 @@ fn rollout_keeps_its_seed() {
         stdout(&out)
     );
 }
+
+// ---- the publisher state file (S1, M3-R2-D1) ------------------------------------------------------
+
+/// The record of `APP` in the state file at `path`.
+fn state_record(path: &Path) -> serde_json::Value {
+    let v: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    v["apps"][APP].clone()
+}
+
+impl World {
+    fn state_path(&self) -> PathBuf {
+        self.dir.path().join("lunepack-state.json")
+    }
+
+    /// A second publisher machine: a copy of the config and the state file in `name/`.
+    fn second_machine(&self, name: &str) -> PathBuf {
+        let d = self.dir.path().join(name);
+        fs::create_dir(&d).unwrap();
+        fs::copy(&self.config, d.join("lunepack.toml")).unwrap();
+        fs::copy(self.state_path(), d.join("lunepack-state.json")).unwrap();
+        d.join("lunepack.toml")
+    }
+
+    /// Like [`World::run_at`] with the config at `config`.
+    fn run_with(&self, config: &Path, epoch: u64, args: &[&str]) -> Output {
+        let mut full = vec!["--config", s(config)];
+        full.extend_from_slice(args);
+        self.cmd(&full, &[("SOURCE_DATE_EPOCH", &epoch.to_string())])
+    }
+}
+
+/// The reviewer's replay: a halted rollout is undone by restoring the older feed, and the next
+/// `feed refresh` (and `feed add`) refuses to re-sign it.
+#[test]
+fn replayed_feed_is_refused() {
+    let r = released("4.0.0", &[WIN]);
+    let w = &r.w;
+    let feed = r.dir.join("feed-stable.json");
+    let old = fs::read(&feed).unwrap();
+    let old_seq = w.read_feed(&r.dir).seq();
+    assert_ok(
+        &w.feed(
+            "add",
+            &r.dir,
+            Some("4.0.0"),
+            &w.release[0],
+            T0 + 60,
+            &["--rollout", "0"],
+        ),
+        "halt the rollout",
+    );
+    let halted = w.read_feed(&r.dir).seq();
+    assert_eq!(state_record(&w.state_path())["feeds"]["stable"], halted);
+    fs::write(&feed, &old).unwrap();
+
+    for (verb, version) in [("refresh", None), ("add", Some("4.0.0"))] {
+        let out = w.feed(verb, &r.dir, version, &w.release[0], T0 + 120, &[]);
+        let err = assert_fails(&out, 1, verb);
+        assert!(err.contains("feed-stable.json"), "{err}");
+        assert!(err.contains("may hold a replayed older copy"), "{err}");
+        assert!(
+            err.contains(&format!("seq {old_seq} ")) && err.contains(&format!("recorded {halted}")),
+            "{err}"
+        );
+        assert_eq!(fs::read(&feed).unwrap(), old, "{verb}: nothing was written");
+        assert_eq!(state_record(&w.state_path())["feeds"]["stable"], halted);
+    }
+}
+
+/// A replayed older `keys.json` is refused by `keys set` and by `keys rotate-root`.
+#[test]
+fn replayed_key_set_is_refused() {
+    let w = World::new(2);
+    let (a, b) = (&w.release[0], &w.release[1]);
+    let dir = w.release_dir("rel", &[a]);
+    let keys = dir.join("keys.json");
+    let old = fs::read(&keys).unwrap();
+    let out = w.keys_set_with(&dir, &[a, b], T0 + 60, &["--threshold", "2"]);
+    assert_ok(&out, "raise the threshold");
+    let b_id = Sha256Hasher.sha256(&hex(&b.public)).to_hex();
+    assert!(
+        stdout(&out).contains(&format!(
+            "change: version 1 -> 2: threshold 1 -> 2; added {b_id}"
+        )),
+        "{}",
+        stdout(&out)
+    );
+    assert_eq!(state_record(&w.state_path())["keys_version"], 2);
+    assert_eq!(state_record(&w.state_path())["keys_threshold"], 2);
+    fs::write(&keys, &old).unwrap();
+
+    let out = w.keys_set_with(&dir, &[a, b], T0 + 120, &["--threshold", "2"]);
+    let err = assert_fails(&out, 1, "keys set on a replayed keys.json");
+    assert!(
+        err.contains("keys.json: version 1 in the release directory is older than the recorded 2"),
+        "{err}"
+    );
+    assert!(err.contains("may hold a replayed older copy"), "{err}");
+    assert_eq!(fs::read(&keys).unwrap(), old);
+
+    let new_root = w.new_key("root2");
+    let (old_side, new_side) = (spec(&w.root), spec(&new_root));
+    let out = w.run_at(
+        T0 + 120,
+        &[
+            "keys",
+            "rotate-root",
+            "--release-dir",
+            s(&dir),
+            "--new-root-key",
+            &new_root.public,
+            "--new-threshold",
+            "1",
+            "--sign",
+            &old_side,
+            "--sign-new",
+            &new_side,
+        ],
+    );
+    let err = assert_fails(&out, 1, "rotate-root on a replayed keys.json");
+    assert!(err.contains("may hold a replayed older copy"), "{err}");
+    assert!(!dir.join("root-2.json").exists());
+    assert_eq!(fs::read(&keys).unwrap(), old);
+}
+
+/// No state file while the release directory holds documents: refused, unless
+/// `--trust-release-dir`, which records the directory's values; the threshold is then not
+/// inherited silently.
+#[test]
+fn missing_state_file() {
+    let r = released("4.0.0", &[WIN]);
+    let w = &r.w;
+    let feed = r.dir.join("feed-stable.json");
+    let before = fs::read(&feed).unwrap();
+    fs::remove_file(w.state_path()).unwrap();
+
+    let out = w.feed("refresh", &r.dir, None, &w.release[0], T0 + 60, &[]);
+    let err = assert_fails(&out, 1, "refresh without a state file");
+    assert!(err.contains("lunepack-state.json does not exist"), "{err}");
+    assert!(err.contains("--trust-release-dir"), "{err}");
+    assert_eq!(fs::read(&feed).unwrap(), before);
+    assert!(!w.state_path().exists());
+
+    let out = w.feed(
+        "refresh",
+        &r.dir,
+        None,
+        &w.release[0],
+        T0 + 60,
+        &["--trust-release-dir"],
+    );
+    assert_ok(&out, "refresh --trust-release-dir");
+    assert!(
+        stderr(&out).contains("--trust-release-dir"),
+        "{}",
+        stderr(&out)
+    );
+    let rec = state_record(&w.state_path());
+    assert_eq!(rec["feeds"]["stable"], w.read_feed(&r.dir).seq());
+    assert_eq!(rec["keys_version"], 1);
+    assert_eq!(rec["keys_threshold"], 1);
+    assert_eq!(rec["root_version"], 1);
+
+    // keys set: refused without the flag, and with it the threshold must be given.
+    fs::remove_file(w.state_path()).unwrap();
+    let a = &w.release[0];
+    let out = w.keys_set_with(&r.dir, &[a], T0 + 120, &[]);
+    assert_fails(&out, 1, "keys set without a state file");
+    let out = w.keys_set_with(&r.dir, &[a], T0 + 120, &["--trust-release-dir"]);
+    let err = assert_fails(&out, 1, "keys set --trust-release-dir without --threshold");
+    assert!(err.contains("pass --threshold"), "{err}");
+    let out = w.keys_set_with(
+        &r.dir,
+        &[a],
+        T0 + 120,
+        &["--trust-release-dir", "--threshold", "1"],
+    );
+    assert_ok(&out, "keys set --trust-release-dir --threshold 1");
+    assert_eq!(state_record(&w.state_path())["keys_version"], 2);
+}
+
+/// A previous document newer than the record (written by another trusted machine) is built on,
+/// and the record follows it; a threshold that changed there must be given explicitly here.
+#[test]
+fn newer_previous_from_a_second_machine() {
+    let w = World::new(2);
+    let (a, b) = (&w.release[0], &w.release[1]);
+    let input = app_tree();
+    let dir = w.release_dir("rel", &[a]);
+    assert_ok(&w.pack(input.path(), &dir, "4.0.0", WIN, a), "pack");
+    assert_ok(&w.feed("add", &dir, Some("4.0.0"), a, T0, &[]), "feed add");
+    let other = w.second_machine("machine2");
+    let (sa, root) = (spec(a), spec(&w.root));
+    let out = w.run_with(
+        &other,
+        T0 + 60,
+        &[
+            "feed",
+            "refresh",
+            "--release-dir",
+            s(&dir),
+            "--channel",
+            "stable",
+            "--sign",
+            &sa,
+        ],
+    );
+    assert_ok(&out, "refresh on the second machine");
+    let theirs = w.read_feed(&dir).seq();
+    assert_eq!(state_record(&w.state_path())["feeds"]["stable"], T0 * 1000);
+
+    assert_ok(
+        &w.feed("refresh", &dir, None, a, T0 + 120, &[]),
+        "refresh on a newer feed",
+    );
+    let ours = w.read_feed(&dir).seq();
+    assert!(ours > theirs);
+    assert_eq!(state_record(&w.state_path())["feeds"]["stable"], ours);
+
+    // The second machine raises the threshold; here it is not inherited silently.
+    let out = w.run_with(
+        &other,
+        T0 + 180,
+        &[
+            "keys",
+            "set",
+            "--release-dir",
+            s(&dir),
+            "--release-key",
+            &a.public,
+            "--release-key",
+            &b.public,
+            "--threshold",
+            "2",
+            "--sign",
+            &root,
+            "--allow-unverifiable-feeds",
+        ],
+    );
+    assert_ok(&out, "keys set on the second machine");
+    let out = w.keys_set_with(&dir, &[a, b], T0 + 240, &["--allow-unverifiable-feeds"]);
+    let err = assert_fails(
+        &out,
+        1,
+        "keys set without --threshold after a change elsewhere",
+    );
+    assert!(
+        err.contains("has threshold 2, but the state file records 1: pass --threshold"),
+        "{err}"
+    );
+    let out = w.keys_set_with(
+        &dir,
+        &[a, b],
+        T0 + 240,
+        &["--threshold", "2", "--allow-unverifiable-feeds"],
+    );
+    assert_ok(&out, "keys set --threshold 2");
+    assert!(
+        stdout(&out).contains("change: version 2 -> 3: no change"),
+        "{}",
+        stdout(&out)
+    );
+    let rec = state_record(&w.state_path());
+    assert_eq!(
+        (rec["keys_version"].clone(), rec["keys_threshold"].clone()),
+        (3.into(), 2.into())
+    );
+}
+
+/// `--allow-older-previous` builds on the replayed feed, names it, and records the new seq.
+#[test]
+fn allow_older_previous_overrides() {
+    let r = released("4.0.0", &[WIN]);
+    let w = &r.w;
+    let feed = r.dir.join("feed-stable.json");
+    let old = fs::read(&feed).unwrap();
+    assert_ok(
+        &w.feed("refresh", &r.dir, None, &w.release[0], T0 + 60, &[]),
+        "refresh",
+    );
+    fs::write(&feed, &old).unwrap();
+    let out = w.feed(
+        "refresh",
+        &r.dir,
+        None,
+        &w.release[0],
+        T0 + 120,
+        &["--allow-older-previous"],
+    );
+    assert_ok(&out, "refresh --allow-older-previous");
+    let err = stderr(&out);
+    assert!(
+        err.contains("feed-stable.json seq") && err.contains("--allow-older-previous"),
+        "{err}"
+    );
+    let seq = w.read_feed(&r.dir).seq();
+    assert_eq!(seq, (T0 + 120) * 1000);
+    assert_eq!(state_record(&w.state_path())["feeds"]["stable"], seq);
+}
