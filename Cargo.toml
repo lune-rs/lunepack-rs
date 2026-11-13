@@ -47,3 +47,8 @@ ed25519-dalek = { version = "3", default-features = false }
 getrandom = "0.4"
 zeroize = { version = "1", default-features = false, features = ["alloc"] }
 tempfile = "3"
+
+# Command-line packager (M3 step 7).
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+toml = "1.2"
