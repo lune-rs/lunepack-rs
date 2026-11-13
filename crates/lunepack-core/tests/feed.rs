@@ -409,6 +409,30 @@ fn release_and_reference_rules() {
 }
 
 #[test]
+fn manifest_reference_size_is_capped_at_the_manifest_limit() {
+    let fx = ChainFixture::fake();
+    let (_, keys) = fx.verified_chain(&[5], 1);
+    let floor = RollbackFloor::default();
+    let now = at(SUITE_T0, None);
+    let cap = 64 * 1024 * 1024u64;
+    let with_size = |size: u64| {
+        let mut doc = simple(&fx, 1, None);
+        let r = doc.releases[0].targets.get_mut("linux-x86_64").unwrap();
+        r.size = size.try_into().unwrap();
+        verify(&fx, &keys, &doc, &[5], &floor, now)
+    };
+    with_size(cap).unwrap();
+    match with_size(cap + 1) {
+        Err(Error::TooLarge { size, cap: c, .. }) => assert_eq!((size, c), (cap + 1, cap)),
+        other => panic!("{other:?}"),
+    }
+    assert!(matches!(
+        with_size((1 << 53) - 1),
+        Err(Error::TooLarge { .. })
+    ));
+}
+
+#[test]
 fn null_values_are_rejected() {
     let fx = ChainFixture::fake();
     let (_, keys) = fx.verified_chain(&[5], 1);

@@ -302,7 +302,18 @@ fn check_release(doc: &ReleaseDoc) -> Result<VerifiedRelease> {
     }
     let mut targets = BTreeMap::new();
     for (id, reference) in &doc.targets {
-        targets.insert(Target::parse(id)?, reference.check()?);
+        let checked = reference.check()?;
+        // FORMAT.md 4: the manifest cap bounds the fetch, so it is enforced before any byte is
+        // fetched, not only when the fetched bytes are opened.
+        let cap = Limits::V1.manifest_doc_bytes;
+        if checked.size > cap {
+            return Err(Error::TooLarge {
+                what: "manifest reference",
+                size: checked.size,
+                cap,
+            });
+        }
+        targets.insert(Target::parse(id)?, checked);
     }
     let rollout = match &doc.rollout {
         None => None,
