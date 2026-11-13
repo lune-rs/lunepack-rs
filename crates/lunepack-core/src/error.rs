@@ -208,6 +208,44 @@ pub enum CodecError {
     /// Writing the decoded output failed.
     #[error("writing decoded output failed")]
     Write(#[source] std::io::Error),
+    /// The decoder library failed on the frame's bytes; its error is kept as the cause.
+    #[error("decoder failed")]
+    Decoder(#[source] Box<dyn std::error::Error + Send + Sync>),
+    /// The encoder library failed; its error is kept as the cause.
+    #[error("encoder failed")]
+    Encoder(#[source] Box<dyn std::error::Error + Send + Sync>),
+    /// A stream decoded to a size other than its signed `decoded_size` (the core cannot see
+    /// BCJ2's sub-streams, so the codec checks each one).
+    #[error("stream {index} decoded to {actual} bytes, the descriptor says {expected}")]
+    StreamSize {
+        /// Stream index (0 for a single-stream frame).
+        index: usize,
+        /// The signed `decoded_size`.
+        expected: u64,
+        /// What the stream really decoded to.
+        actual: u64,
+    },
+}
+
+/// Why a signer failed (no variant ever carries key material).
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum SignerError {
+    /// The signer's public key is not the key the caller required.
+    #[error("the signer's key is not the required key")]
+    WrongKey,
+    /// The same public key was given to sign twice where one signature per key is required.
+    #[error("the same signing key was used twice")]
+    DuplicateKey,
+    /// The signer could not produce a signature; `reason` is a fixed text, the cause is kept.
+    #[error("signing failed: {reason}")]
+    Failed {
+        /// What failed, as a fixed text (never input bytes, never a secret).
+        reason: &'static str,
+        /// The underlying error, when there is one.
+        #[source]
+        source: Option<Box<dyn std::error::Error + Send + Sync>>,
+    },
 }
 
 /// Why a frame descriptor or a frame's bytes were rejected (FORMAT.md 9).
@@ -346,6 +384,12 @@ pub enum Error {
     /// A codec failed.
     #[error("codec: {0}")]
     Codec(#[from] CodecError),
+    /// A signer failed or was the wrong signer.
+    #[error("signer: {0}")]
+    Signer(#[from] SignerError),
+    /// The code-signing hook failed.
+    #[error("code signing failed")]
+    CodeSign(#[source] Box<dyn std::error::Error + Send + Sync>),
     /// The envelope's `payloadType` is not the expected kind's type (FORMAT.md 2.2). The found
     /// type is untrusted and never shown.
     #[error("payload type is not {expected}")]

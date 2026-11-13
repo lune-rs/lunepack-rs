@@ -4,7 +4,11 @@
 use std::io::Write;
 
 use lunepack_core::error::CodecError;
-use lunepack_core::{Codec, CodecId, DecodeReport, Error, FrameView, StreamView};
+use lunepack_core::frame::{MAX_DICT_SIZE, MIN_DICT_SIZE};
+use lunepack_core::{
+    Codec, CodecId, DecodeReport, EncodedFrame, EncodedStream, Encoder, Error, FrameView,
+    StreamView,
+};
 
 /// XOR key of the toy transform.
 const TOY_KEY: u8 = 0x5A;
@@ -58,23 +62,29 @@ impl FakeCodec {
         FakeCodec { fault: Some(fault) }
     }
 
-    /// Encodes `data` as a frame of `codec`. For `Bcj2`, `data` must be at least 4 bytes; it is
-    /// split into MAIN, CALL, JUMP and RC parts of nearly equal size (the remainder goes to MAIN).
+    /// Encodes `data` as a frame of `codec`. For `Bcj2`, `data` is split into MAIN, CALL, JUMP and
+    /// RC parts of nearly equal size (the remainder goes to MAIN); data shorter than 4 bytes puts
+    /// its last byte in RC (the format wants an RC stream of at least one byte) and the rest in
+    /// MAIN.
     ///
     /// # Panics
     ///
-    /// Panics when `codec` is `Bcj2` and `data` is shorter than 4 bytes.
+    /// Panics when `codec` is `Bcj2` and `data` is empty.
     pub fn encode(codec: CodecId, data: &[u8]) -> FakeEncoded {
         let parts: Vec<&[u8]> = match codec {
             CodecId::Bcj2 => {
-                assert!(data.len() >= 4, "bcj2 toy encoding needs at least 4 bytes");
-                let each = data.len() / 4;
-                let main = data.len() - 3 * each;
+                assert!(!data.is_empty(), "bcj2 toy encoding needs at least 1 byte");
+                let (call_len, rc_len) = if data.len() >= 4 {
+                    (data.len() / 4, data.len() / 4)
+                } else {
+                    (0, 1)
+                };
+                let main = data.len() - 2 * call_len - rc_len;
                 vec![
                     &data[..main],
-                    &data[main..main + each],
-                    &data[main + each..main + 2 * each],
-                    &data[main + 2 * each..],
+                    &data[main..main + call_len],
+                    &data[main + call_len..main + 2 * call_len],
+                    &data[main + 2 * call_len..],
                 ]
             }
             _ => vec![data],
@@ -152,6 +162,55 @@ impl FakeEncoded {
     }
 }
 
+/// The dictionary [`FakeCodec`] declares for a stream decoding to `decoded` bytes: the next power
+/// of two, clamped to the format's range (the rule the real encoder follows, M3-D7).
+fn fake_dict(decoded: u64) -> u32 {
+    let dict = decoded
+        .max(1)
+        .next_power_of_two()
+        .clamp(MIN_DICT_SIZE, MAX_DICT_SIZE);
+    // Clamped to at most 16 MiB, so it fits.
+    dict as u32
+}
+
+impl Encoder for FakeCodec {
+    fn encode(&self, codec: CodecId, input: &[u8]) -> Result<EncodedFrame, Error> {
+        if input.is_empty() {
+            return Err(CodecError::Encoder("the toy encoder needs at least 1 byte".into()).into());
+        }
+        let enc = FakeCodec::encode(codec, input);
+        let (dict_size, streams) = match codec {
+            CodecId::Stored => (None, None),
+            CodecId::Bcj2 => (
+                None,
+                Some(
+                    enc.streams
+                        .iter()
+                        .enumerate()
+                        .map(|(i, s)| EncodedStream {
+                            length: s.length as u64,
+                            decoded_size: s.decoded_size,
+                            dict_size: (i < 3).then(|| fake_dict(s.decoded_size)),
+                        })
+                        .collect(),
+                ),
+            ),
+            _ => (Some(fake_dict(input.len() as u64)), None),
+        };
+        Ok(EncodedFrame {
+            codec,
+            bytes: enc.frame,
+            dict_size,
+            streams,
+        })
+    }
+
+    fn encode_memory(&self, _codec: CodecId, input_len: u64) -> u64 {
+        // One copy of the input per stream at most, plus the frame.
+        input_len.saturating_mul(2).saturating_add(64)
+    }
+}
+
 impl Codec for FakeCodec {
     fn decode(&self, frame: &FrameView<'_>, out: &mut dyn Write) -> Result<DecodeReport, Error> {
         assert!(
@@ -178,7 +237,20 @@ impl Codec for FakeCodec {
                 }
             };
             if data.len() as u64 != stream.decoded_size {
-                return Err(CodecError::Corrupt("stream decodes to the wrong size").into());
+                return Err(CodecError::StreamSize {
+                    index: i,
+                    expected: stream.decoded_size,
+                    actual: data.len() as u64,
+                }
+                .into());
+            }
+            // The toy has no matches to reach back: a stream longer than its dictionary (up to the
+            // format's cap) stands in for a distance the dictionary cannot hold.
+            if let Some(dict) = stream.dict_size
+                && stream.decoded_size <= MAX_DICT_SIZE
+                && stream.decoded_size > u64::from(dict)
+            {
+                return Err(CodecError::Corrupt("stream is longer than its dictionary").into());
             }
             consumed.push(stream.input.len() as u64);
             decoded.push(data);

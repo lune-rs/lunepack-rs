@@ -10,6 +10,7 @@ mod codec;
 mod docs;
 mod hasher;
 mod seeds;
+mod signer;
 mod suites;
 mod verifier;
 
@@ -21,8 +22,9 @@ pub use docs::{
 };
 pub use hasher::FakeHasher;
 pub use seeds::{Seed, fuzz_seeds};
+pub use signer::FakeSigner;
 pub use suites::{
-    HashKat, SHA256_KATS, SignFixture, VerifyKat, run_clock_suite, run_hasher_suite,
-    run_verifier_suite,
+    HashKat, SHA256_KATS, SignFixture, VerifyKat, run_clock_suite, run_codec_suite,
+    run_hasher_suite, run_signer_suite, run_verifier_suite,
 };
 pub use verifier::{FAKE_INVALID_KEYS, FakeKeyPair, FakeVerifier};

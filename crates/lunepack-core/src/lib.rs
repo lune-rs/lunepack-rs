@@ -40,8 +40,8 @@ pub use policy::{Candidate, in_rollout, rollout_bucket, select_candidate};
 pub use root::{RootDocument, TrustedRoot, advance_root};
 pub use target::Target;
 pub use traits::{
-    Clock, Codec, CodecId, DecodeReport, FrameView, HashState, Hasher, SignatureAlg, StreamView,
-    Verifier,
+    Clock, CodeSign, Codec, CodecId, DecodeReport, EncodedFrame, EncodedStream, Encoder, FrameView,
+    HashState, Hasher, SignatureAlg, Signer, StreamView, Verifier,
 };
 pub use trust::{ClockReading, KeyEntry, KeyRing, PublicKey, RollbackFloor};
 pub use version::Version;
