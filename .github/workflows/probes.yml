@@ -255,3 +255,36 @@ jobs:
           name: probe-${{ matrix.id }}
           path: probe-results/${{ matrix.id }}.json
           if-no-files-found: error
+
+  p-u1:
+    # LuneUI's gallery builds and renders on hosted runners (M6 premise): headless dump, window, screenshot
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { id: P-U1-linux, os: ubuntu-latest, shell: bash }
+          - { id: P-U1-macos, os: macos-latest, shell: bash }
+          - { id: P-U1-windows, os: windows-latest, shell: pwsh }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Probe (bash)
+        if: matrix.shell == 'bash'
+        timeout-minutes: 40
+        shell: bash
+        run: ./probes/luneui/run.sh
+      - name: Probe (pwsh)
+        if: matrix.shell == 'pwsh'
+        timeout-minutes: 40
+        shell: pwsh
+        run: ./probes/luneui/run.ps1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: always()
+        with:
+          name: probe-${{ matrix.id }}
+          path: probe-results/${{ matrix.id }}.json
+          if-no-files-found: error

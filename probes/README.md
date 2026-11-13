@@ -19,3 +19,14 @@ They are not part of the product:
 Helpers: `lib/result.sh` and `lib/result.ps1` (guard and result writer; `--self-test` /
 `-SelfTest` exercise them in a temp dir). `runner-facts/` is P-R0 (admin rights and runner facts
 on all three OSes).
+
+## P-U1: LuneUI on hosted runners
+
+`luneui/run.sh` (Linux, macOS) and `luneui/run.ps1` (Windows) clone `lune-rs/luneui-rs` at commit
+`ec17ff0` (v0.5.1) into `RUNNER_TEMP` (no Cargo dependency, lock or path in this repo refers to it),
+build the gallery `--release` with the runner's stable toolchain, run `gallery --dump` headless
+(PNG count; adapter name and backend from the gallery's `--bench` line), then open the window for
+about 5 s and take one screenshot (details only). Controls: the clone is at the pin; the binary
+lists its scenes; on Linux `--dump` must fail to find an adapter before Mesa is installed; at least
+one dumped PNG has more than one colour. PASS: the dump rendered and the controls hold. FAIL: no
+adapter or no PNG with the controls ok. INVALID otherwise. Results: `probe-results/P-U1-<os>.json`.
