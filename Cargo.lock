@@ -171,6 +171,7 @@ name = "lunepack-fs"
 version = "0.0.0"
 dependencies = [
  "lunepack-core",
+ "tempfile",
 ]
 
 [[package]]
