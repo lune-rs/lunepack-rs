@@ -48,6 +48,11 @@ getrandom = "0.4"
 zeroize = { version = "1", default-features = false, features = ["alloc"] }
 tempfile = "3"
 
+# Filesystem adapter (M4 step 4): the OS file lock (D15; pure Rust, rustix on Unix, windows-sys on
+# Windows) and the open(2) flag constants.
+fs4 = "1.1"
+libc = "0.2"
+
 # Command-line packager (M3 step 7).
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"

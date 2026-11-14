@@ -12,6 +12,18 @@ workspace = true
 
 [dependencies]
 lunepack-core.workspace = true
+fs4 = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+# O_NOFOLLOW and O_CLOEXEC for `create_new`; constants only, no unsafe code here.
+libc = { workspace = true }
 
 [dev-dependencies]
+lunepack-testkit.workspace = true
 tempfile = "3"
+
+# Own main: the lock test re-runs this binary as a child process that holds the lock and is then
+# killed (the lock must be released when its holder dies).
+[[test]]
+name = "lock"
+harness = false
