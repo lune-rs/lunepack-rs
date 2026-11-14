@@ -332,6 +332,20 @@ where
     cancellable(&ctx.cancel, future).await??
 }
 
+/// [`job`] for work that checks its token: it is cancelled when the operation's token fires or the
+/// future is dropped, so a long read stops at its next check instead of running to the end while
+/// it holds the lock.
+async fn job_with_cancel<T, F>(ctx: &FetchCtx, name: &'static str, f: F) -> Result<T, Error>
+where
+    T: Send + 'static,
+    F: FnOnce(&CancelToken) -> Result<T, Error> + Send + 'static,
+{
+    let future = spawn_job(name, CancelToken::new(), ctx.lock.clone(), move |token| {
+        f(token)
+    });
+    cancellable(&ctx.cancel, future).await??
+}
+
 /// Takes the exclusive lock on `path` on a short job: [`Error::Busy`] when another holder has it.
 pub async fn acquire_op_lock(fs: Arc<dyn Fs>, path: PathBuf) -> Result<OpLock, Error> {
     spawn_job("lock", CancelToken::new(), None, move |_| {
@@ -364,12 +378,12 @@ pub async fn download(
         let frames = frames.clone();
         let pack = pack.clone();
         let hasher = Arc::clone(&ctx.hasher);
-        job(ctx, "cache-state", move || {
+        job_with_cancel(ctx, "cache-state", move |cancel| {
             cache.ensure_dirs()?;
             // A cached pack is used only after its SHA-256 matches (M4-D17); a mismatch deletes it
             // and the download goes on as if it were absent.
             let pack_ready = cache.is_complete(CacheKind::Pack, &pack.sha256, pack.size)?
-                && cache.verify_complete(CacheKind::Pack, &pack.sha256, &*hasher)?;
+                && cache.verify_complete(CacheKind::Pack, &pack.sha256, &*hasher, cancel)?;
             let complete = frames
                 .iter()
                 .map(|f| cache.is_complete(CacheKind::Frame, &f.sha256, f.length))

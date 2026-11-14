@@ -1131,3 +1131,124 @@ fn the_engine_futures_are_send() {
     assert_send(&lock);
     drop((d, p, doc, root, lock));
 }
+
+/// MemFs whose positional reads count themselves and cancel `token` on the first one.
+struct CancelOnRead {
+    inner: MemFs,
+    token: CancelToken,
+    reads: Arc<AtomicU64>,
+}
+
+struct CountingReader {
+    inner: Box<dyn ReadAt>,
+    token: CancelToken,
+    reads: Arc<AtomicU64>,
+}
+
+impl ReadAt for CountingReader {
+    fn size(&self) -> Result<u64, FsError> {
+        self.inner.size()
+    }
+    fn read_exact_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FsError> {
+        if self.reads.fetch_add(1, Ordering::SeqCst) == 0 {
+            self.token.cancel();
+        }
+        self.inner.read_exact_at(offset, buf)
+    }
+}
+
+impl Fs for CancelOnRead {
+    fn read_capped(&self, path: &Path, max: u64) -> Result<Vec<u8>, FsError> {
+        self.inner.read_capped(path, max)
+    }
+    fn open_read(&self, path: &Path) -> Result<Box<dyn ReadAt>, FsError> {
+        Ok(Box::new(CountingReader {
+            inner: self.inner.open_read(path)?,
+            token: self.token.clone(),
+            reads: Arc::clone(&self.reads),
+        }))
+    }
+    fn create_new(&self, path: &Path) -> Result<Box<dyn FileWrite>, FsError> {
+        self.inner.create_new(path)
+    }
+    fn open_append(&self, path: &Path) -> Result<Box<dyn FileWrite>, FsError> {
+        self.inner.open_append(path)
+    }
+    fn truncate(&self, path: &Path, len: u64) -> Result<(), FsError> {
+        self.inner.truncate(path, len)
+    }
+    fn rename(&self, from: &Path, to: &Path) -> Result<(), FsError> {
+        self.inner.rename(from, to)
+    }
+    fn remove_file(&self, path: &Path) -> Result<(), FsError> {
+        self.inner.remove_file(path)
+    }
+    fn remove_dir_all_nofollow(&self, path: &Path) -> Result<(), FsError> {
+        self.inner.remove_dir_all_nofollow(path)
+    }
+    fn create_dir_all(&self, path: &Path) -> Result<(), FsError> {
+        self.inner.create_dir_all(path)
+    }
+    fn list_dir(&self, path: &Path) -> Result<Vec<DirEntryInfo>, FsError> {
+        self.inner.list_dir(path)
+    }
+    fn symlink_metadata(&self, path: &Path) -> Result<Option<Meta>, FsError> {
+        self.inner.symlink_metadata(path)
+    }
+    fn sync_dir(&self, path: &Path) -> Result<(), FsError> {
+        self.inner.sync_dir(path)
+    }
+    fn copy_file(&self, from: &Path, to_new: &Path) -> Result<(), FsError> {
+        self.inner.copy_file(from, to_new)
+    }
+    fn set_exec(&self, path: &Path, exec: bool) -> Result<(), FsError> {
+        self.inner.set_exec(path, exec)
+    }
+    fn symlink(&self, target: &str, link_path: &Path) -> Result<(), FsError> {
+        self.inner.symlink(target, link_path)
+    }
+    fn try_lock(&self, path: &Path) -> Result<Option<Box<dyn LockGuard>>, FsError> {
+        self.inner.try_lock(path)
+    }
+}
+
+#[test]
+fn a_cancelled_rehash_of_a_cached_pack_stops_at_the_next_read_and_keeps_the_pack() {
+    let _s = serial();
+    // 1 MiB, so the re-hash takes 16 reads of 64 KiB; the first one cancels the token.
+    let big: Vec<u8> = (0..1_048_576usize).map(|i| (i % 253) as u8).collect();
+    let digest = sha(&big);
+    for wrong in [false, true] {
+        let mem = MemFs::new();
+        let cache_dir = PathBuf::from(CACHE);
+        let cache = Cache::new(Arc::new(mem.clone()), cache_dir.clone());
+        cache.ensure_dirs().expect("dirs");
+        let path = cache.path(CacheKind::Pack, &digest);
+        let mut w = mem.create_new(&path).expect("create");
+        // The wrong pack has the signed size and other bytes; cancel must win over its mismatch.
+        let bytes: Vec<u8> = if wrong {
+            big.iter().map(|b| b ^ 0x55).collect()
+        } else {
+            big.clone()
+        };
+        w.write_all(&bytes).expect("write");
+        w.sync().expect("sync");
+        drop(w);
+        let token = CancelToken::new();
+        let reads = Arc::new(AtomicU64::new(0));
+        let fs = CancelOnRead {
+            inner: mem.clone(),
+            token: token.clone(),
+            reads: Arc::clone(&reads),
+        };
+        let cache = Cache::new(Arc::new(fs), cache_dir);
+        let result = cache.verify_complete(CacheKind::Pack, &digest, &FakeHasher, &token);
+        assert!(
+            matches!(result, Err(Error::Cancelled)),
+            "wrong={wrong}: {result:?}"
+        );
+        assert_eq!(reads.load(Ordering::SeqCst), 1, "wrong={wrong}: it read on");
+        assert!(exists(&mem, &path), "wrong={wrong}: the pack was removed");
+    }
+    workers_stopped();
+}

@@ -16,7 +16,8 @@ use std::sync::Arc;
 
 use lunepack_core::json::parse_strict;
 use lunepack_core::{
-    FileKind, FileWrite, Fs, FsError, FsErrorKind, HashState, Hasher, Sha256Digest, Validator,
+    CancelToken, FileKind, FileWrite, Fs, FsError, FsErrorKind, HashState, Hasher, Sha256Digest,
+    Validator,
 };
 use serde::{Deserialize, Serialize};
 
@@ -150,17 +151,19 @@ impl Cache {
 
     /// Hashes the complete entry and compares it with `sha` (M4-D17: a complete pack is re-hashed
     /// before use, since its size alone does not show it is the signed file). A mismatch removes the
-    /// entry, with any part and sidecar, and reads as `false`.
+    /// entry, with any part and sidecar, and reads as `false`. `cancel` is checked before every
+    /// read: a cancelled hash is [`Error::Cancelled`] and leaves the entry in place.
     pub fn verify_complete(
         &self,
         kind: CacheKind,
         sha: &Sha256Digest,
         hasher: &dyn Hasher,
-    ) -> Result<bool, FsError> {
+        cancel: &CancelToken,
+    ) -> Result<bool, Error> {
         let path = self.path(kind, sha);
         let len = self.fs.open_read(&path)?.size()?;
         let mut state = hasher.sha256_start();
-        hash_prefix(&*self.fs, &path, len, &mut state)?;
+        hash_prefix(&*self.fs, &path, len, &mut state, Some(cancel))?;
         if state.finalize() == *sha {
             return Ok(true);
         }
@@ -304,13 +307,15 @@ fn io_error(e: std::io::Error, path: &Path) -> Error {
     Error::Fs(FsError::from_io(path, e))
 }
 
-/// Feeds the first `len` bytes of the file at `path` to `state`.
+/// Feeds the first `len` bytes of the file at `path` to `state`, checking `cancel` before every
+/// read ([`Error::Cancelled`]).
 fn hash_prefix(
     fs: &dyn Fs,
     path: &Path,
     len: u64,
     state: &mut Box<dyn HashState>,
-) -> Result<(), FsError> {
+    cancel: Option<&CancelToken>,
+) -> Result<(), Error> {
     if len == 0 {
         return Ok(());
     }
@@ -318,6 +323,9 @@ fn hash_prefix(
     let mut buf = vec![0u8; HASH_READ];
     let mut at = 0u64;
     while at < len {
+        if cancel.is_some_and(CancelToken::is_cancelled) {
+            return Err(Error::Cancelled);
+        }
         let n = usize::try_from((len - at).min(HASH_READ as u64)).unwrap_or(HASH_READ);
         file.read_exact_at(at, &mut buf[..n])?;
         state.update(&buf[..n]);
@@ -349,7 +357,7 @@ impl Cache {
         let path = self.part_path(kind, sha);
         let mut hash = hasher.sha256_start();
         if resume_from > 0 {
-            hash_prefix(&*self.fs, &path, resume_from, &mut hash)?;
+            hash_prefix(&*self.fs, &path, resume_from, &mut hash, None)?;
             // Bytes past `resume_from` (none, unless the part grew since it was measured) would
             // be appended after; cut them so the part is exactly the hashed prefix.
             self.fs.truncate(&path, resume_from)?;
