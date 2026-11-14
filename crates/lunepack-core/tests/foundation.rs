@@ -532,29 +532,76 @@ fn limits_match_format_section_4() {
 
 // ---- purity (hard rule 3) ----
 
+const FORBIDDEN: &[&str] = &[
+    "std::fs",
+    "std::env",
+    "std::net",
+    "std::process",
+    "std::thread",
+    "thread::",
+    "std::time",
+    "SystemTime",
+    "Instant",
+    "RandomState",
+    "HashMap",
+    "HashSet",
+    "getrandom",
+    "println!",
+    "eprintln!",
+    "stdin",
+    "stdout",
+    "stderr",
+    "unsafe",
+];
+
+/// The one narrow exception (M4-D12, user decision Q30): budgeted parallel decode in the stage
+/// engine uses scoped threads. Exactly these (file, token) pairs; nothing else in `std::thread`.
+const ALLOWED: &[(&str, &str)] = &[
+    ("stage.rs", "std::thread::scope"),
+    ("stage.rs", "std::thread::panicking"),
+];
+
+fn is_ident_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// Remove each allowed token of `file` from `code`, but only where the token is a whole path
+/// (not followed by an identifier character) and the line is not a `use` item.
+fn without_allowed(file: &str, code: &str) -> String {
+    if code.trim_start().starts_with("use ") || code.trim_start().starts_with("pub use ") {
+        return code.to_string();
+    }
+    let mut out = code.to_string();
+    for (f, token) in ALLOWED {
+        if *f != file {
+            continue;
+        }
+        let mut rest = String::new();
+        let mut tail = out.as_str();
+        while let Some(at) = tail.find(token) {
+            let after = &tail[at + token.len()..];
+            rest.push_str(&tail[..at]);
+            if after.chars().next().is_some_and(is_ident_char) {
+                rest.push_str(token);
+            }
+            tail = after;
+        }
+        rest.push_str(tail);
+        out = rest;
+    }
+    out
+}
+
+/// The forbidden token found in one line of code of core library file `file` (a file name such as
+/// `stage.rs`, comments already removed), if any.
+fn forbidden_in_line(file: &str, code: &str) -> Option<&'static str> {
+    let code = without_allowed(file, code);
+    FORBIDDEN.iter().copied().find(|word| code.contains(word))
+}
+
 /// Core library code touches no filesystem, network, process, environment, clock or randomness.
 #[test]
 fn core_source_has_no_ambient_capabilities() {
-    const FORBIDDEN: &[&str] = &[
-        "std::fs",
-        "std::env",
-        "std::net",
-        "std::process",
-        "std::thread",
-        "std::time",
-        "SystemTime",
-        "Instant",
-        "RandomState",
-        "HashMap",
-        "HashSet",
-        "getrandom",
-        "println!",
-        "eprintln!",
-        "stdin",
-        "stdout",
-        "stderr",
-        "unsafe",
-    ];
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut scanned = 0;
     for entry in fs::read_dir(&src).unwrap() {
@@ -562,12 +609,12 @@ fn core_source_has_no_ambient_capabilities() {
         if path.extension().is_none_or(|e| e != "rs") {
             continue;
         }
+        let file = path.file_name().unwrap().to_str().unwrap().to_string();
         let text = fs::read_to_string(&path).unwrap();
         for (n, line) in text.lines().enumerate() {
             let code = line.split("//").next().unwrap_or("");
-            for word in FORBIDDEN {
-                assert!(
-                    !code.contains(word),
+            if let Some(word) = forbidden_in_line(&file, code) {
+                panic!(
                     "{}:{}: `{word}` is forbidden in core library code",
                     path.display(),
                     n + 1
@@ -577,4 +624,45 @@ fn core_source_has_no_ambient_capabilities() {
         scanned += 1;
     }
     assert!(scanned >= 7, "scanned only {scanned} files");
+}
+
+/// The thread exception is exactly `std::thread::scope` and `std::thread::panicking` in `stage.rs`.
+#[test]
+fn thread_exception_is_narrow() {
+    // allowed, in stage.rs only
+    assert_eq!(
+        forbidden_in_line("stage.rs", "    std::thread::scope(|s| {"),
+        None
+    );
+    assert_eq!(
+        forbidden_in_line("stage.rs", "if self.stop || std::thread::panicking() {"),
+        None
+    );
+    // anything else in stage.rs
+    for line in [
+        "std::thread::spawn(|| {});",
+        "std::thread::sleep(d);",
+        "std::thread::scoped_thing();",
+        "std::thread::panicking_x();",
+        "use std::thread;",
+        "use std::thread::scope;",
+        "use std::thread::{self, scope};",
+        "thread::sleep(d);",
+        "std::thread::scope(|s| { std::thread::spawn(f); });",
+    ] {
+        assert!(forbidden_in_line("stage.rs", line).is_some(), "{line}");
+    }
+    // the same allowed calls in any other core file
+    for file in ["fetch.rs", "state.rs", "lib.rs", "stage2.rs", "mystage.rs"] {
+        for line in [
+            "std::thread::scope(|s| {",
+            "std::thread::panicking()",
+            "std::thread::spawn(|| {});",
+        ] {
+            assert!(forbidden_in_line(file, line).is_some(), "{file}: {line}");
+        }
+    }
+    // unrelated forbidden tokens stay forbidden in stage.rs
+    assert!(forbidden_in_line("stage.rs", "let m: HashMap<u8, u8>;").is_some());
+    assert!(forbidden_in_line("stage.rs", "std::time::Duration::ZERO").is_some());
 }
