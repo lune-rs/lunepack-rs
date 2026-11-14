@@ -3,9 +3,8 @@
 //! TLS control (a certificate no store trusts must fail with `Tls`), and `DirSource` over a
 //! temporary directory.
 //!
-//! `DirSource` cannot run `run_blocking_transport_suite` whole: the suite requires an `ETag` and a
-//! `Last-Modified`, a duplicated response header, a request log and a `302`, and a directory has
-//! none of those. Its own cases below cover every part of the suite that has a meaning for files.
+//! `DirSource` runs the same blocking suite with the parts a directory has no meaning for switched
+//! off (`TransportCaps`; each one is named where it is chosen), and keeps its own cases below.
 
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, TcpListener};
@@ -18,7 +17,10 @@ use lunepack_core::{
     Validator,
 };
 use lunepack_http::{DirSource, UreqOptions, UreqTransport};
-use lunepack_testkit::{LoopbackServer, TransportFixture, run_blocking_transport_suite};
+use lunepack_testkit::{
+    LoopbackServer, TransportCaps, TransportFixture, run_blocking_transport_suite,
+    run_blocking_transport_suite_with,
+};
 
 fn get_all(
     transport: &dyn BlockingTransport,
@@ -358,6 +360,28 @@ fn dir_with_fixture() -> (tempfile::TempDir, DirSource, String) {
         .expect("directory url")
         .to_string();
     (dir, source, base)
+}
+
+#[test]
+fn dir_source_passes_the_blocking_suite_with_the_http_only_parts_off() {
+    let (_dir, source, base) = dir_with_fixture();
+    run_blocking_transport_suite_with(
+        &source,
+        &base,
+        &|| Vec::new(),
+        TransportCaps {
+            // A directory offers no ETag or Last-Modified, so there is nothing for If-Range to
+            // compare (case 3).
+            validators: false,
+            // A file has one set of headers; a header twice needs a server (case 6).
+            duplicate_headers: false,
+            // The alias is a symlink to the large file, which DirSource follows (M4-D14); the
+            // fixture creates it on Unix only (case 5).
+            redirects: cfg!(unix),
+            // There is no wire, so there is no request log (case 7).
+            request_log: false,
+        },
+    );
 }
 
 fn range(first: u64, last: Option<u64>) -> Option<ByteRange> {

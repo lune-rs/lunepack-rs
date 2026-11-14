@@ -874,7 +874,38 @@ fn bounded(first: u64, last: u64) -> Option<ByteRange> {
     })
 }
 
-fn transport_cases(client: &dyn SuiteClient, base: &str, seen: &dyn Fn() -> Vec<SeenRequest>) {
+/// The parts of the transport contract a transport under test may not have a meaning for. Every
+/// switch is on for a network transport ([`TransportCaps::ALL`]); a switch is turned off only
+/// where the transport cannot offer the thing at all, and the caller names why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransportCaps {
+    /// The server offers validators: a strong `ETag` and a `Last-Modified`, and honours
+    /// `If-Range` with them (case 3).
+    pub validators: bool,
+    /// The server can answer with the same header twice (the `DUPLICATE` fixture, case 6).
+    pub duplicate_headers: bool,
+    /// The fixture's `ALIAS` leads to the large file (a `302`, or a link) (case 5).
+    pub redirects: bool,
+    /// `seen` returns what the server saw (case 7). A transport with no wire has no such log.
+    pub request_log: bool,
+}
+
+impl TransportCaps {
+    /// Everything: an HTTP transport against a server (or a fake of one).
+    pub const ALL: TransportCaps = TransportCaps {
+        validators: true,
+        duplicate_headers: true,
+        redirects: true,
+        request_log: true,
+    };
+}
+
+fn transport_cases(
+    client: &dyn SuiteClient,
+    base: &str,
+    seen: &dyn Fn() -> Vec<SeenRequest>,
+    caps: TransportCaps,
+) {
     let large = TransportFixture::bytes(TransportFixture::LARGE).expect("fixture");
     let len = large.len() as u64;
 
@@ -899,8 +930,13 @@ fn transport_cases(client: &dyn SuiteClient, base: &str, seen: &dyn Fn() -> Vec<
         Some(len),
         "content-length of the large file"
     );
-    let Some(Validator::StrongETag(etag)) = info.validator.clone() else {
-        panic!("the large file's answer has no strong etag: {head:?}");
+    let etag = if caps.validators {
+        let Some(Validator::StrongETag(etag)) = info.validator.clone() else {
+            panic!("the large file's answer has no strong etag: {head:?}");
+        };
+        Some(etag)
+    } else {
+        None
     };
 
     // A closed range: 206 with the exact content-range.
@@ -947,112 +983,133 @@ fn transport_cases(client: &dyn SuiteClient, base: &str, seen: &dyn Fn() -> Vec<
     );
 
     // If-Range: the current validators keep the range, a stale one drops it.
-    let (head, body) = get(
-        client,
-        base,
-        TransportFixture::LARGE,
-        first_100,
-        Some(Validator::StrongETag(etag.clone())),
-    );
-    assert_eq!(head.status, 206, "If-Range with the current etag: status");
-    assert_eq!(body, &large[..100], "If-Range with the current etag: body");
-    let last_modified = head
-        .headers
-        .iter()
-        .find(|(n, _)| n == "last-modified")
-        .and_then(|(_, v)| Validator::from_last_modified(v))
-        .expect("the answer has a last-modified");
-    let (head, _) = get(
-        client,
-        base,
-        TransportFixture::LARGE,
-        first_100,
-        Some(last_modified),
-    );
-    assert_eq!(
-        head.status, 206,
-        "If-Range with the current last-modified: status"
-    );
-    let stale = Validator::from_etag(b"\"stale\"").expect("a strong tag");
-    let (head, body) = get(
-        client,
-        base,
-        TransportFixture::LARGE,
-        first_100,
-        Some(stale),
-    );
-    assert_eq!(head.status, 200, "If-Range with a stale etag: status");
-    assert_eq!(body, large, "If-Range with a stale etag: the full body");
-    assert!(
-        head.headers.iter().all(|(n, _)| n != "content-range"),
-        "a 200 has no content-range"
-    );
+    if let Some(etag) = &etag {
+        let (head, body) = get(
+            client,
+            base,
+            TransportFixture::LARGE,
+            first_100,
+            Some(Validator::StrongETag(etag.clone())),
+        );
+        assert_eq!(head.status, 206, "If-Range with the current etag: status");
+        assert_eq!(body, &large[..100], "If-Range with the current etag: body");
+        let last_modified = head
+            .headers
+            .iter()
+            .find(|(n, _)| n == "last-modified")
+            .and_then(|(_, v)| Validator::from_last_modified(v))
+            .expect("the answer has a last-modified");
+        let (head, _) = get(
+            client,
+            base,
+            TransportFixture::LARGE,
+            first_100,
+            Some(last_modified),
+        );
+        assert_eq!(
+            head.status, 206,
+            "If-Range with the current last-modified: status"
+        );
+        let stale = Validator::from_etag(b"\"stale\"").expect("a strong tag");
+        let (head, body) = get(
+            client,
+            base,
+            TransportFixture::LARGE,
+            first_100,
+            Some(stale),
+        );
+        assert_eq!(head.status, 200, "If-Range with a stale etag: status");
+        assert_eq!(body, large, "If-Range with a stale etag: the full body");
+        assert!(
+            head.headers.iter().all(|(n, _)| n != "content-range"),
+            "a 200 has no content-range"
+        );
+    }
 
     // A missing name is a 404 head, not an error.
     let (head, _) = get(client, base, TransportFixture::MISSING, None, None);
     assert_eq!(head.status, 404, "missing file");
 
     // A redirect is followed to the final response.
-    let (head, body) = get(client, base, TransportFixture::ALIAS, None, None);
-    assert_eq!(head.status, 200, "redirect: final status");
-    assert_eq!(body, large, "redirect: final body");
+    if caps.redirects {
+        let (head, body) = get(client, base, TransportFixture::ALIAS, None, None);
+        assert_eq!(head.status, 200, "redirect: final status");
+        assert_eq!(body, large, "redirect: final body");
+    }
 
-    // Header names are lowercase and a duplicate arrives twice, in order.
-    let (head, _) = get(client, base, TransportFixture::DUPLICATE, None, None);
+    // Header names are lowercase.
+    let (head, _) = get(client, base, TransportFixture::LARGE, None, None);
     assert!(
         head.headers
             .iter()
             .all(|(n, _)| *n == n.to_ascii_lowercase()),
         "header names are lowercased: {head:?}"
     );
-    let dups: Vec<&[u8]> = head
-        .headers
-        .iter()
-        .filter(|(n, _)| n == "x-dup")
-        .map(|(_, v)| v.as_slice())
-        .collect();
-    assert_eq!(
-        dups,
-        [&b"one"[..], b"two"],
-        "a duplicate header arrives twice"
-    );
-    assert!(
-        head.headers
+
+    // A duplicate arrives twice, in order.
+    if caps.duplicate_headers {
+        let (head, _) = get(client, base, TransportFixture::DUPLICATE, None, None);
+        assert!(
+            head.headers
+                .iter()
+                .all(|(n, _)| *n == n.to_ascii_lowercase()),
+            "header names are lowercased: {head:?}"
+        );
+        let dups: Vec<&[u8]> = head
+            .headers
             .iter()
-            .any(|(n, v)| n == "x-mixed-case" && v == b"v"),
-        "a mixed-case header arrives lowercased: {head:?}"
-    );
+            .filter(|(n, _)| n == "x-dup")
+            .map(|(_, v)| v.as_slice())
+            .collect();
+        assert_eq!(
+            dups,
+            [&b"one"[..], b"two"],
+            "a duplicate header arrives twice"
+        );
+        assert!(
+            head.headers
+                .iter()
+                .any(|(n, v)| n == "x-mixed-case" && v == b"v"),
+            "a mixed-case header arrives lowercased: {head:?}"
+        );
+    }
 
     // What was sent: no accept-encoding anywhere, and the range and validator exactly as given.
-    let log = seen();
-    assert!(!log.is_empty(), "the request log is empty");
-    assert!(
-        log.iter().all(|r| r.accept_encoding.is_none()),
-        "a request carried accept-encoding: {log:?}"
-    );
-    let large_url = format!("/{}", TransportFixture::LARGE);
-    assert!(
-        log.iter().any(|r| r.url.ends_with(&large_url)
-            && r.range_header.as_deref() == Some("bytes=0-99")
-            && r.if_range.is_none()),
-        "no request with exactly Range: bytes=0-99: {log:?}"
-    );
-    assert!(
-        log.iter()
-            .any(|r| r.range_header.as_deref() == Some(format!("bytes={from}-").as_str())),
-        "no request with the open range: {log:?}"
-    );
-    assert!(
-        log.iter()
-            .any(|r| r.if_range.as_deref() == Some(etag.as_str())),
-        "no request with If-Range: {etag}: {log:?}"
-    );
-    assert!(
-        log.iter()
-            .any(|r| r.url.ends_with(&format!("/{}", TransportFixture::ALIAS)))
-            && log.iter().filter(|r| r.url.ends_with(&large_url)).count() >= 2,
-        "the redirect hop was not logged: {log:?}"
-    );
+    if caps.request_log {
+        let log = seen();
+        assert!(!log.is_empty(), "the request log is empty");
+        assert!(
+            log.iter().all(|r| r.accept_encoding.is_none()),
+            "a request carried accept-encoding: {log:?}"
+        );
+        let large_url = format!("/{}", TransportFixture::LARGE);
+        assert!(
+            log.iter().any(|r| r.url.ends_with(&large_url)
+                && r.range_header.as_deref() == Some("bytes=0-99")
+                && r.if_range.is_none()),
+            "no request with exactly Range: bytes=0-99: {log:?}"
+        );
+        assert!(
+            log.iter()
+                .any(|r| r.range_header.as_deref() == Some(format!("bytes={from}-").as_str())),
+            "no request with the open range: {log:?}"
+        );
+        if let Some(etag) = &etag {
+            assert!(
+                log.iter()
+                    .any(|r| r.if_range.as_deref() == Some(etag.as_str())),
+                "no request with If-Range: {etag}: {log:?}"
+            );
+        }
+        if caps.redirects {
+            assert!(
+                log.iter()
+                    .any(|r| r.url.ends_with(&format!("/{}", TransportFixture::ALIAS)))
+                    && log.iter().filter(|r| r.url.ends_with(&large_url)).count() >= 2,
+                "the redirect hop was not logged: {log:?}"
+            );
+        }
+    }
 }
 
 /// Transport contract for the sync trait. `base_url` serves [`TransportFixture`] (for a real
@@ -1075,7 +1132,18 @@ pub fn run_blocking_transport_suite(
     base_url: &str,
     seen: &dyn Fn() -> Vec<SeenRequest>,
 ) {
-    transport_cases(&BlockingClient(transport), base_url, seen);
+    run_blocking_transport_suite_with(transport, base_url, seen, TransportCaps::ALL);
+}
+
+/// [`run_blocking_transport_suite`] with the parts a transport has no meaning for switched off
+/// ([`TransportCaps`]); everything else, the cancel check included, still runs.
+pub fn run_blocking_transport_suite_with(
+    transport: &dyn BlockingTransport,
+    base_url: &str,
+    seen: &dyn Fn() -> Vec<SeenRequest>,
+    caps: TransportCaps,
+) {
+    transport_cases(&BlockingClient(transport), base_url, seen, caps);
     let cancel = CancelToken::new();
     cancel.cancel();
     let url = format!(
@@ -1106,7 +1174,7 @@ pub fn run_transport_suite(
     base_url: &str,
     seen: &dyn Fn() -> Vec<SeenRequest>,
 ) {
-    transport_cases(&AsyncClient(transport), base_url, seen);
+    transport_cases(&AsyncClient(transport), base_url, seen, TransportCaps::ALL);
 }
 
 // ---- filesystem suite (M4 step 3) ---------------------------------------------------------------------
