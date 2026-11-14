@@ -1080,11 +1080,16 @@ name = "lunepack"
 version = "0.0.0"
 dependencies = [
  "futures",
+ "lunepack-codec-lzma",
  "lunepack-core",
+ "lunepack-crypto",
+ "lunepack-fs",
+ "lunepack-http",
  "lunepack-testkit",
  "serde",
  "serde_json",
  "smol",
+ "tempfile",
  "thiserror",
  "tokio",
  "url",

@@ -294,7 +294,10 @@ impl Fetched {
 }
 
 /// Resolves to `Err(Cancelled)` as soon as `cancel` is cancelled, else to `future`'s output.
-async fn cancellable<F: Future>(cancel: &CancelToken, future: F) -> Result<F::Output, Error> {
+pub(crate) async fn cancellable<F: Future>(
+    cancel: &CancelToken,
+    future: F,
+) -> Result<F::Output, Error> {
     let mut future = pin!(future);
     poll_fn(|cx| {
         if cancel.is_cancelled() {

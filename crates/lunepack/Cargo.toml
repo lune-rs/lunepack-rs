@@ -12,6 +12,11 @@ workspace = true
 
 [dependencies]
 lunepack-core.workspace = true
+# The default adapters; the facade is the composition root for embedding apps.
+lunepack-codec-lzma.workspace = true
+lunepack-crypto.workspace = true
+lunepack-fs.workspace = true
+lunepack-http.workspace = true
 thiserror.workspace = true
 # The cache's part sidecars (strict JSON on read through the core) and feed URL resolution.
 serde = { workspace = true }
@@ -20,6 +25,8 @@ url = { workspace = true }
 
 [dev-dependencies]
 lunepack-testkit.workspace = true
+# The default-adapter build test uses a real temporary directory.
+tempfile = { workspace = true }
 # The plumbing and scenario suites run under five executors (M4 step 10): the built-in
 # `block_on`, futures' `block_on`, tokio current-thread and multi-thread, and smol. Tests only;
 # the facade's own task plumbing is std-only (M4-D3).

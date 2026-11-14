@@ -6,14 +6,19 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use lunepack_core::Clock;
 
 mod cache;
+mod error;
 mod executor;
 mod fetch;
 mod pipe;
 mod progress;
 mod task;
+mod updater;
 mod worker_transport;
 
+pub mod blocking;
+
 pub use cache::{Cache, CacheKind};
+pub use error::Error;
 pub use executor::block_on;
 pub use fetch::{
     ABSENT_ROOT_STATUSES, FeedUrls, FetchCtx, FetchOutcome, Fetched, FrameNeed, PackTarget,
@@ -28,45 +33,11 @@ pub use progress::{ProgressPump, ProgressSink, progress};
 #[doc(hidden)]
 pub use task::live_workers;
 pub use task::{JobFuture, OpLock, WORKER_THREAD_NAME, spawn_job};
+pub use updater::{
+    DownloadOptions, Downloaded, InstalledVersion, Layout, ProgressCallback, StagedVersion,
+    Timeouts, UpdateInfo, Updater, UpdaterBuilder,
+};
 pub use worker_transport::{CHUNK_SIZE, WorkerTransport};
-
-/// Errors of the facade.
-#[derive(Debug, thiserror::Error)]
-#[non_exhaustive]
-pub enum Error {
-    /// The operation was cancelled.
-    #[error("cancelled")]
-    Cancelled,
-    /// A lunepack worker thread panicked (or could not be started); the panic message is not
-    /// shown.
-    #[error("a lunepack worker thread panicked")]
-    WorkerPanicked,
-    /// Another operation holds the updater lock.
-    #[error("another lunepack operation is running")]
-    Busy,
-    /// A download ended early (a dropped connection, a short body); the part is kept and the next
-    /// call resumes it.
-    #[error("download incomplete; it resumes on the next call")]
-    Incomplete,
-    /// Bytes or documents failed verification or a format rule (the core's error).
-    #[error("{0}")]
-    Verify(#[from] lunepack_core::Error),
-    /// A transport failed to produce a response or a body chunk.
-    #[error("{0}")]
-    Transport(#[from] lunepack_core::TransportError),
-    /// A filesystem operation failed.
-    #[error("{0}")]
-    Fs(#[from] lunepack_core::FsError),
-    /// The configuration is unusable (for example a feed URL with an unsupported scheme).
-    #[error("configuration: {0}")]
-    Config(&'static str),
-}
-
-impl From<lunepack_core::RangeError> for Error {
-    fn from(e: lunepack_core::RangeError) -> Self {
-        Error::Verify(lunepack_core::Error::Range(e))
-    }
-}
 
 /// The wall clock: seconds since the Unix epoch from the operating system (M3-D5).
 ///
