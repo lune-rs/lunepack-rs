@@ -267,8 +267,9 @@ pub enum PackError {
     StoredRoundTrip(#[source] Box<Error>),
 }
 
-/// Why a frame descriptor or a frame's bytes were rejected (FORMAT.md 9).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+/// Why a frame descriptor or a frame's bytes were rejected (FORMAT.md 9). Not `Copy` or `Clone`:
+/// [`FrameError::OutputWrite`] keeps the writer's `io::Error` as its source.
+#[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum FrameError {
     /// A non-empty file without a frame, or an empty file with one.
@@ -340,11 +341,8 @@ pub enum FrameError {
         size: u64,
     },
     /// The caller's output writer failed; what it holds is not the file.
-    #[error("the output writer failed: {kind}")]
-    OutputWrite {
-        /// The writer's error kind.
-        kind: std::io::ErrorKind,
-    },
+    #[error("the output writer failed")]
+    OutputWrite(#[source] std::io::Error),
     /// The decoder wrote fewer bytes than the file's size.
     #[error("decoded {actual} of {expected} bytes")]
     OutputTooShort {
@@ -367,6 +365,22 @@ pub enum FrameError {
     #[error("decoded file hash does not match")]
     FileHash,
 }
+
+/// Equality, for tests and for callers that branch on the cause: variants compare by their
+/// fields, and two [`FrameError::OutputWrite`] by the kind of their errors (`io::Error` has no
+/// equality).
+impl PartialEq for FrameError {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::OutputWrite(a), Self::OutputWrite(b)) => a.kind() == b.kind(),
+            (Self::OutputWrite(_), _) | (_, Self::OutputWrite(_)) => false,
+            // Every other variant is plain data, and the derived `Debug` shows all of its fields.
+            _ => format!("{self:?}") == format!("{other:?}"),
+        }
+    }
+}
+
+impl Eq for FrameError {}
 
 /// The install-state store refused to load or commit (FORMAT.md 12). Paths are never shown.
 #[derive(Debug, thiserror::Error)]

@@ -20,8 +20,32 @@ use crate::trust::present;
 pub const MIN_DICT_SIZE: u64 = 4096;
 /// Largest LZMA2 dictionary a descriptor may declare (16 MiB).
 pub const MAX_DICT_SIZE: u64 = 16 * 1024 * 1024;
-/// Fixed decoder memory per frame on top of its dictionaries (C3: about 1 MiB).
-pub const DECODER_OVERHEAD_BYTES: u64 = 1024 * 1024;
+/// Decoder memory beyond the signed dictionaries, per codec (M4-D13). Each constant is the peak
+/// heap measured by `lunepack-codec-lzma/tests/memory.rs` (a counting allocator, a frame at the
+/// 16 MiB maximum dictionary), minus the dictionaries, times at least 1.25, rounded up to the next
+/// 256 KiB. That test fails when a constant falls below its measurement plus 25 %, or when a
+/// peak passes [`decoder_memory`].
+///
+/// The measured overhead is mostly not fixed state: `lzma-rust2` 0.25 grows each window by
+/// doubling, and the last doubling holds the old block (half the dictionary) and the new one at
+/// once, as the counting allocator sees any `realloc`. So an LZMA2 stream peaks at about 1.5
+/// dictionaries, and the constants below cover half of 16 MiB. A smaller dictionary peaks lower,
+/// so the budget over-charges small frames, never under-charges.
+///
+/// `stored` decodes straight from its input: 0. The I/O buffers around a decode are charged by the
+/// stage engine (M4-D11), not here.
+pub const DECODER_OVERHEAD_STORED_BYTES: u64 = 0;
+/// `lzma2`: measured 8 519 715 bytes (8 MiB of growth plus 131 107 bytes of reader state and the
+/// codec's copy buffer); with headroom, 41 × 256 KiB.
+pub const DECODER_OVERHEAD_LZMA2_BYTES: u64 = 41 * 256 * 1024;
+/// `bcj-x86+lzma2`: measured 8 523 811 bytes (the BCJ filter's 4 KiB buffer on top of `lzma2`);
+/// with headroom, 41 × 256 KiB.
+pub const DECODER_OVERHEAD_BCJ_X86_LZMA2_BYTES: u64 = 41 * 256 * 1024;
+/// `bcj-arm64+lzma2`: measured 8 523 811 bytes, the same as x86; with headroom, 41 × 256 KiB.
+pub const DECODER_OVERHEAD_BCJ_ARM64_LZMA2_BYTES: u64 = 41 * 256 * 1024;
+/// `bcj2`, on top of its three dictionaries: measured 9 748 401 bytes (8 MiB of growth, the BCJ2
+/// reader's four 256 KiB buffers and the three LZMA2 readers' state); with headroom, 47 × 256 KiB.
+pub const DECODER_OVERHEAD_BCJ2_BYTES: u64 = 47 * 256 * 1024;
 
 const BCJ2_STREAMS: usize = 4;
 const RC: usize = 3;
@@ -277,16 +301,23 @@ impl FrameDesc {
     }
 }
 
-/// Decoder memory a frame may need (C3's budget input): its signed dictionaries (one for the
-/// LZMA2 variants, three for `bcj2`, none for `stored`) plus [`DECODER_OVERHEAD_BYTES`].
+/// Decoder memory a frame may need (C3's budget input, M4-D13): its signed dictionaries (one for
+/// the LZMA2 variants, three for `bcj2`, none for `stored`) plus the overhead constant of its codec.
 pub fn decoder_memory(frame: &CheckedFrame) -> u64 {
+    let overhead = match frame.codec {
+        CodecId::Stored => DECODER_OVERHEAD_STORED_BYTES,
+        CodecId::Lzma2 => DECODER_OVERHEAD_LZMA2_BYTES,
+        CodecId::BcjX86Lzma2 => DECODER_OVERHEAD_BCJ_X86_LZMA2_BYTES,
+        CodecId::BcjArm64Lzma2 => DECODER_OVERHEAD_BCJ_ARM64_LZMA2_BYTES,
+        CodecId::Bcj2 => DECODER_OVERHEAD_BCJ2_BYTES,
+    };
     frame
         .streams
         .iter()
         .filter_map(|s| s.dict_size)
         .map(u64::from)
         .sum::<u64>()
-        + DECODER_OVERHEAD_BYTES
+        + overhead
 }
 
 /// A checked frame split over its (hash-verified) bytes, ready for the codec.
@@ -343,9 +374,10 @@ struct ExactWriter<'w> {
     remaining: u64,
     written: u64,
     overflowed: bool,
-    /// The kind of the first error the caller's writer returned: remembered because a codec may
-    /// swallow it and keep writing, and `written` and the hash cover only accepted buffers.
-    failed: Option<io::ErrorKind>,
+    /// The first error the caller's writer returned: remembered because a codec may swallow it
+    /// and keep writing, and `written` and the hash cover only accepted buffers. It is the cause
+    /// of the `OutputWrite` error.
+    failed: Option<io::Error>,
     hash: Option<Box<dyn HashState>>,
 }
 
@@ -359,8 +391,10 @@ impl Write for ExactWriter<'_> {
             return Err(io::Error::other("the output writer failed earlier"));
         }
         if let Err(e) = self.inner.write_all(buf) {
-            self.failed = Some(e.kind());
-            return Err(e);
+            // The codec gets an error of the same kind; the writer's own is kept as the cause.
+            let kind = e.kind();
+            self.failed = Some(e);
+            return Err(io::Error::new(kind, "the output writer failed"));
         }
         if let Some(hash) = self.hash.as_mut() {
             hash.update(buf);
@@ -373,8 +407,9 @@ impl Write for ExactWriter<'_> {
     fn flush(&mut self) -> io::Result<()> {
         // A codec may ignore a flush error and return `Ok`, so it is latched like a write error.
         if let Err(e) = self.inner.flush() {
-            self.failed.get_or_insert(e.kind());
-            return Err(e);
+            let kind = e.kind();
+            self.failed.get_or_insert(e);
+            return Err(io::Error::new(kind, "the output writer failed"));
         }
         Ok(())
     }
@@ -424,8 +459,8 @@ pub fn decode_verified(
         .into());
     }
     // So is a failure of the caller's writer: `out` may hold part of a rejected buffer.
-    if let Some(kind) = writer.failed {
-        return Err(FrameError::OutputWrite { kind }.into());
+    if let Some(source) = writer.failed.take() {
+        return Err(FrameError::OutputWrite(source).into());
     }
     let report = result?;
     if writer.written != frame.file_size {

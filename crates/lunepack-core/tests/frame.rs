@@ -5,7 +5,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use lunepack_core::digest::{Sha256Digest, U53};
 use lunepack_core::error::{CodecError, FrameError};
-use lunepack_core::frame::{DECODER_OVERHEAD_BYTES, MAX_DICT_SIZE};
+use lunepack_core::frame::{
+    DECODER_OVERHEAD_BCJ_ARM64_LZMA2_BYTES, DECODER_OVERHEAD_BCJ_X86_LZMA2_BYTES,
+    DECODER_OVERHEAD_BCJ2_BYTES, DECODER_OVERHEAD_LZMA2_BYTES, DECODER_OVERHEAD_STORED_BYTES,
+    MAX_DICT_SIZE,
+};
 use lunepack_core::json::parse_strict;
 use lunepack_core::{
     CheckedFrame, CodecId, Error, FrameDesc, HashState, Hasher, StreamDesc, check_file_frame,
@@ -355,12 +359,26 @@ fn frame_present_exactly_when_the_file_is_not_empty() {
 
 #[test]
 fn decoder_memory_is_dictionaries_plus_overhead() {
+    // One dictionary for each LZMA2 variant plus its own constant (M4-D13), none for `stored`.
     let (_, stored) = checked(CodecId::Stored);
-    assert_eq!(decoder_memory(&stored), DECODER_OVERHEAD_BYTES);
-    let (_, lzma) = checked(CodecId::BcjArm64Lzma2);
-    assert_eq!(decoder_memory(&lzma), DICT + DECODER_OVERHEAD_BYTES);
+    assert_eq!(decoder_memory(&stored), DECODER_OVERHEAD_STORED_BYTES);
+    assert_eq!(DECODER_OVERHEAD_STORED_BYTES, 0);
+    for (id, overhead) in [
+        (CodecId::Lzma2, DECODER_OVERHEAD_LZMA2_BYTES),
+        (CodecId::BcjX86Lzma2, DECODER_OVERHEAD_BCJ_X86_LZMA2_BYTES),
+        (
+            CodecId::BcjArm64Lzma2,
+            DECODER_OVERHEAD_BCJ_ARM64_LZMA2_BYTES,
+        ),
+    ] {
+        let (_, lzma) = checked(id);
+        assert_eq!(decoder_memory(&lzma), DICT + overhead, "{id:?}");
+    }
     let (_, bcj2) = checked(CodecId::Bcj2);
-    assert_eq!(decoder_memory(&bcj2), 3 * DICT + DECODER_OVERHEAD_BYTES);
+    assert_eq!(
+        decoder_memory(&bcj2),
+        3 * DICT + DECODER_OVERHEAD_BCJ2_BYTES
+    );
     // The worst case is bounded by the signed caps: three 16 MiB dictionaries.
     let (enc, _) = checked(CodecId::Bcj2);
     let mut desc = desc_for(&enc);
@@ -371,7 +389,7 @@ fn decoder_memory_is_dictionaries_plus_overhead() {
     let max = desc.check(d.len() as u64, sha(&d), 1 << 40).unwrap();
     assert_eq!(
         decoder_memory(&max),
-        3 * MAX_DICT_SIZE + DECODER_OVERHEAD_BYTES
+        3 * MAX_DICT_SIZE + DECODER_OVERHEAD_BCJ2_BYTES
     );
 }
 
@@ -394,7 +412,7 @@ fn descriptor_json_matches_the_format_example() {
         .expect("FORMAT.md example checks");
     assert_eq!(
         decoder_memory(&frame),
-        2_097_152 + 262_144 + 65_536 + DECODER_OVERHEAD_BYTES
+        2_097_152 + 262_144 + 65_536 + DECODER_OVERHEAD_BCJ2_BYTES
     );
     // Writer output parses back to the same descriptor.
     let again: FrameDesc = parse_strict(&serde_json::to_vec(&desc).unwrap()).unwrap();
@@ -591,9 +609,7 @@ fn output_writer_failure_is_reported_even_when_the_codec_swallows_it() {
         );
         assert_eq!(
             frame_err(res.unwrap_err()),
-            FrameError::OutputWrite {
-                kind: std::io::ErrorKind::StorageFull
-            },
+            FrameError::OutputWrite(std::io::Error::from(std::io::ErrorKind::StorageFull)),
             "{id:?}"
         );
         // The writer holds partial bytes plus the retry: size would match, content does not.
@@ -701,9 +717,7 @@ fn a_flush_failure_the_codec_swallows_is_still_reported() {
         let res = decode_verified(&frame, &enc.frame, &FakeHasher, &FlushIgnoringCodec, &mut w);
         assert_eq!(
             frame_err(res.unwrap_err()),
-            FrameError::OutputWrite {
-                kind: std::io::ErrorKind::StorageFull
-            },
+            FrameError::OutputWrite(std::io::Error::from(std::io::ErrorKind::StorageFull)),
             "{id:?}"
         );
     }
@@ -719,4 +733,62 @@ fn a_flush_failure_the_codec_swallows_is_still_reported() {
     )
     .unwrap();
     assert_eq!(out, data());
+}
+
+/// A writer's own error type, to find again at the end of the cause chain (F9).
+#[derive(Debug)]
+struct DiskGone(u32);
+
+impl std::fmt::Display for DiskGone {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "disk {} is gone", self.0)
+    }
+}
+
+impl std::error::Error for DiskGone {}
+
+/// Fails every write with a custom error carrying a value.
+struct FailsWithCustomError;
+
+impl std::io::Write for FailsWithCustomError {
+    fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::other(DiskGone(7)))
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn an_output_write_failure_keeps_the_writers_error_as_its_source() {
+    use std::error::Error as _;
+    for id in ALL {
+        let (enc, frame) = checked(id);
+        let err = decode_verified(
+            &frame,
+            &enc.frame,
+            &FakeHasher,
+            &FakeCodec::default(),
+            &mut FailsWithCustomError,
+        )
+        .unwrap_err();
+        let Error::Frame(frame_error) = &err else {
+            panic!("{id:?}: expected a frame error, got {err:?}");
+        };
+        assert!(
+            matches!(frame_error, FrameError::OutputWrite(_)),
+            "{id:?}: {frame_error:?}"
+        );
+        // The source is the writer's own io::Error, and that one still holds its custom value.
+        let io = frame_error
+            .source()
+            .and_then(|s| s.downcast_ref::<std::io::Error>())
+            .unwrap_or_else(|| panic!("{id:?}: no io::Error source"));
+        let custom = io
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<DiskGone>())
+            .unwrap_or_else(|| panic!("{id:?}: the writer's error was replaced by {io:?}"));
+        assert_eq!(custom.0, 7, "{id:?}");
+    }
 }

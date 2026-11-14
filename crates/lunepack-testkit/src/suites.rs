@@ -5,7 +5,7 @@ use std::io::{self, Read, Write};
 use std::path::Path;
 
 use lunepack_core::encoding::{base64_encode, hex_encode};
-use lunepack_core::error::FrameError;
+use lunepack_core::error::{CodecError, FrameError};
 use lunepack_core::fetch::classify;
 use lunepack_core::frame::{MAX_DICT_SIZE, MIN_DICT_SIZE};
 use lunepack_core::{
@@ -677,6 +677,37 @@ fn codec_cases(
             );
             let res = direct(codec, id, &lie, bytes, input.len() as u64, &mut Vec::new());
             assert!(res.is_err(), "{ctx}: lying stream sizes decoded (direct)");
+
+            // 13. F6: one sub-stream whose `decoded_size` is off by one while the others and the
+            // total stay as they are (core sees only the total) is a `StreamSize` error for that
+            // stream: a stream that decodes to less than it says and one that decodes to more
+            for index in 0..3 {
+                for by in [1i64, -1] {
+                    let size = streams[index].decoded_size.get();
+                    if by < 0 && size == 0 {
+                        continue;
+                    }
+                    let mut lie = desc.clone();
+                    let s = lie.streams.as_mut().expect("streams");
+                    s[index].decoded_size = u53(size.saturating_add_signed(by));
+                    let name = format!("stream {index} {by:+}");
+                    let stream_size = |err: &Error| {
+                        matches!(
+                            err,
+                            Error::Codec(CodecError::StreamSize { index: i, .. }) if *i == index
+                        )
+                    };
+                    let err = direct(codec, id, &lie, bytes, input.len() as u64, &mut Vec::new())
+                        .expect_err("a sub-stream of the wrong size must be rejected");
+                    assert!(stream_size(&err), "{ctx}: {name} (direct): {err:?}");
+                    // Core only checks `decoded_size <= file_size`, so it lets this through.
+                    if size.saturating_add_signed(by) <= input.len() as u64 {
+                        let err = through_core(hasher, codec, &lie, bytes, input, &mut Vec::new())
+                            .expect_err("a sub-stream of the wrong size must be rejected");
+                        assert!(stream_size(&err), "{ctx}: {name} (core path): {err:?}");
+                    }
+                }
+            }
         }
     }
 
@@ -686,7 +717,7 @@ fn codec_cases(
     let err = through_core(hasher, codec, &desc, bytes, input, &mut w)
         .expect_err("a failing writer must fail the decode");
     assert!(
-        matches!(frame_error(&err), Some(FrameError::OutputWrite { .. })),
+        matches!(frame_error(&err), Some(FrameError::OutputWrite(_))),
         "{ctx}: {err}"
     );
     assert_eq!(w.after_failure, 0, "{ctx}: writes after the failure (core)");
