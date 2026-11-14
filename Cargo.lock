@@ -1082,9 +1082,12 @@ dependencies = [
  "futures",
  "lunepack-core",
  "lunepack-testkit",
+ "serde",
+ "serde_json",
  "smol",
  "thiserror",
  "tokio",
+ "url",
 ]
 
 [[package]]
