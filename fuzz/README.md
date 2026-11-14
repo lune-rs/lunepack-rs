@@ -1,7 +1,8 @@
 # Fuzz targets
 
 libFuzzer targets over the untrusted-input harnesses of `lunepack_core::fuzz` (envelopes, root,
-key set, feed, manifest, paths, trees, version/target/id rules, strict JSON, frames). Each target
+key set, feed, manifest, paths, trees, version/target/id rules, strict JSON, frames, HTTP response
+headers). Each target
 calls one harness; a harness must return for any input without panicking.
 
 This directory is outside the Cargo workspace (root `exclude`) and has its own committed
@@ -16,7 +17,7 @@ the committed seeds and random and mutated inputs on stable:
     cargo install cargo-fuzz --locked
     cargo +nightly fuzz run <target> fuzz/corpus/<target> fuzz/seeds/<target> -- -max_total_time=60
 
-Targets: `envelope`, `root`, `keys`, `feed`, `manifest`, `path`, `tree`, `rules`, `json`, `frame`.
+Targets: `envelope`, `root`, `keys`, `feed`, `manifest`, `path`, `tree`, `rules`, `json`, `frame`, `http`.
 If AddressSanitizer does not work on your host, add `-s none`. `corpus/` and `artifacts/` are
 local and gitignored; a crash lands in `artifacts/<target>/`.
 
@@ -44,3 +45,7 @@ regression case and fix the parser.
   reference rules. `json`: the strict JSON pre-pass.
 - `frame`: 50 header bytes (u16 BE descriptor length, u64 BE file size, u64 BE pack size, 32 bytes
   file SHA-256), the frame descriptor JSON, then the frame bytes.
+- `http`: 35 parameter bytes (flags: bit 0 a range was requested, bit 1 it has a last byte; u64 BE
+  first, last, signed pack size and expected body length; u16 BE status), then one `name: value`
+  header line per newline. The harness runs the response header rules, the `Content-Range` and
+  `Content-Length` checks and the document check.

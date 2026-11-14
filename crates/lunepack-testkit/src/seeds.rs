@@ -7,10 +7,10 @@
 //! 64-byte signatures, and the payload harnesses sign with the fake scheme at run time.
 
 use lunepack_core::digest::{Sha256Digest, U53};
-use lunepack_core::fuzz::{FRAME_HEADER_LEN, FUZZ_TARGET, FUZZ_VERSION};
+use lunepack_core::fuzz::{FRAME_HEADER_LEN, FUZZ_TARGET, FUZZ_VERSION, HTTP_HEADER_LEN};
 use lunepack_core::{
-    Channel, CodecId, EnvelopeSignature, FrameDesc, Hasher, PayloadKind, StreamDesc, Target,
-    write_envelope,
+    ByteRange, Channel, CodecId, ContentRange, EnvelopeSignature, FrameDesc, Hasher, PayloadKind,
+    StreamDesc, Target, Validator, write_envelope,
 };
 
 use crate::docs::{ChainFixture, PackBuilder, SUITE_T0};
@@ -72,6 +72,7 @@ pub fn fuzz_seeds() -> Vec<Seed> {
     rules_seeds(&mut out);
     json_seeds(&fx, &mut out);
     frame_seeds(&mut out);
+    http_seeds(&mut out);
     out.0
 }
 
@@ -560,5 +561,207 @@ fn frame_seeds(out: &mut Out) {
         "frame",
         "bcj2-with-a-frame-dict-size",
         frame_input(&with_dict, len, len, file_hash, &data),
+    );
+}
+
+/// The pack size of the `http` seeds (the size of the GitHub release asset P-N1 fetched).
+const HTTP_TOTAL: u64 = 1_787_248;
+
+/// An `http` input: parameter bytes, then one `name: value` line per header.
+fn http_input(
+    range: Option<ByteRange>,
+    total: u64,
+    expected_len: u64,
+    status: u16,
+    headers: &[(&str, &[u8])],
+) -> Vec<u8> {
+    let flags =
+        u8::from(range.is_some()) | (u8::from(range.is_some_and(|r| r.last.is_some())) << 1);
+    let range = range.unwrap_or(ByteRange {
+        first: 0,
+        last: None,
+    });
+    let mut out = Vec::with_capacity(HTTP_HEADER_LEN + 64 * headers.len());
+    out.push(flags);
+    out.extend_from_slice(&range.first.to_be_bytes());
+    out.extend_from_slice(&range.last.unwrap_or(0).to_be_bytes());
+    out.extend_from_slice(&total.to_be_bytes());
+    out.extend_from_slice(&expected_len.to_be_bytes());
+    out.extend_from_slice(&status.to_be_bytes());
+    for (name, value) in headers {
+        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(b": ");
+        out.extend_from_slice(value);
+        out.push(b'\n');
+    }
+    out
+}
+
+fn content_range(first: u64, last: u64, total: u64) -> String {
+    ContentRange { first, last, total }.to_string()
+}
+
+fn http_seeds(out: &mut Out) {
+    let first_100 = Some(ByteRange {
+        first: 0,
+        last: Some(99),
+    });
+    let etag = match Validator::from_etag(b"\"5d41402abc4b2a76\"") {
+        Some(Validator::StrongETag(tag)) => tag,
+        _ => unreachable!("a quoted ASCII tag is a strong validator"),
+    };
+    let cr = content_range(0, 99, HTTP_TOTAL);
+    let total_len = HTTP_TOTAL.to_string();
+
+    out.ok(
+        "http",
+        "partial",
+        http_input(
+            first_100,
+            HTTP_TOTAL,
+            100,
+            206,
+            &[
+                ("content-range", cr.as_bytes()),
+                ("content-length", b"100"),
+                ("etag", etag.as_bytes()),
+                ("last-modified", b"Wed, 21 Oct 2026 07:28:00 GMT"),
+            ],
+        ),
+    );
+    out.ok(
+        "http",
+        "partial-open-ended",
+        http_input(
+            Some(ByteRange {
+                first: HTTP_TOTAL - 100,
+                last: None,
+            }),
+            HTTP_TOTAL,
+            100,
+            206,
+            &[(
+                "content-range",
+                content_range(HTTP_TOTAL - 100, HTTP_TOTAL - 1, HTTP_TOTAL).as_bytes(),
+            )],
+        ),
+    );
+    out.ok(
+        "http",
+        "full-answering-a-range-request",
+        http_input(
+            first_100,
+            HTTP_TOTAL,
+            100,
+            200,
+            &[("content-length", total_len.as_bytes())],
+        ),
+    );
+    out.ok(
+        "http",
+        "full-identity-encoding",
+        http_input(
+            None,
+            HTTP_TOTAL,
+            HTTP_TOTAL,
+            200,
+            &[
+                ("content-length", total_len.as_bytes()),
+                ("content-encoding", b"identity"),
+            ],
+        ),
+    );
+    out.ok(
+        "http",
+        "full-without-content-length",
+        http_input(None, HTTP_TOTAL, HTTP_TOTAL, 200, &[("server", b"x")]),
+    );
+
+    let partial = |headers: &[(&str, &[u8])]| http_input(first_100, HTTP_TOTAL, 100, 206, headers);
+    let cases: [(&str, Vec<u8>); 16] = [
+        (
+            "unit-in-capitals",
+            partial(&[("content-range", b"Bytes 0-99/1787248")]),
+        ),
+        (
+            "two-spaces-after-the-unit",
+            partial(&[("content-range", b"bytes  0-99/1787248")]),
+        ),
+        (
+            "unknown-total",
+            partial(&[("content-range", b"bytes 0-99/*")]),
+        ),
+        (
+            "unsatisfied-range-form",
+            partial(&[("content-range", b"bytes */1787248")]),
+        ),
+        (
+            "last-byte-differs-from-the-request",
+            partial(&[("content-range", content_range(0, 98, HTTP_TOTAL).as_bytes())]),
+        ),
+        (
+            "first-byte-differs-from-the-request",
+            partial(&[("content-range", content_range(1, 99, HTTP_TOTAL).as_bytes())]),
+        ),
+        (
+            "total-differs-from-the-signed-size",
+            partial(&[(
+                "content-range",
+                content_range(0, 99, HTTP_TOTAL + 1).as_bytes(),
+            )]),
+        ),
+        (
+            "seventeen-digits",
+            partial(&[("content-range", b"bytes 0-99/10000000000000000")]),
+        ),
+        (
+            "total-above-2-pow-53",
+            partial(&[("content-range", b"bytes 0-99/9007199254740992")]),
+        ),
+        (
+            "last-before-first",
+            partial(&[("content-range", b"bytes 99-0/1787248")]),
+        ),
+        (
+            "two-content-range-headers",
+            partial(&[
+                ("content-range", cr.as_bytes()),
+                ("content-range", cr.as_bytes()),
+            ]),
+        ),
+        (
+            "content-encoding-gzip",
+            partial(&[
+                ("content-range", cr.as_bytes()),
+                ("content-encoding", b"gzip"),
+            ]),
+        ),
+        (
+            "content-length-differs",
+            partial(&[("content-range", cr.as_bytes()), ("content-length", b"101")]),
+        ),
+        ("partial-without-content-range", partial(&[])),
+        (
+            "non-ascii-header-byte",
+            partial(&[("content-range", b"bytes 0-99/1787248\xff")]),
+        ),
+        (
+            "unsatisfiable-range-status",
+            http_input(first_100, HTTP_TOTAL, 100, 416, &[]),
+        ),
+    ];
+    for (name, bytes) in cases {
+        out.bad("http", name, bytes);
+    }
+    out.bad(
+        "http",
+        "full-with-a-content-range",
+        http_input(
+            first_100,
+            HTTP_TOTAL,
+            100,
+            200,
+            &[("content-range", cr.as_bytes())],
+        ),
     );
 }

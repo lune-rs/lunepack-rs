@@ -5,9 +5,11 @@
 
 use std::fmt;
 
+use crate::fetch::RangeError;
 use crate::path::{PathError, TreeError};
 use crate::target::TargetError;
 use crate::traits::CodecId;
+use crate::transport::TransportError;
 use crate::version::VersionError;
 
 /// Result alias for the core.
@@ -576,4 +578,13 @@ pub enum Error {
         /// The clock's reading.
         now: u64,
     },
+    /// A transport failed to produce a response or a body chunk.
+    #[error("{0}")]
+    Transport(#[from] TransportError),
+    /// A response broke the HTTP response rules of the fetch (M4-D9).
+    #[error("response refused: {0}")]
+    Range(#[from] RangeError),
+    /// The operation's cancel token was cancelled.
+    #[error("cancelled")]
+    Cancelled,
 }

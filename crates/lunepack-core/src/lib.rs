@@ -1,10 +1,12 @@
 //! Pure update-framework logic and the traits behind every external or replaceable capability; depends on no adapter or I/O crate.
 
+pub mod cancel;
 pub mod digest;
 pub mod encoding;
 pub mod envelope;
 pub mod error;
 pub mod feed;
+pub mod fetch;
 pub mod frame;
 #[doc(hidden)]
 pub mod fuzz;
@@ -16,19 +18,26 @@ pub mod manifest;
 pub mod pack;
 pub mod path;
 pub mod policy;
+pub mod progress;
 pub mod root;
 pub mod target;
 pub mod traits;
+pub mod transport;
 pub mod trust;
 pub mod version;
 pub mod write;
 
+pub use cancel::CancelToken;
 pub use digest::{Sha256Digest, U53};
 pub use envelope::{EnvelopeSignature, OpenedEnvelope, PayloadKind, pae, write_envelope};
 pub use error::{Error, Result};
 pub use feed::{
     ArtifactRef, CheckedRef, FeedDocument, FeedTargetEntry, ReleaseDoc, Rollout, RolloutDoc,
     VerifiedFeed, VerifiedRelease, verify_feed,
+};
+pub use fetch::{
+    ContentRange, FetchPlan, FetchPolicy, Outcome, RangeError, ResponseInfo, Run, check_document,
+    plan_fetch,
 };
 pub use frame::{
     CheckedFrame, FrameDesc, StreamDesc, check_file_frame, decode_verified, decoder_memory,
@@ -40,11 +49,16 @@ pub use manifest::{EntryDoc, ManifestDocument, VerifiedEntry, VerifiedManifest, 
 pub use pack::{FileClass, PackedFile, ReleaseLayout, candidates, classify, pack_file};
 pub use path::{EntryKind, RelPath, validate_path, validate_tree};
 pub use policy::{Candidate, in_rollout, rollout_bucket, select_candidate};
+pub use progress::{FileProgress, Phase, Progress, Source};
 pub use root::{RootDocument, TrustedRoot, advance_root};
 pub use target::Target;
 pub use traits::{
     Clock, CodeSign, Codec, CodecId, DecodeReport, EncodedFrame, EncodedStream, Encoder, FrameView,
     HashState, Hasher, SignatureAlg, Signer, StreamView, Verifier,
+};
+pub use transport::{
+    BlockingResponse, BlockingTransport, Body, BoxFuture, ByteRange, Head, Request, Response,
+    Transport, TransportError, TransportErrorKind, Validator,
 };
 pub use trust::{ClockReading, KeyEntry, KeyRing, PublicKey, RollbackFloor};
 pub use version::Version;

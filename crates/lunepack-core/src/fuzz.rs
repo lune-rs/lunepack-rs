@@ -22,6 +22,7 @@ use crate::encoding::{base64_decode, hex_decode_array};
 use crate::envelope::{EnvelopeSignature, OpenedEnvelope, PayloadKind, pae, write_envelope};
 use crate::error::{CodecError, Error};
 use crate::feed::{ArtifactRef, FeedDocument, ReleaseDoc, verify_feed};
+use crate::fetch::{ResponseInfo, check_document, classify};
 use crate::frame::{FrameDesc, decode_verified, decoder_memory};
 use crate::ident::{AppId, Channel};
 use crate::json::{check_strict, parse_strict};
@@ -34,6 +35,7 @@ use crate::target::Target;
 use crate::traits::{
     Clock, Codec, CodecId, DecodeReport, FrameView, HashState, Hasher, SignatureAlg, Verifier,
 };
+use crate::transport::{ByteRange, Head};
 use crate::trust::{ClockReading, PublicKey, RollbackFloor, parse_payload};
 use crate::version::Version;
 
@@ -54,6 +56,10 @@ pub const RELEASE_SEED: u8 = 5;
 /// Bytes before the descriptor JSON in a `frame` input: JSON length (u16 BE), file size (u64 BE),
 /// pack size (u64 BE), file SHA-256 (32 bytes).
 pub const FRAME_HEADER_LEN: usize = 2 + 8 + 8 + 32;
+/// Bytes before the header lines in an `http` input: flags (bit 0 a range was requested, bit 1 the
+/// range has a last byte), request first byte (u64 BE), request last byte (u64 BE), signed pack
+/// size (u64 BE), expected body length (u64 BE), status (u16 BE).
+pub const HTTP_HEADER_LEN: usize = 1 + 8 + 8 + 8 + 8 + 2;
 
 const DAY: u64 = 86_400;
 const ALL_SEEDS: [u8; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
@@ -79,6 +85,7 @@ pub const HARNESSES: &[(&str, Harness)] = &[
     ("rules", rules),
     ("json", json),
     ("frame", frame),
+    ("http", http),
 ];
 
 /// Runs the harness `name` and reports whether `data` got all the way through it (`None`: no such
@@ -95,6 +102,7 @@ pub fn accepts(name: &str, data: &[u8]) -> Option<bool> {
         "rules" => rules_run(data),
         "json" => json_run(data),
         "frame" => frame_run(data),
+        "http" => http_run(data),
         _ => return None,
     })
 }
@@ -176,6 +184,13 @@ pub fn json(data: &[u8]) {
 /// `data` as a frame input: [`FRAME_HEADER_LEN`] header bytes, the descriptor JSON, the frame bytes.
 pub fn frame(data: &[u8]) {
     let _ = frame_run(data);
+}
+
+/// `data` as a response to a pack request: [`HTTP_HEADER_LEN`] parameter bytes, then header lines
+/// (`name: value`, one per line, name lowercased) through the response header
+/// rules, the `Content-Range` and `Content-Length` checks and the document check.
+pub fn http(data: &[u8]) {
+    let _ = http_run(data);
 }
 
 // ---- scaffolding: fake hasher, fake signatures, clock, codec -------------------------------------
@@ -639,6 +654,43 @@ fn frame_run(data: &[u8]) -> bool {
         &mut io::sink(),
     )
     .is_ok()
+}
+
+fn http_run(data: &[u8]) -> bool {
+    let Some((params, lines)) = data.split_first_chunk::<HTTP_HEADER_LEN>() else {
+        return false;
+    };
+    let flags = params[0];
+    let first = be_u64(&params[1..9]);
+    let last = be_u64(&params[9..17]);
+    let signed_total = be_u64(&params[17..25]);
+    let expected_len = be_u64(&params[25..33]);
+    let status = u16::from_be_bytes([params[33], params[34]]);
+    let range = (flags & 1 != 0).then_some(ByteRange {
+        first,
+        last: (flags & 2 != 0).then_some(last),
+    });
+    let headers = lines
+        .split(|&b| b == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            let (name, value) = match line.iter().position(|&b| b == b':') {
+                Some(at) => (&line[..at], &line[at + 1..]),
+                None => (line, &line[line.len()..]),
+            };
+            let value = value.strip_prefix(b" ").unwrap_or(value);
+            (
+                String::from_utf8_lossy(name).to_ascii_lowercase(),
+                value.to_vec(),
+            )
+        })
+        .collect();
+    let head = Head { status, headers };
+    let Ok(info) = ResponseInfo::from_head(&head) else {
+        return false;
+    };
+    let _ = check_document(&info, expected_len);
+    classify(range, &info, signed_total, expected_len).is_ok()
 }
 
 fn be_u64(bytes: &[u8]) -> u64 {
