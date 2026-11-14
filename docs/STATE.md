@@ -58,6 +58,10 @@ the staged tree).
   halves (only its control flow ran locally, under stubs); Windows directory durability (`sync_dir` on
   a directory handle is an assumption in `lunepack-fs`; a commit could be lost, never corrupted, on
   power loss).
+- Windows CI fix (unverified until the next run): `StdFs::create_dir_all` no longer inspects a bare
+  Windows prefix (`\\?\C:`, which a canonicalised path starts with), the cause of the
+  `cross_process` failure (empty-name `FsError`, kind `Other`, "Uncategorized"). `FsError` now carries
+  the failed operation and the OS code, so a repeat names itself.
 - A dropped download on the default transport leaves its worker in a socket read until the per-read
   timeout (30 s), and the updater lock stays held meanwhile (`Busy`); documented in the threat model.
 - `DirSource` has its own tests and does not run the whole transport contract suite (that needs an

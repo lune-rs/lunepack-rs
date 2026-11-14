@@ -23,7 +23,7 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use lunepack_core::{
     DirEntryInfo, FileKind, FileWrite, Fs, FsError, FsErrorKind, LockGuard, Meta, ReadAt,
@@ -47,8 +47,9 @@ impl StdFs {
     }
 }
 
-fn err(path: &Path) -> impl Fn(io::Error) -> FsError + '_ {
-    move |e| FsError::from_io(path, e)
+/// Maps an `io::Error` of operation `op` on `path` to an [`FsError`] that names both.
+fn err<'a>(op: &'static str, path: &'a Path) -> impl Fn(io::Error) -> FsError + 'a {
+    move |e| FsError::from_io(path, e).during(op)
 }
 
 fn kind_of(ft: fs::FileType) -> FileKind {
@@ -67,7 +68,7 @@ fn lstat(path: &Path) -> Result<Option<fs::Metadata>, FsError> {
     match fs::symlink_metadata(path) {
         Ok(meta) => Ok(Some(meta)),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(FsError::from_io(path, e)),
+        Err(e) => Err(FsError::from_io(path, e).during("lstat")),
     }
 }
 
@@ -85,11 +86,11 @@ impl ReadAt for StdReader {
         self.file
             .metadata()
             .map(|m| m.len())
-            .map_err(err(&self.path))
+            .map_err(err("metadata", &self.path))
     }
 
     fn read_exact_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FsError> {
-        read_exact_at(&self.file, offset, buf).map_err(err(&self.path))
+        read_exact_at(&self.file, offset, buf).map_err(err("read", &self.path))
     }
 }
 
@@ -132,7 +133,7 @@ impl Write for StdWriter {
 
 impl FileWrite for StdWriter {
     fn sync(&mut self) -> Result<(), FsError> {
-        self.file.sync_all().map_err(err(&self.path))
+        self.file.sync_all().map_err(err("sync", &self.path))
     }
 }
 
@@ -146,11 +147,11 @@ impl LockGuard for StdLock {}
 
 impl Fs for StdFs {
     fn read_capped(&self, path: &Path, max: u64) -> Result<Vec<u8>, FsError> {
-        let file = File::open(path).map_err(err(path))?;
+        let file = File::open(path).map_err(err("open", path))?;
         let mut bytes = Vec::new();
         file.take(max.saturating_add(1))
             .read_to_end(&mut bytes)
-            .map_err(err(path))?;
+            .map_err(err("read", path))?;
         if bytes.len() as u64 > max {
             return Err(FsError::new(FsErrorKind::TooLarge, path, None));
         }
@@ -158,7 +159,7 @@ impl Fs for StdFs {
     }
 
     fn open_read(&self, path: &Path) -> Result<Box<dyn ReadAt>, FsError> {
-        let file = File::open(path).map_err(err(path))?;
+        let file = File::open(path).map_err(err("open", path))?;
         Ok(Box::new(StdReader {
             file,
             path: path.to_owned(),
@@ -173,7 +174,7 @@ impl Fs for StdFs {
             use std::os::unix::fs::OpenOptionsExt;
             options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
         }
-        let file = options.open(path).map_err(err(path))?;
+        let file = options.open(path).map_err(err("create", path))?;
         Ok(Box::new(StdWriter {
             file,
             path: path.to_owned(),
@@ -184,7 +185,7 @@ impl Fs for StdFs {
         let file = OpenOptions::new()
             .append(true)
             .open(path)
-            .map_err(err(path))?;
+            .map_err(err("open", path))?;
         Ok(Box::new(StdWriter {
             file,
             path: path.to_owned(),
@@ -195,15 +196,15 @@ impl Fs for StdFs {
         let file = OpenOptions::new()
             .write(true)
             .open(path)
-            .map_err(err(path))?;
-        file.set_len(len).map_err(err(path))
+            .map_err(err("open", path))?;
+        file.set_len(len).map_err(err("truncate", path))
     }
 
     fn rename(&self, from: &Path, to: &Path) -> Result<(), FsError> {
         if lstat(to)?.is_some() {
             return Err(FsError::new(FsErrorKind::AlreadyExists, to, None));
         }
-        fs::rename(from, to).map_err(err(from))
+        fs::rename(from, to).map_err(err("rename", from))
     }
 
     fn remove_file(&self, path: &Path) -> Result<(), FsError> {
@@ -227,13 +228,19 @@ impl Fs for StdFs {
             return Err(FsError::new(FsErrorKind::NotADirectory, path, None));
         }
         // std's `remove_dir_all` does not follow symlinks inside the tree: it unlinks them.
-        fs::remove_dir_all(path).map_err(err(path))
+        fs::remove_dir_all(path).map_err(err("remove_dir_all", path))
     }
 
     fn create_dir_all(&self, path: &Path) -> Result<(), FsError> {
         let mut current = PathBuf::new();
         for component in path.components() {
             current.push(component);
+            // A bare Windows prefix (`C:`, `\\?\C:`) is not a directory entry to inspect: `C:` means
+            // the drive's current directory and `\\?\C:` names the volume device. The root component
+            // after it (`\\?\C:\`) is checked as usual.
+            if matches!(component, Component::Prefix(_)) {
+                continue;
+            }
             match lstat(&current)? {
                 Some(meta) if meta.file_type().is_symlink() => {
                     return Err(FsError::new(FsErrorKind::IsSymlink, path, None));
@@ -247,7 +254,7 @@ impl Fs for StdFs {
                         Some(m) if m.is_dir() && !m.file_type().is_symlink() => {}
                         _ => return Err(FsError::new(FsErrorKind::NotADirectory, path, None)),
                     },
-                    Err(e) => return Err(FsError::from_io(path, e)),
+                    Err(e) => return Err(FsError::from_io(path, e).during("create_dir")),
                 },
             }
         }
@@ -256,9 +263,9 @@ impl Fs for StdFs {
 
     fn list_dir(&self, path: &Path) -> Result<Vec<DirEntryInfo>, FsError> {
         let mut out = Vec::new();
-        for entry in fs::read_dir(path).map_err(err(path))? {
-            let entry = entry.map_err(err(path))?;
-            let kind = entry.file_type().map_err(err(path))?;
+        for entry in fs::read_dir(path).map_err(err("read_dir", path))? {
+            let entry = entry.map_err(err("read_dir", path))?;
+            let kind = entry.file_type().map_err(err("read_dir", path))?;
             out.push(DirEntryInfo {
                 name: entry.file_name(),
                 kind: kind_of(kind),
@@ -284,16 +291,16 @@ impl Fs for StdFs {
         if lstat(to_new)?.is_some() {
             return Err(FsError::new(FsErrorKind::AlreadyExists, to_new, None));
         }
-        fs::copy(from, to_new).map(drop).map_err(err(from))
+        fs::copy(from, to_new).map(drop).map_err(err("copy", from))
     }
 
     fn set_exec(&self, path: &Path, exec: bool) -> Result<(), FsError> {
-        let meta = fs::metadata(path).map_err(err(path))?;
+        let meta = fs::metadata(path).map_err(err("metadata", path))?;
         set_exec(path, &meta, exec)
     }
 
     fn symlink(&self, target: &str, link_path: &Path) -> Result<(), FsError> {
-        symlink(target, link_path).map_err(err(link_path))
+        symlink(target, link_path).map_err(err("symlink", link_path))
     }
 
     fn try_lock(&self, path: &Path) -> Result<Option<Box<dyn LockGuard>>, FsError> {
@@ -302,13 +309,13 @@ impl Fs for StdFs {
             .create(true)
             .truncate(false)
             .open(path)
-            .map_err(err(path))?;
+            .map_err(err("open_lock", path))?;
         // By trait path: `std::fs::File` has inherent `try_lock` and `unlock` since Rust 1.89, which
         // would shadow the trait methods. Only `try_lock` is used; the lock ends with the file.
         match fs4::FileExt::try_lock(&file) {
             Ok(()) => Ok(Some(Box::new(StdLock { _file: file }))),
             Err(fs4::TryLockError::WouldBlock) => Ok(None),
-            Err(fs4::TryLockError::Error(e)) => Err(FsError::from_io(path, e)),
+            Err(fs4::TryLockError::Error(e)) => Err(FsError::from_io(path, e).during("lock")),
         }
     }
 }
@@ -319,18 +326,18 @@ fn remove_link_or_file(path: &Path, meta: &fs::Metadata) -> Result<(), FsError> 
         // A symlink to a directory is removed with `remove_dir` on Windows.
         use std::os::windows::fs::FileTypeExt;
         if meta.file_type().is_symlink_dir() {
-            return fs::remove_dir(path).map_err(err(path));
+            return fs::remove_dir(path).map_err(err("remove_dir", path));
         }
     }
     let _ = meta;
-    fs::remove_file(path).map_err(err(path))
+    fs::remove_file(path).map_err(err("remove_file", path))
 }
 
 #[cfg(unix)]
 fn sync_dir(path: &Path) -> Result<(), FsError> {
     File::open(path)
         .and_then(|dir| dir.sync_all())
-        .map_err(err(path))
+        .map_err(err("sync_dir", path))
 }
 
 #[cfg(windows)]
@@ -351,7 +358,7 @@ fn sync_dir(path: &Path) -> Result<(), FsError> {
         {
             Ok(())
         }
-        Err(e) => Err(FsError::from_io(path, e)),
+        Err(e) => Err(FsError::from_io(path, e).during("sync_dir")),
     }
 }
 
@@ -368,7 +375,7 @@ fn set_exec(path: &Path, meta: &fs::Metadata, exec: bool) -> Result<(), FsError>
     if new == mode {
         return Ok(());
     }
-    fs::set_permissions(path, fs::Permissions::from_mode(new)).map_err(err(path))
+    fs::set_permissions(path, fs::Permissions::from_mode(new)).map_err(err("set_permissions", path))
 }
 
 #[cfg(windows)]

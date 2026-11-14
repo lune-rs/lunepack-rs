@@ -65,6 +65,8 @@ pub struct FsError {
     /// The underlying error, kept as the cause (hard rule 4).
     pub source: Option<io::Error>,
     name: String,
+    /// The operation that failed (`"lstat"`, `"create"`, ...); empty when the producer set none.
+    op: &'static str,
 }
 
 impl FsError {
@@ -74,7 +76,12 @@ impl FsError {
             .file_name()
             .map(|n| Untrusted::new(&n.to_string_lossy()).to_string())
             .unwrap_or_default();
-        FsError { kind, source, name }
+        FsError {
+            kind,
+            source,
+            name,
+            op: "",
+        }
     }
 
     /// Classifies an `io::Error` by its kind (`NotFound`, `AlreadyExists`; anything else is
@@ -98,6 +105,23 @@ impl FsError {
         FsError::new(kind, path, Some(err))
     }
 
+    /// Names the operation that failed, shown by `Display` and `Debug`.
+    #[must_use]
+    pub fn during(mut self, op: &'static str) -> Self {
+        self.op = op;
+        self
+    }
+
+    /// The operation that failed; empty when none was recorded.
+    pub fn operation(&self) -> &'static str {
+        self.op
+    }
+
+    /// The OS error code of the cause (`GetLastError` on Windows, `errno` elsewhere), if any.
+    pub fn os_code(&self) -> Option<i32> {
+        self.source.as_ref().and_then(io::Error::raw_os_error)
+    }
+
     /// The file name the error is about (escaped, possibly empty).
     pub fn file_name(&self) -> &str {
         &self.name
@@ -106,21 +130,26 @@ impl FsError {
 
 impl fmt::Display for FsError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.name.is_empty() {
-            write!(f, "filesystem: {}", self.kind.describe())
-        } else {
-            write!(f, "filesystem: {}: {}", self.kind.describe(), self.name)
+        write!(f, "filesystem: {}", self.kind.describe())?;
+        if !self.op.is_empty() {
+            write!(f, " ({})", self.op)?;
         }
+        if !self.name.is_empty() {
+            write!(f, ": {}", self.name)?;
+        }
+        Ok(())
     }
 }
 
 impl fmt::Debug for FsError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // The cause is shown by kind only: an OS error message can name a full path.
+        // The cause is shown by kind and OS code only: an OS error message can name a full path.
         f.debug_struct("FsError")
             .field("kind", &self.kind)
+            .field("op", &self.op)
             .field("name", &self.name)
             .field("source_kind", &self.source.as_ref().map(io::Error::kind))
+            .field("os_code", &self.os_code())
             .finish()
     }
 }

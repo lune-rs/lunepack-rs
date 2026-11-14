@@ -44,6 +44,37 @@ fn errors_name_only_the_file() {
 }
 
 #[test]
+fn errors_name_the_operation_and_the_os_code() {
+    let (_guard, root) = temp_root();
+    // A directory read as a file fails differently per OS, but always with an OS code and the
+    // operation that failed.
+    let err = StdFs.read_capped(&root, 10).unwrap_err();
+    let shown = format!("{err} / {err:?}");
+    assert!(["open", "read"].contains(&err.operation()), "{shown}");
+    assert!(shown.contains(&format!("({})", err.operation())), "{shown}");
+    assert!(err.os_code().is_some(), "{shown}");
+    assert!(shown.contains("os_code: Some("), "{shown}");
+    assert!(!shown.contains(&*root.to_string_lossy()), "{shown}");
+}
+
+/// The test root is canonicalised, which on Windows gives a verbatim `\\?\C:\...` path; its bare
+/// prefix `\\?\C:` names the volume device and must not be inspected as a directory.
+#[cfg(windows)]
+#[test]
+fn create_dir_all_works_below_a_verbatim_root() {
+    let (_guard, root) = temp_root();
+    assert!(
+        root.to_string_lossy().starts_with(r"\\?\"),
+        "{}",
+        root.display()
+    );
+    let deep = root.join("a").join("b").join("c");
+    StdFs.create_dir_all(&deep).unwrap();
+    StdFs.create_dir_all(&deep).unwrap();
+    assert!(deep.is_dir());
+}
+
+#[test]
 fn rename_and_copy_never_overwrite() {
     let (_guard, root) = temp_root();
     for name in ["a", "b"] {
