@@ -427,6 +427,26 @@ pub enum StateError {
     FloorLowered,
 }
 
+/// Why [`crate::stage::stage`] did not produce a tree (C3). Paths are never shown.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum StageError {
+    /// These files (manifest order) could not be placed from their sources: a missing, short or
+    /// corrupt cache file, a pack frame that fails its hash or decode, or a current-tree file that
+    /// no longer matches. The partial tree stays; the caller fetches them and calls again.
+    #[error("{} files need fetching", .0.len())]
+    NeedFetch(Vec<crate::path::RelPath>),
+    /// The cancel token was cancelled; no temporary file is left and a later call resumes.
+    #[error("cancelled")]
+    Cancelled,
+    /// A source kind this build does not implement (`SourceFor::Patch`, reserved).
+    #[error("unsupported stage source")]
+    Unsupported,
+    /// Anything else, a failure of the destination (disk full, permission) included.
+    #[error("{0}")]
+    Other(#[from] Error),
+}
+
 /// Every way the core rejects input or fails.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
