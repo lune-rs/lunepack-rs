@@ -1,9 +1,19 @@
 //! The testkit's own tests: the fakes pass the contract suites, and each fake rejects what it must.
 
+use std::io::{self, Read, Write};
+use std::net::TcpStream;
+use std::pin::pin;
+use std::sync::Arc;
+use std::task::{Context, Poll, Waker};
+use std::time::{Duration, Instant};
+
 use lunepack_core::error::{CodecError, SignatureError};
+use lunepack_core::fetch::classify;
 use lunepack_core::{
-    Clock, Codec, CodecId, DecodeReport, Encoder, Error, FrameView, Hasher, Sha256Digest,
-    SignatureAlg, Signer, StreamView, Verifier,
+    BlockingResponse, BlockingTransport, ByteRange, CancelToken, Clock, Codec, CodecId,
+    DecodeReport, Encoder, Error, FrameView, Hasher, Head, RangeError, Request, ResponseInfo,
+    Sha256Digest, SignatureAlg, Signer, StreamView, Transport, TransportError, TransportErrorKind,
+    Validator, Verifier,
 };
 use lunepack_testkit::*;
 
@@ -445,4 +455,661 @@ fn signer_suite_catches_a_non_deterministic_or_wrong_signer() {
     }
     let caught = std::panic::catch_unwind(|| run_signer_suite(&WrongKey, &FakeVerifier, b"x"));
     assert!(caught.is_err());
+}
+
+// ---- transports (M4 step 2) --------------------------------------------------------------------------
+
+/// A minimal HTTP/1.1 client over a raw `TcpStream`: the transport the loopback server is tested
+/// with, since the real adapter lives in `lunepack-http`. Follows up to 5 redirects, lowercases
+/// header names, keeps duplicates, reads the body by `content-length` or to the end of the
+/// connection, sends no `Accept-Encoding`, and checks the cancel token before connecting and before
+/// every read.
+struct RawTcpTransport;
+
+fn cancelled(url: &str) -> TransportError {
+    TransportError::new(TransportErrorKind::Cancelled, url, None)
+}
+
+struct RawBody {
+    stream: TcpStream,
+    buffered: Vec<u8>,
+    pos: usize,
+    remaining: Option<u64>,
+    cancel: CancelToken,
+    url: String,
+}
+
+impl Read for RawBody {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.cancel.is_cancelled() {
+            return Err(io::Error::other(cancelled(&self.url)));
+        }
+        if buf.is_empty() || self.remaining == Some(0) {
+            return Ok(0);
+        }
+        let n = if self.pos < self.buffered.len() {
+            let n = buf.len().min(self.buffered.len() - self.pos);
+            buf[..n].copy_from_slice(&self.buffered[self.pos..self.pos + n]);
+            self.pos += n;
+            n
+        } else {
+            self.stream.read(buf)?
+        };
+        if let Some(left) = self.remaining.as_mut() {
+            if n == 0 {
+                return Err(io::Error::other(TransportError::new(
+                    TransportErrorKind::Io,
+                    &self.url,
+                    Some("connection closed before content-length bytes".into()),
+                )));
+            }
+            *left = left.saturating_sub(n as u64);
+        }
+        Ok(n)
+    }
+}
+
+impl BlockingTransport for RawTcpTransport {
+    fn get(
+        &self,
+        request: &Request,
+        cancel: &CancelToken,
+    ) -> Result<BlockingResponse, TransportError> {
+        let io_err = |e: io::Error| {
+            TransportError::new(TransportErrorKind::Io, &request.url, Some(Box::new(e)))
+        };
+        let mut url = request.url.clone();
+        for _ in 0..=5 {
+            if cancel.is_cancelled() {
+                return Err(cancelled(&request.url));
+            }
+            let rest = url
+                .strip_prefix("http://")
+                .ok_or_else(|| TransportError::new(TransportErrorKind::Unsupported, &url, None))?;
+            let (authority, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+            let path = if path.is_empty() { "/" } else { path };
+            let mut stream = TcpStream::connect(authority).map_err(|e| {
+                TransportError::new(TransportErrorKind::Connect, &url, Some(Box::new(e)))
+            })?;
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .map_err(io_err)?;
+            let mut head = format!(
+                "GET {path} HTTP/1.1\r\nHost: {authority}\r\nUser-Agent: lunepack-test\r\n"
+            );
+            if let Some(range) = request.range {
+                head.push_str(&format!("Range: {}\r\n", range.header_value()));
+            }
+            if let Some(validator) = &request.if_range {
+                head.push_str(&format!("If-Range: {}\r\n", validator.header_value()));
+            }
+            head.push_str("Connection: close\r\n\r\n");
+            stream.write_all(head.as_bytes()).map_err(io_err)?;
+
+            // Read until the end of the response head.
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 4096];
+            let end = loop {
+                if let Some(at) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break at;
+                }
+                let n = stream.read(&mut tmp).map_err(io_err)?;
+                if n == 0 {
+                    return Err(TransportError::new(
+                        TransportErrorKind::Protocol,
+                        &url,
+                        Some("connection closed inside the head".into()),
+                    ));
+                }
+                buf.extend_from_slice(&tmp[..n]);
+            };
+            let text = String::from_utf8_lossy(&buf[..end]).into_owned();
+            let mut lines = text.split("\r\n");
+            let status: u16 = lines
+                .next()
+                .and_then(|l| l.split(' ').nth(1))
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| TransportError::new(TransportErrorKind::Protocol, &url, None))?;
+            let headers: Vec<(String, Vec<u8>)> = lines
+                .filter_map(|l| l.split_once(':'))
+                .map(|(n, v)| (n.trim().to_ascii_lowercase(), v.trim().as_bytes().to_vec()))
+                .collect();
+            if matches!(status, 301 | 302 | 303 | 307 | 308) {
+                let location = headers
+                    .iter()
+                    .find(|(n, _)| n == "location")
+                    .map(|(_, v)| String::from_utf8_lossy(v).into_owned())
+                    .unwrap_or_default();
+                url = if location.starts_with("http://") {
+                    location
+                } else {
+                    format!("http://{authority}{location}")
+                };
+                continue;
+            }
+            let remaining = headers
+                .iter()
+                .find(|(n, _)| n == "content-length")
+                .and_then(|(_, v)| std::str::from_utf8(v).ok()?.parse::<u64>().ok());
+            return Ok(BlockingResponse {
+                head: Head { status, headers },
+                body: Box::new(RawBody {
+                    stream,
+                    buffered: buf[end + 4..].to_vec(),
+                    pos: 0,
+                    remaining,
+                    cancel: cancel.clone(),
+                    url: request.url.clone(),
+                }),
+            });
+        }
+        Err(TransportError::new(
+            TransportErrorKind::Unsupported,
+            &request.url,
+            Some("too many redirects".into()),
+        ))
+    }
+}
+
+fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    let mut future = pin!(future);
+    let mut cx = Context::from_waker(Waker::noop());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Poll::Ready(v) = future.as_mut().poll(&mut cx) {
+            return v;
+        }
+        assert!(Instant::now() < deadline, "future still pending after 10 s");
+        std::thread::yield_now();
+    }
+}
+
+const LARGE: &str = TransportFixture::LARGE;
+
+fn url(name: &str) -> String {
+    format!("{FAKE_BASE_URL}/{name}")
+}
+
+fn request(name: &str, range: Option<ByteRange>, if_range: Option<Validator>) -> Request {
+    Request {
+        url: url(name),
+        range,
+        if_range,
+    }
+}
+
+fn first_100() -> Option<ByteRange> {
+    Some(ByteRange {
+        first: 0,
+        last: Some(99),
+    })
+}
+
+/// A whole response through the blocking fake: the head and the body (or the first body error).
+fn fetch_blocking(
+    t: &FakeBlockingTransport,
+    request: &Request,
+) -> (Head, Result<Vec<u8>, io::Error>) {
+    let response = t.get(request, &CancelToken::new()).expect("a response");
+    let mut body = Vec::new();
+    let result = response.body.take(8 * 1024 * 1024).read_to_end(&mut body);
+    (response.head, result.map(|_| body))
+}
+
+fn info_of(head: &Head) -> Result<ResponseInfo, RangeError> {
+    ResponseInfo::from_head(head)
+}
+
+#[test]
+fn the_blocking_fake_passes_the_blocking_suite() {
+    let t = FakeBlockingTransport::fixture();
+    run_blocking_transport_suite(&t, FAKE_BASE_URL, &|| t.requests());
+}
+
+#[test]
+fn the_async_fake_passes_the_async_suite() {
+    let t = FakeTransport::fixture();
+    run_transport_suite(&t, FAKE_BASE_URL, &|| t.requests());
+}
+
+#[test]
+fn the_loopback_server_passes_the_suite_through_a_raw_tcp_client() {
+    let server = LoopbackServer::fixture().expect("bind");
+    run_blocking_transport_suite(&RawTcpTransport, &server.base_url(), &|| {
+        server.origin().requests()
+    });
+}
+
+#[test]
+fn the_suites_catch_a_transport_that_breaks_the_contract() {
+    // A fake that ignores Range answers 200 to a range request: the suite must fail.
+    let broken = std::panic::catch_unwind(|| {
+        let t = FakeBlockingTransport::fixture().with_fault(TransportFault::IgnoreRange);
+        run_blocking_transport_suite(&t, FAKE_BASE_URL, &|| t.requests());
+    });
+    assert!(
+        broken.is_err(),
+        "the suite passed a transport that ignores Range"
+    );
+    // ...and one that gzips.
+    let broken = std::panic::catch_unwind(|| {
+        let t = FakeTransport::fixture().with_fault(TransportFault::GzipEncoded);
+        run_transport_suite(&t, FAKE_BASE_URL, &|| t.requests());
+    });
+    assert!(
+        broken.is_err(),
+        "the suite passed a transport that sends content-encoding"
+    );
+}
+
+#[test]
+fn the_suites_catch_a_transport_that_sends_accept_encoding() {
+    let t = FakeBlockingTransport::fixture();
+    let broken = std::panic::catch_unwind(|| {
+        run_blocking_transport_suite(&t, FAKE_BASE_URL, &|| {
+            let mut log = t.requests();
+            for r in &mut log {
+                r.accept_encoding = Some("gzip".to_owned());
+            }
+            log
+        });
+    });
+    assert!(broken.is_err());
+}
+
+#[test]
+fn every_fake_logs_what_it_was_sent() {
+    let t = FakeBlockingTransport::fixture();
+    let etag = Validator::from_etag(b"\"x\"").unwrap();
+    let _ = fetch_blocking(&t, &request(LARGE, first_100(), Some(etag)));
+    let log = t.requests();
+    assert_eq!(log.len(), 1);
+    assert_eq!(log[0].url, format!("/{LARGE}"));
+    assert_eq!(log[0].range, first_100());
+    assert_eq!(log[0].range_header.as_deref(), Some("bytes=0-99"));
+    assert_eq!(log[0].if_range.as_deref(), Some("\"x\""));
+    assert_eq!(log[0].accept_encoding, None);
+    // A redirect logs both hops.
+    t.origin().clear_requests();
+    let _ = fetch_blocking(&t, &request(TransportFixture::ALIAS, None, None));
+    assert_eq!(t.requests().len(), 2);
+}
+
+#[test]
+fn faults_through_the_blocking_fake() {
+    let len = TransportFixture::LARGE_LEN as u64;
+    let with = |f: TransportFault| FakeBlockingTransport::fixture().with_fault(f);
+
+    // IgnoreRange: 200 with everything.
+    let t = with(TransportFault::IgnoreRange);
+    let (head, body) = fetch_blocking(&t, &request(LARGE, first_100(), None));
+    assert_eq!(head.status, 200);
+    assert_eq!(body.unwrap().len() as u64, len);
+    assert_eq!(
+        classify(first_100(), &info_of(&head).unwrap(), len, 100),
+        Ok(lunepack_core::Outcome::Full)
+    );
+
+    // WrongContentRange and NoContentRange are refused by the core's rules.
+    let t = with(TransportFault::WrongContentRange);
+    let (head, _) = fetch_blocking(&t, &request(LARGE, first_100(), None));
+    assert_eq!(head.status, 206);
+    assert!(matches!(
+        classify(first_100(), &info_of(&head).unwrap(), len, 100),
+        Err(RangeError::ContentRangeMismatch { .. })
+    ));
+    let t = with(TransportFault::NoContentRange);
+    let (head, _) = fetch_blocking(&t, &request(LARGE, first_100(), None));
+    assert_eq!(
+        classify(first_100(), &info_of(&head).unwrap(), len, 100),
+        Err(RangeError::ContentRangeMissing)
+    );
+
+    // TruncateAfter: content-length says more than arrives.
+    let t = with(TransportFault::TruncateAfter(10));
+    let (head, body) = fetch_blocking(&t, &request(LARGE, None, None));
+    assert_eq!(body.unwrap().len(), 10);
+    assert_eq!(info_of(&head).unwrap().content_length, Some(len));
+
+    // Endless: more than the file, no end, no content-length.
+    let t = with(TransportFault::Endless);
+    let (head, body) = fetch_blocking(&t, &request(LARGE, None, None));
+    assert_eq!(info_of(&head).unwrap().content_length, None);
+    assert_eq!(
+        body.unwrap().len(),
+        8 * 1024 * 1024,
+        "stopped only by the test's cap"
+    );
+
+    // ExtraBytes.
+    let t = with(TransportFault::ExtraBytes(7));
+    let (head, body) = fetch_blocking(&t, &request(LARGE, None, None));
+    assert_eq!(info_of(&head).unwrap().content_length, None);
+    assert_eq!(body.unwrap().len() as u64, len + 7);
+
+    // Status.
+    let t = with(TransportFault::Status(503));
+    let (head, body) = fetch_blocking(&t, &request(LARGE, None, None));
+    assert_eq!(head.status, 503);
+    assert!(body.unwrap().is_empty());
+
+    // GzipEncoded and DuplicateHeader are refused by the core's rules.
+    let t = with(TransportFault::GzipEncoded);
+    let (head, _) = fetch_blocking(&t, &request(LARGE, None, None));
+    assert_eq!(info_of(&head), Err(RangeError::ContentCoding));
+    let t = with(TransportFault::DuplicateHeader("etag"));
+    let (head, _) = fetch_blocking(&t, &request(LARGE, None, None));
+    assert_eq!(
+        info_of(&head),
+        Err(RangeError::DuplicateHeader { name: "etag" })
+    );
+    // A header the answer lacks is added twice.
+    let t = with(TransportFault::DuplicateHeader("x-new"));
+    let (head, _) = fetch_blocking(&t, &request(LARGE, None, None));
+    assert_eq!(head.headers.iter().filter(|(n, _)| n == "x-new").count(), 2);
+
+    // ErrorAfter: n good bytes, then an I/O error that carries a TransportError.
+    let t = with(TransportFault::ErrorAfter(10));
+    let response = t
+        .get(&request(LARGE, None, None), &CancelToken::new())
+        .unwrap();
+    let mut body = response.body;
+    let mut got = Vec::new();
+    let err = body.read_to_end(&mut got).unwrap_err();
+    assert_eq!(got.len(), 10);
+    let inner = err
+        .get_ref()
+        .unwrap()
+        .downcast_ref::<TransportError>()
+        .unwrap();
+    assert_eq!(inner.kind, TransportErrorKind::Io);
+}
+
+#[test]
+fn change_etag_after_makes_the_old_validator_stale() {
+    let t = FakeBlockingTransport::fixture().with_fault(TransportFault::ChangeETagAfter(1));
+    let (head, _) = fetch_blocking(&t, &request(LARGE, None, None));
+    let validator = info_of(&head).unwrap().validator.unwrap();
+    let (head, body) = fetch_blocking(&t, &request(LARGE, first_100(), Some(validator.clone())));
+    assert_eq!(head.status, 200, "the tag changed, so If-Range fails");
+    assert_eq!(body.unwrap().len(), TransportFixture::LARGE_LEN);
+    assert_ne!(info_of(&head).unwrap().validator, Some(validator));
+}
+
+#[test]
+fn slow_chunks_deliver_one_byte_at_a_time_through_the_async_fake() {
+    let t = FakeTransport::fixture().with_fault(TransportFault::SlowChunks);
+    block_on(async {
+        let mut response = t
+            .get(request(TransportFixture::ONE_BYTE, None, None))
+            .await
+            .unwrap();
+        assert_eq!(response.body.next_chunk().await.unwrap(), Some(vec![0x41]));
+        assert_eq!(response.body.next_chunk().await.unwrap(), None);
+        let mut response = t.get(request(LARGE, first_100(), None)).await.unwrap();
+        let mut sizes = Vec::new();
+        while let Some(chunk) = response.body.next_chunk().await.unwrap() {
+            sizes.push(chunk.len());
+        }
+        assert_eq!(sizes, vec![1; 100]);
+    });
+}
+
+#[test]
+fn pending_forever_never_resolves_next_chunk() {
+    let t = FakeTransport::fixture().with_fault(TransportFault::PendingForever);
+    let mut cx = Context::from_waker(Waker::noop());
+    let mut response = block_on(t.get(request(LARGE, None, None))).unwrap();
+    let mut chunk = response.body.next_chunk();
+    for _ in 0..1000 {
+        assert!(matches!(chunk.as_mut().poll(&mut cx), Poll::Pending));
+    }
+}
+
+#[test]
+fn the_async_fake_reports_error_after_and_endless() {
+    let t = FakeTransport::fixture().with_fault(TransportFault::ErrorAfter(10));
+    block_on(async {
+        let mut response = t.get(request(LARGE, None, None)).await.unwrap();
+        let mut got = 0;
+        let err = loop {
+            match response.body.next_chunk().await {
+                Ok(Some(chunk)) => got += chunk.len(),
+                Ok(None) => panic!("the body ended without the error"),
+                Err(e) => break e,
+            }
+        };
+        assert_eq!((got, err.kind), (10, TransportErrorKind::Io));
+    });
+    let t = FakeTransport::fixture().with_fault(TransportFault::Endless);
+    block_on(async {
+        let mut response = t.get(request(LARGE, None, None)).await.unwrap();
+        let mut got = 0usize;
+        while got < 1_000_000 {
+            got += response
+                .body
+                .next_chunk()
+                .await
+                .unwrap()
+                .expect("endless")
+                .len();
+        }
+    });
+}
+
+#[test]
+fn the_blocking_fake_stops_a_read_when_cancelled() {
+    let t = FakeBlockingTransport::fixture().with_fault(TransportFault::Endless);
+    let cancel = CancelToken::new();
+    let mut response = t.get(&request(LARGE, None, None), &cancel).unwrap();
+    let mut buf = [0u8; 4096];
+    assert!(response.body.read(&mut buf).unwrap() > 0);
+    cancel.cancel();
+    let err = response.body.read(&mut buf).unwrap_err();
+    let inner = err
+        .get_ref()
+        .unwrap()
+        .downcast_ref::<TransportError>()
+        .unwrap();
+    assert_eq!(inner.kind, TransportErrorKind::Cancelled);
+    // And before the request.
+    assert_eq!(
+        t.get(&request(LARGE, None, None), &cancel)
+            .unwrap_err()
+            .kind,
+        TransportErrorKind::Cancelled
+    );
+}
+
+#[test]
+fn fakes_refuse_urls_without_a_scheme_and_follow_at_most_five_redirects() {
+    let t = FakeBlockingTransport::fixture();
+    let err = t
+        .get(
+            &Request {
+                url: "large.bin".to_owned(),
+                range: None,
+                if_range: None,
+            },
+            &CancelToken::new(),
+        )
+        .unwrap_err();
+    assert_eq!(err.kind, TransportErrorKind::Unsupported);
+    t.origin().redirect("/loop-a", "/loop-b");
+    t.origin().redirect("/loop-b", "/loop-a");
+    let err = t
+        .get(&request("loop-a", None, None), &CancelToken::new())
+        .unwrap_err();
+    assert_eq!(err.kind, TransportErrorKind::Unsupported);
+}
+
+#[test]
+fn the_fake_transports_are_object_safe_and_shareable() {
+    let a: Arc<dyn Transport> = Arc::new(FakeTransport::fixture());
+    let b: Arc<dyn BlockingTransport> = Arc::new(FakeBlockingTransport::fixture());
+    let (a2, b2) = (a.clone(), b.clone());
+    std::thread::spawn(move || {
+        drop(a2.get(request(LARGE, None, None)));
+        let _ = b2.get(&request(LARGE, None, None), &CancelToken::new());
+    })
+    .join()
+    .unwrap();
+}
+
+// ---- the loopback server ------------------------------------------------------------------------------
+
+fn raw(server: &LoopbackServer, name: &str, range: Option<ByteRange>) -> (Head, Vec<u8>) {
+    let request = Request {
+        url: server.url(name),
+        range,
+        if_range: None,
+    };
+    let mut response = RawTcpTransport
+        .get(&request, &CancelToken::new())
+        .expect("a response");
+    let mut body = Vec::new();
+    response.body.read_to_end(&mut body).expect("body");
+    (response.head, body)
+}
+
+#[test]
+fn the_loopback_server_binds_only_to_127_0_0_1() {
+    let server = LoopbackServer::fixture().unwrap();
+    assert!(server.addr().ip().is_loopback() && server.addr().is_ipv4());
+    assert!(server.base_url().starts_with("http://127.0.0.1:"));
+}
+
+#[test]
+fn the_loopback_server_answers_404_and_redirects_and_ranges() {
+    let server = LoopbackServer::fixture().unwrap();
+    let (head, _) = raw(&server, "nope.bin", None);
+    assert_eq!(head.status, 404);
+    let large = TransportFixture::bytes(LARGE).unwrap();
+    let (head, body) = raw(&server, TransportFixture::ALIAS, None);
+    assert_eq!((head.status, body), (200, large.clone()));
+    let (head, body) = raw(
+        &server,
+        LARGE,
+        Some(ByteRange {
+            first: 10,
+            last: Some(19),
+        }),
+    );
+    assert_eq!((head.status, body), (206, large[10..20].to_vec()));
+    // An unsatisfiable range.
+    let (head, _) = raw(
+        &server,
+        LARGE,
+        Some(ByteRange {
+            first: large.len() as u64,
+            last: None,
+        }),
+    );
+    assert_eq!(head.status, 416);
+    // A user-added file and redirect.
+    server.origin().put("/new/file", b"hello".to_vec());
+    server.origin().redirect("/old", "/new/file");
+    assert_eq!(raw(&server, "old", None).1, b"hello");
+}
+
+#[test]
+fn the_loopback_server_puts_faults_on_the_wire() {
+    let server = LoopbackServer::fixture().unwrap();
+    let len = TransportFixture::LARGE_LEN;
+
+    // One byte per chunk still delivers the whole body.
+    server.origin().set_faults(vec![TransportFault::SlowChunks]);
+    let (_, body) = raw(&server, TransportFixture::ONE_BYTE, None);
+    assert_eq!(body, [0x41]);
+    let (_, body) = raw(
+        &server,
+        LARGE,
+        Some(ByteRange {
+            first: 0,
+            last: Some(999),
+        }),
+    );
+    assert_eq!(body.len(), 1000);
+
+    // ExtraBytes: no content-length, the connection close ends a longer body.
+    server
+        .origin()
+        .set_faults(vec![TransportFault::ExtraBytes(5)]);
+    let (head, body) = raw(&server, LARGE, None);
+    assert!(head.headers.iter().all(|(n, _)| n != "content-length"));
+    assert_eq!(body.len(), len + 5);
+
+    // Truncation and an error both end the body early while content-length promises more.
+    for fault in [
+        TransportFault::TruncateAfter(10),
+        TransportFault::ErrorAfter(10),
+    ] {
+        server.origin().set_faults(vec![fault.clone()]);
+        let request = Request {
+            url: server.url(LARGE),
+            range: None,
+            if_range: None,
+        };
+        let mut response = RawTcpTransport.get(&request, &CancelToken::new()).unwrap();
+        let mut body = Vec::new();
+        let result = response.body.read_to_end(&mut body);
+        assert!(
+            result.is_err(),
+            "{fault:?}: a short body must be an error, got {} bytes",
+            body.len()
+        );
+        assert_eq!(body.len(), 10, "{fault:?}");
+    }
+
+    // Status and content-encoding.
+    server
+        .origin()
+        .set_faults(vec![TransportFault::Status(503)]);
+    assert_eq!(raw(&server, LARGE, None).0.status, 503);
+    server
+        .origin()
+        .set_faults(vec![TransportFault::GzipEncoded]);
+    assert_eq!(
+        info_of(&raw(&server, LARGE, None).0),
+        Err(RangeError::ContentCoding)
+    );
+    server
+        .origin()
+        .set_faults(vec![TransportFault::DuplicateHeader("etag")]);
+    assert!(info_of(&raw(&server, LARGE, None).0).is_err());
+}
+
+#[test]
+fn the_loopback_server_logs_requests() {
+    let server = LoopbackServer::fixture().unwrap();
+    raw(&server, LARGE, first_100());
+    let log = server.origin().requests();
+    assert_eq!(log.len(), 1);
+    assert_eq!(log[0].url, format!("/{LARGE}"));
+    assert_eq!(log[0].range, first_100());
+    assert_eq!(log[0].accept_encoding, None);
+}
+
+#[test]
+fn dropping_the_loopback_server_stops_it_within_a_second() {
+    let server = LoopbackServer::fixture().unwrap();
+    let addr = server.addr();
+    // A connection that never sends a request, and an endless download nobody reads.
+    let _stalled = TcpStream::connect(addr).unwrap();
+    server.origin().set_faults(vec![TransportFault::Endless]);
+    let mut endless = TcpStream::connect(addr).unwrap();
+    write!(endless, "GET /{LARGE} HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+    let mut buf = [0u8; 16];
+    endless.read_exact(&mut buf).unwrap();
+    let started = Instant::now();
+    drop(server);
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "stopping took {:?}",
+        started.elapsed()
+    );
+    assert!(
+        TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_err(),
+        "the port still accepts connections"
+    );
 }

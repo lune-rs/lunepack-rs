@@ -1,16 +1,20 @@
 //! Contract suites: one function per trait, run by every adapter's `tests/` against its real
 //! implementation and by this crate against the fakes. They panic (assert) on a violation.
 
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 
 use lunepack_core::encoding::{base64_encode, hex_encode};
 use lunepack_core::error::FrameError;
+use lunepack_core::fetch::classify;
 use lunepack_core::frame::{MAX_DICT_SIZE, MIN_DICT_SIZE};
 use lunepack_core::{
-    Clock, Codec, CodecId, DecodeReport, EncodedFrame, Encoder, Error, FrameDesc, FrameView,
-    Hasher, Sha256Digest, SignatureAlg, Signer, StreamDesc, StreamView, U53, Verifier,
-    decode_verified,
+    BlockingTransport, ByteRange, CancelToken, Clock, Codec, CodecId, DecodeReport, EncodedFrame,
+    Encoder, Error, FrameDesc, FrameView, Hasher, Head, Outcome, Request, ResponseInfo,
+    Sha256Digest, SignatureAlg, Signer, StreamDesc, StreamView, Transport, TransportError,
+    TransportErrorKind, U53, Validator, Verifier, decode_verified,
 };
+
+use crate::transport::{SeenRequest, TransportFixture, block_on};
 
 /// A hash known answer: the input and its digest in lowercase hex.
 #[derive(Debug, Clone, Copy)]
@@ -766,4 +770,309 @@ fn long_distance_case(
     }
     let res = through_core(hasher, codec, &desc, &enc.bytes, input, &mut Vec::new());
     assert!(res.is_err(), "{ctx}: decoded with a dictionary of 4096");
+}
+
+// ---- transport suites (M4 step 2) -----------------------------------------------------------------
+
+/// How a suite gets one whole response from the transport under test.
+trait SuiteClient {
+    fn fetch(&self, request: Request) -> Result<(Head, Vec<u8>), TransportError>;
+}
+
+struct BlockingClient<'a>(&'a dyn BlockingTransport);
+
+impl SuiteClient for BlockingClient<'_> {
+    fn fetch(&self, request: Request) -> Result<(Head, Vec<u8>), TransportError> {
+        let response = self.0.get(&request, &CancelToken::new())?;
+        let mut body = Vec::new();
+        let mut reader = response.body;
+        reader.read_to_end(&mut body).map_err(|e| {
+            match e
+                .get_ref()
+                .and_then(|inner| inner.downcast_ref::<TransportError>())
+            {
+                Some(_) => {
+                    TransportError::new(TransportErrorKind::Io, &request.url, Some(e.into()))
+                }
+                None => panic!("body read failed with a plain I/O error: {e}"),
+            }
+        })?;
+        Ok((response.head, body))
+    }
+}
+
+struct AsyncClient<'a>(&'a dyn Transport);
+
+impl SuiteClient for AsyncClient<'_> {
+    fn fetch(&self, request: Request) -> Result<(Head, Vec<u8>), TransportError> {
+        let future = self.0.get(request);
+        block_on(async move {
+            let mut response = future.await?;
+            let mut body = Vec::new();
+            while let Some(chunk) = response.body.next_chunk().await? {
+                assert!(!chunk.is_empty(), "a body chunk is never empty");
+                body.extend_from_slice(&chunk);
+            }
+            Ok((response.head, body))
+        })
+    }
+}
+
+fn get(
+    client: &dyn SuiteClient,
+    base: &str,
+    name: &str,
+    range: Option<ByteRange>,
+    if_range: Option<Validator>,
+) -> (Head, Vec<u8>) {
+    let url = format!("{}/{name}", base.trim_end_matches('/'));
+    client
+        .fetch(Request {
+            url,
+            range,
+            if_range,
+        })
+        .unwrap_or_else(|e| panic!("GET {name} {range:?} failed: {e}"))
+}
+
+fn bounded(first: u64, last: u64) -> Option<ByteRange> {
+    Some(ByteRange {
+        first,
+        last: Some(last),
+    })
+}
+
+fn transport_cases(client: &dyn SuiteClient, base: &str, seen: &dyn Fn() -> Vec<SeenRequest>) {
+    let large = TransportFixture::bytes(TransportFixture::LARGE).expect("fixture");
+    let len = large.len() as u64;
+
+    // Whole files, with their exact bytes.
+    for name in [
+        TransportFixture::EMPTY,
+        TransportFixture::ONE_BYTE,
+        TransportFixture::LARGE,
+    ] {
+        let (head, body) = get(client, base, name, None, None);
+        assert_eq!(head.status, 200, "{name}: status");
+        assert_eq!(
+            body,
+            TransportFixture::bytes(name).expect("fixture"),
+            "{name}: body"
+        );
+    }
+    let (head, _) = get(client, base, TransportFixture::LARGE, None, None);
+    let info = ResponseInfo::from_head(&head).expect("a plain 200 passes the response rules");
+    assert_eq!(
+        info.content_length,
+        Some(len),
+        "content-length of the large file"
+    );
+    let Some(Validator::StrongETag(etag)) = info.validator.clone() else {
+        panic!("the large file's answer has no strong etag: {head:?}");
+    };
+
+    // A closed range: 206 with the exact content-range.
+    let first_100 = bounded(0, 99);
+    let (head, body) = get(client, base, TransportFixture::LARGE, first_100, None);
+    assert_eq!(head.status, 206, "range 0-99: status");
+    assert_eq!(body, &large[..100], "range 0-99: body");
+    let range_value = head
+        .headers
+        .iter()
+        .find(|(n, _)| n == "content-range")
+        .map(|(_, v)| v.clone());
+    assert_eq!(
+        range_value.as_deref(),
+        Some(format!("bytes 0-99/{len}").as_bytes()),
+        "range 0-99: content-range"
+    );
+    let info = ResponseInfo::from_head(&head).expect("a 206 passes the response rules");
+    assert_eq!(
+        classify(first_100, &info, len, 100),
+        Ok(Outcome::Partial { first: 0, last: 99 }),
+        "range 0-99: classify"
+    );
+
+    // An open range.
+    let from = len - 1000;
+    let (head, body) = get(
+        client,
+        base,
+        TransportFixture::LARGE,
+        Some(ByteRange {
+            first: from,
+            last: None,
+        }),
+        None,
+    );
+    assert_eq!(head.status, 206, "open range: status");
+    assert_eq!(body, &large[from as usize..], "open range: body");
+    let info = ResponseInfo::from_head(&head).expect("rules");
+    assert_eq!(
+        info.content_range.map(|c| (c.first, c.last, c.total)),
+        Some((from, len - 1, len)),
+        "open range: content-range"
+    );
+
+    // If-Range: the current validators keep the range, a stale one drops it.
+    let (head, body) = get(
+        client,
+        base,
+        TransportFixture::LARGE,
+        first_100,
+        Some(Validator::StrongETag(etag.clone())),
+    );
+    assert_eq!(head.status, 206, "If-Range with the current etag: status");
+    assert_eq!(body, &large[..100], "If-Range with the current etag: body");
+    let last_modified = head
+        .headers
+        .iter()
+        .find(|(n, _)| n == "last-modified")
+        .and_then(|(_, v)| Validator::from_last_modified(v))
+        .expect("the answer has a last-modified");
+    let (head, _) = get(
+        client,
+        base,
+        TransportFixture::LARGE,
+        first_100,
+        Some(last_modified),
+    );
+    assert_eq!(
+        head.status, 206,
+        "If-Range with the current last-modified: status"
+    );
+    let stale = Validator::from_etag(b"\"stale\"").expect("a strong tag");
+    let (head, body) = get(
+        client,
+        base,
+        TransportFixture::LARGE,
+        first_100,
+        Some(stale),
+    );
+    assert_eq!(head.status, 200, "If-Range with a stale etag: status");
+    assert_eq!(body, large, "If-Range with a stale etag: the full body");
+    assert!(
+        head.headers.iter().all(|(n, _)| n != "content-range"),
+        "a 200 has no content-range"
+    );
+
+    // A missing name is a 404 head, not an error.
+    let (head, _) = get(client, base, TransportFixture::MISSING, None, None);
+    assert_eq!(head.status, 404, "missing file");
+
+    // A redirect is followed to the final response.
+    let (head, body) = get(client, base, TransportFixture::ALIAS, None, None);
+    assert_eq!(head.status, 200, "redirect: final status");
+    assert_eq!(body, large, "redirect: final body");
+
+    // Header names are lowercase and a duplicate arrives twice, in order.
+    let (head, _) = get(client, base, TransportFixture::DUPLICATE, None, None);
+    assert!(
+        head.headers
+            .iter()
+            .all(|(n, _)| *n == n.to_ascii_lowercase()),
+        "header names are lowercased: {head:?}"
+    );
+    let dups: Vec<&[u8]> = head
+        .headers
+        .iter()
+        .filter(|(n, _)| n == "x-dup")
+        .map(|(_, v)| v.as_slice())
+        .collect();
+    assert_eq!(
+        dups,
+        [&b"one"[..], b"two"],
+        "a duplicate header arrives twice"
+    );
+    assert!(
+        head.headers
+            .iter()
+            .any(|(n, v)| n == "x-mixed-case" && v == b"v"),
+        "a mixed-case header arrives lowercased: {head:?}"
+    );
+
+    // What was sent: no accept-encoding anywhere, and the range and validator exactly as given.
+    let log = seen();
+    assert!(!log.is_empty(), "the request log is empty");
+    assert!(
+        log.iter().all(|r| r.accept_encoding.is_none()),
+        "a request carried accept-encoding: {log:?}"
+    );
+    let large_url = format!("/{}", TransportFixture::LARGE);
+    assert!(
+        log.iter().any(|r| r.url.ends_with(&large_url)
+            && r.range_header.as_deref() == Some("bytes=0-99")
+            && r.if_range.is_none()),
+        "no request with exactly Range: bytes=0-99: {log:?}"
+    );
+    assert!(
+        log.iter()
+            .any(|r| r.range_header.as_deref() == Some(format!("bytes={from}-").as_str())),
+        "no request with the open range: {log:?}"
+    );
+    assert!(
+        log.iter()
+            .any(|r| r.if_range.as_deref() == Some(etag.as_str())),
+        "no request with If-Range: {etag}: {log:?}"
+    );
+    assert!(
+        log.iter()
+            .any(|r| r.url.ends_with(&format!("/{}", TransportFixture::ALIAS)))
+            && log.iter().filter(|r| r.url.ends_with(&large_url)).count() >= 2,
+        "the redirect hop was not logged: {log:?}"
+    );
+}
+
+/// Transport contract for the sync trait. `base_url` serves [`TransportFixture`] (for a real
+/// server, `LoopbackServer::fixture`; for a fake, its `fixture()` and `FAKE_BASE_URL`), and `seen`
+/// returns the requests the server saw (`FakeOrigin::requests`). Checks:
+///
+/// 1. whole files (0 B, 1 B, 100 KiB) arrive with their exact bytes;
+/// 2. `Range: bytes=0-99` is a `206` with `content-range: bytes 0-99/<len>` that passes the core's
+///    response rules, and an open range `first-` works;
+/// 3. `If-Range` with the current `ETag` or `Last-Modified` keeps the range (`206`), a stale
+///    `ETag` gives `200` with the full body;
+/// 4. a missing name is a `404` head, not an error;
+/// 5. a `302` is followed;
+/// 6. header names arrive lowercased and a duplicated header arrives twice;
+/// 7. no `Accept-Encoding` is ever sent, and the range and validator reach the server exactly as
+///    given;
+/// 8. a `CancelToken` cancelled before `get` fails with `TransportErrorKind::Cancelled`.
+pub fn run_blocking_transport_suite(
+    transport: &dyn BlockingTransport,
+    base_url: &str,
+    seen: &dyn Fn() -> Vec<SeenRequest>,
+) {
+    transport_cases(&BlockingClient(transport), base_url, seen);
+    let cancel = CancelToken::new();
+    cancel.cancel();
+    let url = format!(
+        "{}/{}",
+        base_url.trim_end_matches('/'),
+        TransportFixture::LARGE
+    );
+    let request = Request {
+        url,
+        range: None,
+        if_range: None,
+    };
+    match transport.get(&request, &cancel) {
+        Err(e) => assert_eq!(
+            e.kind,
+            TransportErrorKind::Cancelled,
+            "a cancelled token before get: {e}"
+        ),
+        Ok(_) => panic!("get succeeded with a cancelled token"),
+    }
+}
+
+/// Transport contract for the async trait: checks 1 to 7 of [`run_blocking_transport_suite`] (the
+/// async `get` takes no token, so cancellation there is dropping the future). The futures are
+/// driven by a std-only `block_on` private to the testkit.
+pub fn run_transport_suite(
+    transport: &dyn Transport,
+    base_url: &str,
+    seen: &dyn Fn() -> Vec<SeenRequest>,
+) {
+    transport_cases(&AsyncClient(transport), base_url, seen);
 }
