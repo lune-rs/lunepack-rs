@@ -213,6 +213,19 @@ pub struct FetchCtx {
     pub policy: FetchPolicy,
 }
 
+impl FetchCtx {
+    /// Adds `total` bytes to the download's total and `done` of them to its done count: the part of
+    /// the work that is on disk already, or about to be requested (`done` = 0).
+    fn progress_have(&self, total: u64, done: u64) {
+        if let Some(p) = &self.progress {
+            p.add_total(total);
+            if done > 0 {
+                p.add_done(done);
+            }
+        }
+    }
+}
+
 impl std::fmt::Debug for FetchCtx {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FetchCtx")
@@ -350,9 +363,13 @@ pub async fn download(
     let (pack_ready, complete) = {
         let frames = frames.clone();
         let pack = pack.clone();
+        let hasher = Arc::clone(&ctx.hasher);
         job(ctx, "cache-state", move || {
             cache.ensure_dirs()?;
-            let pack_ready = cache.is_complete(CacheKind::Pack, &pack.sha256, pack.size)?;
+            // A cached pack is used only after its SHA-256 matches (M4-D17); a mismatch deletes it
+            // and the download goes on as if it were absent.
+            let pack_ready = cache.is_complete(CacheKind::Pack, &pack.sha256, pack.size)?
+                && cache.verify_complete(CacheKind::Pack, &pack.sha256, &*hasher)?;
             let complete = frames
                 .iter()
                 .map(|f| cache.is_complete(CacheKind::Frame, &f.sha256, f.length))
@@ -363,12 +380,15 @@ pub async fn download(
     };
     let mut fetched = Fetched::default();
     if pack_ready {
+        // Bytes already on disk count as done up front, so total and done agree (F1).
+        ctx.progress_have(pack.size, pack.size);
         fetched.pack = Some(ctx.cache.path(CacheKind::Pack, &pack.sha256));
         return Ok(fetched);
     }
     let mut missing = Vec::new();
     for (frame, done) in frames.into_iter().zip(complete) {
         if done {
+            ctx.progress_have(frame.length, frame.length);
             fetched.frames.insert(
                 frame.sha256,
                 ctx.cache.path(CacheKind::Frame, &frame.sha256),
@@ -386,7 +406,10 @@ pub async fn download(
             fetched.pack = Some(fetch_pack(ctx, pack, None).await?);
         }
         FetchPlan::Runs(runs) => {
-            for run in runs {
+            // The request is the runs, gaps merged into them included.
+            let run_bytes: Vec<u64> = runs.iter().map(|r| r.last - r.first + 1).collect();
+            ctx.progress_have(run_bytes.iter().fold(0, |s, b| s.saturating_add(*b)), 0);
+            for (k, run) in runs.into_iter().enumerate() {
                 let run_frames: Vec<FrameNeed> =
                     run.frames.iter().map(|&i| missing[i].clone()).collect();
                 match fetch_run(ctx, pack, &run, &run_frames).await? {
@@ -402,6 +425,11 @@ pub async fn download(
                         fetched.bad.extend(bad);
                     }
                     FetchOutcome::RangeIgnored(response) => {
+                        // The runs not fetched are replaced by the whole pack, which
+                        // `fetch_pack` adds to the total.
+                        if let Some(p) = &ctx.progress {
+                            p.sub_total(run_bytes[k..].iter().fold(0, |s, b| s.saturating_add(*b)));
+                        }
                         fetched.pack = Some(fetch_pack(ctx, pack, Some(response)).await?);
                         return Ok(fetched);
                     }
@@ -592,6 +620,10 @@ pub async fn fetch_run(
         Outcome::Full => return Ok(FetchOutcome::RangeIgnored(response)),
         Outcome::Partial { .. } => {}
     }
+    // The run's total includes the resumed bytes, which are on disk already.
+    if let Some(p) = &ctx.progress {
+        p.add_done(have);
+    }
     let targets: Vec<RunTarget> = frames
         .iter()
         .enumerate()
@@ -685,6 +717,8 @@ pub async fn fetch_pack(
             }
         };
         let expected = pack.size - resume_from;
+        // The whole pack is this download's work, the resumed part already done (F1).
+        ctx.progress_have(pack.size, resume_from);
         let validator = match &response {
             Some(r) => ResponseInfo::from_head(&r.head)?.validator,
             None => None,

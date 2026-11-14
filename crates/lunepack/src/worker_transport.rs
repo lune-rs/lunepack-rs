@@ -62,7 +62,8 @@ impl<T: BlockingTransport + 'static> WorkerTransport<T> {
     }
 
     /// A handle for one operation: every request job it starts holds a clone of `lock` until the
-    /// job ends (M4-D15).
+    /// job ends (M4-D15). Used by the updater; not part of the supported API.
+    #[doc(hidden)]
     pub fn for_op(&self, lock: &OpLock) -> Self {
         WorkerTransport {
             inner: Arc::clone(&self.inner),

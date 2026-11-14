@@ -14,10 +14,11 @@ use std::task::{Context, Poll, Wake, Waker};
 use std::thread::{self, Thread};
 use std::time::{Duration, Instant};
 
-use lunepack::{
-    ABSENT_ROOT_STATUSES, Cache, CacheKind, Error, FeedUrls, FetchCtx, FrameNeed, PackTarget,
-    acquire_op_lock, block_on, download, fetch_document, fetch_pack, fetch_root_doc, live_workers,
+use lunepack::unstable_internals::{
+    ABSENT_ROOT_STATUSES, Cache, CacheKind, FeedUrls, FetchCtx, FrameNeed, PackTarget,
+    acquire_op_lock, download, fetch_document, fetch_pack, fetch_root_doc, live_workers,
 };
+use lunepack::{Error, block_on};
 use lunepack_core::fetch::FetchPolicy;
 use lunepack_core::{
     Body, BoxFuture, CancelToken, Channel, DirEntryInfo, FileWrite, Fs, FsError, Hasher, LockGuard,
@@ -1024,12 +1025,89 @@ fn a_changed_etag_on_a_run_resume_falls_back_to_the_full_pack() {
 fn downloaded_bytes_are_reported_to_the_progress_sink() {
     let _s = serial();
     let mut r = rig();
-    let (sink, mut pump) = lunepack::progress(lunepack_core::Phase::Download, 0);
+    let (sink, mut pump) =
+        lunepack::unstable_internals::progress(lunepack_core::Phase::Download, 0);
     r.ctx.progress = Some(sink);
     block_on(download(&r.ctx, &pack_target(), &two_frames())).expect("download");
-    let mut done = None;
-    assert!(pump.pump(&mut |p: &lunepack_core::Progress| done = Some(p.done)));
-    assert_eq!(done, Some(2500));
+    let mut seen = None;
+    assert!(pump.pump(&mut |p: &lunepack_core::Progress| seen = Some((p.done, p.total))));
+    assert_eq!(seen, Some((2500, 2500)));
+    workers_stopped();
+}
+
+#[test]
+fn the_progress_total_is_the_whole_pack_when_the_plan_is_the_full_pack() {
+    let _s = serial();
+    let mut r = rig();
+    // 12.5 % of the pack is needed, and the policy takes the whole pack from 1 %.
+    r.ctx.policy = FetchPolicy {
+        full_ratio: 1,
+        ..FetchPolicy::default()
+    };
+    let (sink, mut pump) =
+        lunepack::unstable_internals::progress(lunepack_core::Phase::Download, 0);
+    r.ctx.progress = Some(sink);
+    let fetched = block_on(download(&r.ctx, &pack_target(), &two_frames())).expect("download");
+    assert!(fetched.pack().is_some());
+    let mut seen = None;
+    assert!(pump.pump(&mut |p: &lunepack_core::Progress| seen = Some((p.done, p.total))));
+    assert_eq!(seen, Some((PACK_LEN as u64, PACK_LEN as u64)));
+    workers_stopped();
+}
+
+#[test]
+fn a_gap_merged_into_a_run_is_part_of_the_total_and_resumed_bytes_count_as_done() {
+    let _s = serial();
+    let mut r = rig();
+    // Frames at 0-999 and 3000-3999: the 2000 byte gap is merged, so the run is 4000 bytes.
+    let frames = vec![frame(0, 1000), frame(3000, 1000)];
+    let (sink, mut pump) =
+        lunepack::unstable_internals::progress(lunepack_core::Phase::Download, 0);
+    r.ctx.progress = Some(sink);
+    block_on(download(&r.ctx, &pack_target(), &frames)).expect("download");
+    let mut seen = None;
+    assert!(pump.pump(&mut |p: &lunepack_core::Progress| seen = Some((p.done, p.total))));
+    assert_eq!(seen, Some((4000, 4000)));
+    // Frames complete in the cache count as done up front, with no request.
+    let before = r.origin.requests().len();
+    let (sink, mut pump) =
+        lunepack::unstable_internals::progress(lunepack_core::Phase::Download, 0);
+    r.ctx.progress = Some(sink);
+    block_on(download(&r.ctx, &pack_target(), &frames)).expect("download again");
+    assert_eq!(r.origin.requests().len(), before);
+    let mut seen = None;
+    assert!(pump.pump(&mut |p: &lunepack_core::Progress| seen = Some((p.done, p.total))));
+    assert_eq!(seen, Some((2000, 2000)));
+    workers_stopped();
+}
+
+fn put_complete_pack(r: &Rig, bytes: &[u8]) {
+    r.fs.create_dir_all(pack_path().parent().expect("parent"))
+        .expect("dirs");
+    let mut w = r.fs.create_new(&pack_path()).expect("create");
+    w.write_all(bytes).expect("write");
+    w.sync().expect("sync");
+}
+
+#[test]
+fn a_complete_cached_pack_is_rehashed_before_use() {
+    let _s = serial();
+    // The right size and the wrong bytes: deleted, and the frames are fetched.
+    let r = rig();
+    let wrong: Vec<u8> = pack_bytes().iter().map(|b| b ^ 0x55).collect();
+    put_complete_pack(&r, &wrong);
+    let fetched = block_on(download(&r.ctx, &pack_target(), &two_frames())).expect("download");
+    assert_eq!(fetched.pack(), None, "the wrong pack was used");
+    assert!(!exists(&*r.fs, &pack_path()), "the wrong pack was kept");
+    assert_frames_cached(&*r.fs, &two_frames());
+    assert!(!r.origin.requests().is_empty());
+
+    // The right bytes: used as they are, with no request.
+    let r = rig();
+    put_complete_pack(&r, &pack_bytes());
+    let fetched = block_on(download(&r.ctx, &pack_target(), &two_frames())).expect("download");
+    assert_eq!(fetched.pack(), Some(pack_path().as_path()));
+    assert!(r.origin.requests().is_empty());
     workers_stopped();
 }
 

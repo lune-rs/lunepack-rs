@@ -13,10 +13,11 @@ use std::task::{Context, Poll, Wake, Waker};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use lunepack::{
-    Closed, Error, JobFuture, OpLock, RecvFuture, SendFuture, WORKER_THREAD_NAME, WorkerTransport,
-    block_on, from_async, live_workers, progress, spawn_job, to_async,
+use lunepack::unstable_internals::{
+    Closed, JobFuture, OpLock, RecvFuture, SendFuture, WORKER_THREAD_NAME, from_async,
+    live_workers, progress, spawn_job, to_async,
 };
+use lunepack::{Error, WorkerTransport, block_on};
 use lunepack_core::{
     CancelToken, FileProgress, Fs, Phase, Progress, RelPath, Request, Response, Source, Transport,
     TransportError,
@@ -216,7 +217,10 @@ fn a_worker_to_task_pipe_delivers_10000_chunks_in_order() {
     let _s = serial();
     on_every_executor(|| async {
         let cancel = CancelToken::new();
-        let (tx, rx) = to_async::<u32>(lunepack::DEFAULT_CAPACITY, cancel.clone());
+        let (tx, rx) = to_async::<u32>(
+            lunepack::unstable_internals::DEFAULT_CAPACITY,
+            cancel.clone(),
+        );
         let job = spawn_job("producer", cancel, None, move |_| {
             for i in 0..CHUNKS {
                 tx.send(i).expect("send");
@@ -237,7 +241,10 @@ fn a_task_to_worker_pipe_delivers_10000_chunks_in_order() {
     let _s = serial();
     on_every_executor(|| async {
         let cancel = CancelToken::new();
-        let (tx, rx) = from_async::<u32>(lunepack::DEFAULT_CAPACITY, cancel.clone());
+        let (tx, rx) = from_async::<u32>(
+            lunepack::unstable_internals::DEFAULT_CAPACITY,
+            cancel.clone(),
+        );
         let job = spawn_job("consumer", cancel, None, move |_| {
             let mut got = Vec::new();
             while let Some(i) = rx.recv().expect("recv") {
@@ -438,7 +445,7 @@ async fn read_all(transport: Arc<dyn Transport>) -> Result<Vec<u8>, TransportErr
     assert_eq!(response.head.status, 200);
     let mut body = Vec::new();
     while let Some(chunk) = response.body.next_chunk().await? {
-        assert!(!chunk.is_empty() && chunk.len() <= lunepack::CHUNK_SIZE);
+        assert!(!chunk.is_empty() && chunk.len() <= lunepack::unstable_internals::CHUNK_SIZE);
         body.extend_from_slice(&chunk);
     }
     Ok(body)

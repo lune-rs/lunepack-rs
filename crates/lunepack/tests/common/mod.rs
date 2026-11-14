@@ -17,7 +17,8 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use lunepack::{DownloadOptions, Layout, Updater, UpdaterBuilder, block_on, live_workers};
+use lunepack::unstable_internals::live_workers;
+use lunepack::{DownloadOptions, Layout, Updater, UpdaterBuilder, block_on};
 use lunepack_codec_lzma::LzmaCodec;
 use lunepack_core::state::{InstallState, Loaded, Scope, UserScope, load};
 use lunepack_core::{
@@ -211,9 +212,12 @@ impl World {
 
     /// A user install of `current` (issued at `issued`), committed by the core's writer.
     pub fn install(&self, current: &str, issued: u64) -> InstallState {
-        let record = InstallState::new(1, app_id(), Scope::User, INSTALL_ID, TARGET)
-            .install(version(current), issued, TARGET, INSTALL_ID)
-            .with_seq(1);
+        let record = InstallState::new(1, app_id(), Scope::User, INSTALL_ID, TARGET).install(
+            version(current),
+            issued,
+            TARGET,
+            INSTALL_ID,
+        );
         self.commit_user(record)
     }
 
@@ -224,11 +228,9 @@ impl World {
             app_id: app_id(),
         };
         let loaded = store.load(&self.fs, &FakeHasher).expect("load");
-        let record = record.with_seq(loaded.next_seq);
         store
             .commit(&self.fs, &loaded, &record, &FakeHasher)
-            .expect("commit");
-        record
+            .expect("commit")
     }
 
     pub fn user_state(&self) -> Loaded<InstallState> {
@@ -678,11 +680,10 @@ impl Site {
             app_id: app_id(),
         };
         let loaded = store.load(&StdFs::new(), &Sha256Hasher).expect("load");
-        let record = f(loaded.record.as_ref()).with_seq(loaded.next_seq);
+        let record = f(loaded.record.as_ref());
         store
             .commit(&StdFs::new(), &loaded, &record, &Sha256Hasher)
-            .expect("commit");
-        record
+            .expect("commit")
     }
 
     /// A site with 0.9.0 installed and no tree for it (every file of a later release is fetched).

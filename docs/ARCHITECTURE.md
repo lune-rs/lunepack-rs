@@ -56,8 +56,10 @@ Owned by the core, implemented by adapters, faked in the testkit. Defined today:
 - `BlockingTransport` (the same contract, synchronous, with a `CancelToken`), implemented by
   `UreqTransport` and `DirSource`; the facade's `WorkerTransport` presents any of them as a
   `Transport`. Fake: `FakeBlockingTransport`; suite: `run_blocking_transport_suite`, run by
-  `UreqTransport` against `LoopbackServer`. `DirSource` has its own tests instead: the suite's
-  validator, redirect, duplicate-header and request-log cases need an HTTP server;
+  `UreqTransport` against `LoopbackServer` (every case) and by `DirSource` against a temporary
+  directory, with the cases a directory cannot offer switched off through `TransportCaps`
+  (validators, duplicate headers, the request log, and the redirect off Unix), each named where it is
+  switched off;
 - `Fs` (capped reads, positional reads, create-new and append writes with sync, truncate, rename,
   removal, directory creation, listing and sync, copy, `set_exec`, `symlink` and `symlink_metadata`,
   and `try_lock` returning a `LockGuard`), implemented by
@@ -76,6 +78,8 @@ installers (M5, M7, M8). The rule they must place trees by:
 
 - version `V`'s tree is `<versions dir>/<V's version text>`; `stage` builds it there, as
   `<V>.partial` renamed into place once every file is verified (M4-D18);
+  `stage` refuses a version whose directory name differs from a kept version's only in letter case
+  (one directory on a case-insensitive file system; FORMAT.md 12.7);
 - the current tree is the layout's explicit `current_tree` when given (a layout whose live tree is
   not under the versions directory, such as an in-place bundle), else
   `<versions dir>/<current version text>`. It counts only when it is a real directory (a symlink is

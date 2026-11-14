@@ -451,9 +451,12 @@ fn machine_world(machine_seq: u64, user_seq: u64) -> World {
     let w = World::new();
     let dir = Path::new(MACHINE_STATE);
     let loaded = load::<InstallState>(&w.fs, dir, &app_id(), &FakeHasher).expect("load");
-    let mut machine = InstallState::new(1, app_id(), Scope::Machine, INSTALL_ID, TARGET)
-        .install(version("1.0.0"), SUITE_T0 - 10 * DAY, TARGET, INSTALL_ID)
-        .with_seq(loaded.next_seq);
+    let mut machine = InstallState::new(1, app_id(), Scope::Machine, INSTALL_ID, TARGET).install(
+        version("1.0.0"),
+        SUITE_T0 - 10 * DAY,
+        TARGET,
+        INSTALL_ID,
+    );
     machine.floors.feed_seq.insert(channel(), machine_seq);
     commit(&w.fs, dir, &loaded, &machine, &FakeHasher).expect("machine commit");
     let store = MachineScope {
@@ -887,4 +890,551 @@ fn the_blocking_updater_runs_and_honours_its_cancel_token() {
     let staged = u.stage(downloaded, &cancel).expect("stage");
     assert_eq!(u.staged().expect("staged"), Some(staged));
     workers_stopped();
+}
+
+// ---- fix round 1 ---------------------------------------------------------------------------------
+
+/// MemFs with switchable faults: removals under one directory, or file creation under another,
+/// fail while armed.
+struct FaultFs {
+    inner: MemFs,
+    fail_remove_under: Mutex<Option<PathBuf>>,
+    fail_create_under: Mutex<Option<PathBuf>>,
+}
+
+impl FaultFs {
+    fn new(inner: MemFs) -> Arc<FaultFs> {
+        Arc::new(FaultFs {
+            inner,
+            fail_remove_under: Mutex::new(None),
+            fail_create_under: Mutex::new(None),
+        })
+    }
+
+    fn armed(slot: &Mutex<Option<PathBuf>>, path: &Path) -> bool {
+        slot.lock()
+            .expect("fault")
+            .as_ref()
+            .is_some_and(|dir| path.starts_with(dir))
+    }
+
+    fn fault(path: &Path, what: &'static str) -> FsError {
+        FsError::new(
+            lunepack_core::FsErrorKind::Other,
+            path,
+            Some(std::io::Error::other(what)),
+        )
+    }
+}
+
+impl Fs for FaultFs {
+    fn read_capped(&self, path: &Path, max: u64) -> Result<Vec<u8>, FsError> {
+        self.inner.read_capped(path, max)
+    }
+    fn open_read(&self, path: &Path) -> Result<Box<dyn ReadAt>, FsError> {
+        self.inner.open_read(path)
+    }
+    fn create_new(&self, path: &Path) -> Result<Box<dyn FileWrite>, FsError> {
+        if FaultFs::armed(&self.fail_create_under, path) {
+            return Err(FaultFs::fault(path, "no space left on device"));
+        }
+        self.inner.create_new(path)
+    }
+    fn open_append(&self, path: &Path) -> Result<Box<dyn FileWrite>, FsError> {
+        self.inner.open_append(path)
+    }
+    fn truncate(&self, path: &Path, len: u64) -> Result<(), FsError> {
+        self.inner.truncate(path, len)
+    }
+    fn rename(&self, from: &Path, to: &Path) -> Result<(), FsError> {
+        self.inner.rename(from, to)
+    }
+    fn remove_file(&self, path: &Path) -> Result<(), FsError> {
+        if FaultFs::armed(&self.fail_remove_under, path) {
+            return Err(FaultFs::fault(path, "file is in use"));
+        }
+        self.inner.remove_file(path)
+    }
+    fn remove_dir_all_nofollow(&self, path: &Path) -> Result<(), FsError> {
+        self.inner.remove_dir_all_nofollow(path)
+    }
+    fn create_dir_all(&self, path: &Path) -> Result<(), FsError> {
+        self.inner.create_dir_all(path)
+    }
+    fn list_dir(&self, path: &Path) -> Result<Vec<DirEntryInfo>, FsError> {
+        self.inner.list_dir(path)
+    }
+    fn symlink_metadata(&self, path: &Path) -> Result<Option<Meta>, FsError> {
+        self.inner.symlink_metadata(path)
+    }
+    fn sync_dir(&self, path: &Path) -> Result<(), FsError> {
+        self.inner.sync_dir(path)
+    }
+    fn copy_file(&self, from: &Path, to_new: &Path) -> Result<(), FsError> {
+        self.inner.copy_file(from, to_new)
+    }
+    fn set_exec(&self, path: &Path, exec: bool) -> Result<(), FsError> {
+        self.inner.set_exec(path, exec)
+    }
+    fn symlink(&self, target: &str, link_path: &Path) -> Result<(), FsError> {
+        self.inner.symlink(target, link_path)
+    }
+    fn try_lock(&self, path: &Path) -> Result<Option<Box<dyn LockGuard>>, FsError> {
+        self.inner.try_lock(path)
+    }
+}
+
+/// An updater on `w`'s MemFs through `fs`, with the given fetch policy.
+fn updater_over(w: &World, fs: Arc<dyn Fs>, policy: FetchPolicy) -> lunepack::Updater {
+    w.builder(w.user_layout(None), fs)
+        .fetch_policy(policy)
+        .build()
+        .expect("build")
+}
+
+/// Every progress event of a download, in order.
+fn download_events(
+    u: &lunepack::Updater,
+    info: &lunepack::UpdateInfo,
+) -> (Vec<lunepack_core::Progress>, lunepack::Downloaded) {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&events);
+    let options = DownloadOptions {
+        progress: Some(Box::new(move |p| {
+            seen.lock().expect("events").push(p.clone())
+        })),
+        cancel: None,
+    };
+    let downloaded = block_on(u.download(info, options)).expect("download");
+    let events = events.lock().expect("events").clone();
+    (events, downloaded)
+}
+
+fn phase_events(
+    events: &[lunepack_core::Progress],
+    phase: lunepack_core::Phase,
+) -> Vec<&lunepack_core::Progress> {
+    events.iter().filter(|p| p.phase == phase).collect()
+}
+
+/// The sum of the byte ranges the pack requests asked for.
+fn requested_pack_bytes(w: &World) -> u64 {
+    w.origin
+        .requests()
+        .iter()
+        .filter(|r| r.url.ends_with(".pack"))
+        .map(|r| match r.range {
+            Some(range) => range.last.map_or(0, |last| last - range.first + 1),
+            None => w.pack("1.1.0").bytes.len() as u64,
+        })
+        .sum()
+}
+
+#[test]
+fn download_progress_counts_what_is_requested_and_ends_complete() {
+    let _s = serial();
+    // A full pack although only one file changed: the total is the pack, not the needed frames.
+    let w = World::new();
+    w.install("1.0.0", SUITE_T0 - 10 * DAY);
+    w.publish(1, "1.1.0");
+    w.write_tree(&w.versions_dir.join("1.0.0"), "1.0.0");
+    let full_pack = FetchPolicy {
+        full_ratio: 1,
+        ..FetchPolicy::default()
+    };
+    let u = updater_over(&w, Arc::new(w.fs.clone()), full_pack);
+    let info = block_on(u.check()).expect("check").expect("update");
+    let (events, _downloaded) = download_events(&u, &info);
+    let pack_len = w.pack("1.1.0").bytes.len() as u64;
+    assert_eq!(
+        requested_pack_bytes(&w),
+        pack_len,
+        "the plan was the full pack"
+    );
+    let download = phase_events(&events, lunepack_core::Phase::Download);
+    assert!(!download.is_empty(), "no download event");
+    for p in &download {
+        assert!(p.done <= p.total, "past 100 %: {p:?}");
+    }
+    let last = download.last().expect("last");
+    assert_eq!((last.done, last.total), (pack_len, pack_len), "{last:?}");
+    // Scan: its total is the bytes of the candidates it hashes (here all four files), never more.
+    let scan = phase_events(&events, lunepack_core::Phase::Scan);
+    assert!(!scan.is_empty(), "no scan event");
+    for p in &scan {
+        assert!(p.done <= p.total, "{p:?}");
+    }
+    let total = scan.last().expect("a scan event").total;
+    assert_eq!(
+        total,
+        files("1.0.0")
+            .iter()
+            .map(|(_, b)| b.len() as u64)
+            .sum::<u64>()
+    );
+    workers_stopped();
+
+    // Range runs with a gap merged in: the total is the bytes of the runs, not the needed frames.
+    let w = World::new();
+    w.install("1.0.0", SUITE_T0 - 10 * DAY);
+    w.publish(1, "1.1.0");
+    w.write_tree(&w.versions_dir.join("1.0.0"), "1.0.0");
+    // A missing file in the middle of the pack's order: bin/app changed, share/readme.txt is gone,
+    // lib/common.so between them matches and is merged into the one run.
+    w.fs.remove_file(&w.versions_dir.join("1.0.0/share/readme.txt"))
+        .expect("remove");
+    let u = updater_over(&w, Arc::new(w.fs.clone()), FetchPolicy::default());
+    let info = block_on(u.check()).expect("check").expect("update");
+    let (events, _downloaded) = download_events(&u, &info);
+    let requested = requested_pack_bytes(&w);
+    assert!(
+        requested < w.pack("1.1.0").bytes.len() as u64,
+        "this plan is ranges, not the full pack"
+    );
+    let download = phase_events(&events, lunepack_core::Phase::Download);
+    for p in &download {
+        assert!(p.done <= p.total, "past 100 %: {p:?}");
+    }
+    let last = download.last().expect("last");
+    assert_eq!((last.done, last.total), (requested, requested), "{last:?}");
+    workers_stopped();
+}
+
+#[test]
+fn the_ladders_second_rung_reports_its_own_total() {
+    let _s = serial();
+    let w = World::new();
+    w.install("1.0.0", SUITE_T0 - 10 * DAY);
+    w.publish(1, "1.1.0");
+    let u = updater_over(&w, Arc::new(w.fs.clone()), ranges_ratio_never());
+    let info = block_on(u.check()).expect("check").expect("update");
+    // The callback given to `download` also receives the stage's events.
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&events);
+    let options = DownloadOptions {
+        progress: Some(Box::new(move |p| {
+            seen.lock().expect("events").push(p.clone())
+        })),
+        cancel: None,
+    };
+    let downloaded = block_on(u.download(&info, options)).expect("download");
+    // Damage one cached frame so the stage falls to rung 2.
+    let frames_dir = w.cache_dir.join("frames");
+    let victim = frames_dir.join(&names(&w.fs, &frames_dir)[0]);
+    let len = w.read(&victim).len();
+    w.fs.remove_file(&victim).expect("remove");
+    let mut f = w.fs.create_new(&victim).expect("create");
+    f.write_all(&vec![0xAB; len]).expect("write");
+    f.sync().expect("sync");
+    drop(f);
+    let before = events.lock().expect("events").len();
+    block_on(u.stage(downloaded)).expect("stage");
+    let events = events.lock().expect("events")[before..].to_vec();
+    let download = phase_events(&events, lunepack_core::Phase::Download);
+    assert!(!download.is_empty(), "rung 2 reported no download");
+    // Never "n of 0": the total is set before any byte is counted.
+    for p in &download {
+        assert!(p.done <= p.total, "{p:?}");
+    }
+    let last = download.last().expect("last");
+    assert!(last.total > 0 && last.done == last.total, "{last:?}");
+    workers_stopped();
+}
+
+#[test]
+fn a_failing_cache_cleanup_after_the_commit_does_not_fail_stage() {
+    let _s = serial();
+    let w = World::new();
+    w.install("1.0.0", SUITE_T0 - 10 * DAY);
+    w.publish(1, "1.1.0");
+    let fs = FaultFs::new(w.fs.clone());
+    let u = updater_over(&w, fs.clone(), FetchPolicy::default());
+    let info = block_on(u.check()).expect("check").expect("update");
+    let downloaded = block_on(u.download(&info, DownloadOptions::default())).expect("download");
+    assert!(!names(&w.fs, &w.cache_dir.join("packs")).is_empty());
+    // From here every removal in the cache fails: only the housekeeping after the commit removes.
+    *fs.fail_remove_under.lock().expect("fault") = Some(w.cache_dir.clone());
+    let staged = block_on(u.stage(downloaded)).expect("stage succeeds although the cleanup failed");
+    assert_eq!(u.staged().expect("staged"), Some(staged));
+    // The leftovers are still there, for the next download's cleanup.
+    assert!(!names(&w.fs, &w.cache_dir.join("packs")).is_empty());
+    workers_stopped();
+}
+
+#[test]
+fn a_disk_failure_while_staging_is_an_fs_error_not_a_verify_error() {
+    let _s = serial();
+    let w = World::new();
+    w.install("1.0.0", SUITE_T0 - 10 * DAY);
+    w.publish(1, "1.1.0");
+    let fs = FaultFs::new(w.fs.clone());
+    let u = updater_over(&w, fs.clone(), FetchPolicy::default());
+    let info = block_on(u.check()).expect("check").expect("update");
+    let downloaded = block_on(u.download(&info, DownloadOptions::default())).expect("download");
+    *fs.fail_create_under.lock().expect("fault") = Some(w.versions_dir.clone());
+    match block_on(u.stage(downloaded)) {
+        Err(Error::Fs(e)) => assert_eq!(e.kind, lunepack_core::FsErrorKind::Other),
+        other => panic!("expected Error::Fs, got {other:?}"),
+    }
+    assert_eq!(u.staged().expect("staged"), None);
+    workers_stopped();
+}
+
+#[test]
+fn a_core_fs_error_converts_to_the_fs_variant() {
+    let core = lunepack_core::Error::Fs(FsError::new(
+        lunepack_core::FsErrorKind::Other,
+        Path::new("/x/file"),
+        None,
+    ));
+    assert!(matches!(Error::from(core), Error::Fs(_)));
+    assert!(matches!(
+        Error::from(lunepack_core::Error::Cancelled),
+        Error::Cancelled
+    ));
+    assert!(matches!(
+        Error::from(lunepack_core::Error::AppIdMismatch),
+        Error::Verify(_)
+    ));
+}
+
+/// A blocking transport that stalls in `get`, ignoring the cancel token like a socket read that
+/// has not timed out, until released.
+struct StalledBlocking {
+    inner: lunepack_testkit::FakeBlockingTransport,
+    entered: Arc<AtomicBool>,
+    release: Arc<AtomicBool>,
+}
+
+impl lunepack_core::BlockingTransport for StalledBlocking {
+    fn get(
+        &self,
+        request: &Request,
+        cancel: &lunepack_core::CancelToken,
+    ) -> Result<lunepack_core::BlockingResponse, TransportError> {
+        self.entered.store(true, Ordering::SeqCst);
+        while !self.release.load(Ordering::SeqCst) {
+            thread::sleep(std::time::Duration::from_millis(2));
+        }
+        self.inner.get(request, cancel)
+    }
+}
+
+/// Polls `future` with a no-op waker every few ms for at most `limit`.
+fn poll_for<T>(
+    future: &mut std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send>>,
+    limit: std::time::Duration,
+) -> Option<T> {
+    let deadline = std::time::Instant::now() + limit;
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    loop {
+        if let std::task::Poll::Ready(v) = future.as_mut().poll(&mut cx) {
+            return Some(v);
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        thread::sleep(std::time::Duration::from_millis(2));
+    }
+}
+
+#[test]
+fn a_dropped_operation_over_a_stalled_transport_holds_the_lock_until_the_worker_returns() {
+    let _s = serial();
+    let w = World::new();
+    w.install("1.0.0", SUITE_T0 - 10 * DAY);
+    w.publish(1, "1.1.0");
+    let entered = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(AtomicBool::new(false));
+    let stalled = StalledBlocking {
+        inner: lunepack_testkit::FakeBlockingTransport::new(w.origin.clone()),
+        entered: Arc::clone(&entered),
+        release: Arc::clone(&release),
+    };
+    let u = lunepack::UpdaterBuilder::new(
+        app_id(),
+        w.root(),
+        &w.feed_url(),
+        channel(),
+        w.user_layout(None),
+    )
+    .blocking_transport(Arc::new(stalled))
+    .fs(Arc::new(w.fs.clone()))
+    .hasher(Arc::new(FakeHasher))
+    .verifier(Arc::new(lunepack_testkit::FakeVerifier))
+    .codec(Arc::new(lunepack_testkit::FakeCodec::new()))
+    .clock(Arc::clone(&w.clock) as Arc<dyn lunepack_core::Clock>)
+    .workers(2)
+    .build()
+    .expect("build");
+
+    // Start a check and drop it once its transport worker is stuck in `get`.
+    let mut first: std::pin::Pin<Box<dyn std::future::Future<Output = _> + Send>> =
+        Box::pin(u.check());
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !entered.load(Ordering::SeqCst) {
+        assert!(first.as_mut().poll(&mut cx).is_pending());
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the worker never entered the transport"
+        );
+        thread::sleep(std::time::Duration::from_millis(2));
+    }
+    drop(first);
+
+    // The future is gone, but its transport worker still holds the operation's lock.
+    let mut second: std::pin::Pin<Box<dyn std::future::Future<Output = _> + Send>> =
+        Box::pin(u.check());
+    let result = poll_for(&mut second, std::time::Duration::from_secs(2));
+    release.store(true, Ordering::SeqCst);
+    drop(second);
+    assert!(
+        matches!(result, Some(Err(Error::Busy))),
+        "the next operation must be Busy while the worker is stuck: {result:?}"
+    );
+
+    // Once the worker returns the lock is free again and the next operation succeeds.
+    workers_stopped();
+    let info = block_on(u.check()).expect("check").expect("update");
+    assert_eq!(info.version_text(), "1.1.0");
+    workers_stopped();
+}
+
+#[test]
+fn a_version_directory_differing_only_in_case_is_refused() {
+    let _s = serial();
+    // The current version's directory is 1.0.0-RC1; a case-insensitive file system would make
+    // 1.0.0-rc1 the same directory.
+    let w = World::new();
+    w.install("1.0.0-RC1", SUITE_T0 - 10 * DAY);
+    w.write_tree(&w.versions_dir.join("1.0.0-RC1"), "1.0.0-RC1");
+    w.publish(1, "1.0.0-rc1");
+    let u = w.updater();
+    let info = block_on(u.check()).expect("check").expect("update");
+    assert_eq!(info.version_text(), "1.0.0-rc1");
+    let downloaded = block_on(u.download(&info, DownloadOptions::default())).expect("download");
+    assert!(matches!(
+        block_on(u.stage(downloaded)),
+        Err(Error::VersionDirCollision)
+    ));
+    assert_eq!(names(&w.fs, &w.versions_dir), vec!["1.0.0-RC1".to_owned()]);
+    assert_eq!(u.staged().expect("staged"), None);
+    workers_stopped();
+
+    // A kept tree on disk that the record does not name counts too.
+    let w = World::new();
+    w.install("1.0.0", SUITE_T0 - 10 * DAY);
+    w.write_tree(&w.versions_dir.join("1.0.1-RC1"), "1.0.1-RC1");
+    w.publish(1, "1.0.1-rc1");
+    let u = w.updater();
+    let info = block_on(u.check()).expect("check").expect("update");
+    let downloaded = block_on(u.download(&info, DownloadOptions::default())).expect("download");
+    assert!(matches!(
+        block_on(u.stage(downloaded)),
+        Err(Error::VersionDirCollision)
+    ));
+    assert_eq!(names(&w.fs, &w.versions_dir), vec!["1.0.1-RC1".to_owned()]);
+    workers_stopped();
+
+    // Other names do not block: the same version restaged, and a different version.
+    let w = World::new();
+    w.install("1.0.0", SUITE_T0 - 10 * DAY);
+    w.write_tree(&w.versions_dir.join("1.0.0"), "1.0.0");
+    w.publish(1, "1.1.0");
+    let u = w.updater();
+    let info = block_on(u.check()).expect("check").expect("update");
+    let downloaded = block_on(u.download(&info, DownloadOptions::default())).expect("download");
+    block_on(u.stage(downloaded)).expect("stage");
+    workers_stopped();
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlinked_current_tree_is_not_scanned_on_the_default_fs() {
+    use lunepack_core::Phase;
+    let _s = serial();
+    let baseline = Baseline::new();
+    let run = |symlinked: bool| -> u64 {
+        let site = baseline.fresh();
+        let tree = site.tree(V100);
+        let current = if symlinked {
+            let live = site.root.join("live");
+            std::os::unix::fs::symlink(&tree, &live).expect("symlink");
+            live
+        } else {
+            tree
+        };
+        let u = lunepack::UpdaterBuilder::new(
+            app_id(),
+            fixture().root(),
+            &fake_feed_url(),
+            channel(),
+            Layout::User {
+                state_dir: site.state_dir.clone(),
+                cache_dir: site.cache_dir.clone(),
+                versions_dir: site.versions_dir.clone(),
+                current_tree: Some(current),
+            },
+        )
+        .transport(Arc::new(FakeTransport::new(fixture().origin(2))))
+        .clock(Arc::new(lunepack_testkit::FakeClock::new(SUITE_T0 + 3600)))
+        .workers(2)
+        .build()
+        .expect("build");
+        let info = block_on(u.check()).expect("check").expect("update");
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&events);
+        block_on(u.download(
+            &info,
+            DownloadOptions {
+                progress: Some(Box::new(move |p| {
+                    seen.lock().expect("events").push(p.clone())
+                })),
+                cancel: None,
+            },
+        ))
+        .expect("download");
+        let events = events.lock().expect("events");
+        let scanned = events
+            .iter()
+            .filter(|p| p.phase == Phase::Scan && p.total > 0)
+            .count();
+        let download = events
+            .iter()
+            .rfind(|p| p.phase == Phase::Download)
+            .expect("a download event");
+        assert_eq!(download.done, download.total, "{download:?}");
+        // A symlinked tree is not scanned at all (M4-D4).
+        assert_eq!(scanned > 0, !symlinked, "scan events: {scanned}");
+        download.total
+    };
+    let real = run(false);
+    let linked = run(true);
+    // Nothing unchanged to reuse: every frame is needed, which plans the whole pack.
+    assert_eq!(linked, fixture().pack_sizes[V110]);
+    assert!(real <= linked);
+    workers_stopped();
+}
+
+#[test]
+fn the_facade_names_the_api_types_and_builds_a_trusted_root_from_bytes() {
+    // Everything below is spelled with `lunepack::` paths only (the re-exports are the same types
+    // as the core's, so the other tests' values fit).
+    let app: lunepack::AppId = app_id();
+    let root: lunepack::TrustedRoot =
+        lunepack::trusted_root(app.clone(), 1, 1, &[fixture().root_public]).expect("root");
+    assert_eq!(root, fixture().root());
+    assert!(matches!(
+        lunepack::trusted_root(app.clone(), 0, 1, &[fixture().root_public]),
+        Err(Error::Verify(_))
+    ));
+    assert!(lunepack::trusted_root(app, 1, 2, &[fixture().root_public]).is_err());
+    let _channel: lunepack::Channel = channel();
+    let _cancel = lunepack::CancelToken::new();
+    let _version: lunepack::Version = version("1.0.0");
+    let _policy = lunepack::FetchPolicy::default();
+    let _phase = lunepack::Phase::Download;
+    let _target: lunepack::Target = TARGET;
+    let _core_error: Option<lunepack::CoreError> = None;
 }

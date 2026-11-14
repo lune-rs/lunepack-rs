@@ -148,6 +148,26 @@ impl Cache {
         }
     }
 
+    /// Hashes the complete entry and compares it with `sha` (M4-D17: a complete pack is re-hashed
+    /// before use, since its size alone does not show it is the signed file). A mismatch removes the
+    /// entry, with any part and sidecar, and reads as `false`.
+    pub fn verify_complete(
+        &self,
+        kind: CacheKind,
+        sha: &Sha256Digest,
+        hasher: &dyn Hasher,
+    ) -> Result<bool, FsError> {
+        let path = self.path(kind, sha);
+        let len = self.fs.open_read(&path)?.size()?;
+        let mut state = hasher.sha256_start();
+        hash_prefix(&*self.fs, &path, len, &mut state)?;
+        if state.finalize() == *sha {
+            return Ok(true);
+        }
+        self.remove_entry(kind, sha)?;
+        Ok(false)
+    }
+
     /// The length of the entry's `.part`, or 0. A part longer than `signed` bytes, or one that is
     /// not a regular file, is deleted with its sidecar and reads as 0.
     pub fn part_len(

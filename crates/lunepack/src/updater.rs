@@ -112,7 +112,8 @@ impl Layout {
         }
     }
 
-    fn map(&self, f: impl Fn(&Path) -> PathBuf) -> Layout {
+    /// The layout with `f` applied to every directory and `tree` to the live tree.
+    fn map(&self, f: impl Fn(&Path) -> PathBuf, tree: impl Fn(&Path) -> PathBuf) -> Layout {
         match self {
             Layout::User {
                 state_dir,
@@ -123,7 +124,7 @@ impl Layout {
                 state_dir: f(state_dir),
                 cache_dir: f(cache_dir),
                 versions_dir: f(versions_dir),
-                current_tree: current_tree.as_deref().map(&f),
+                current_tree: current_tree.as_deref().map(&tree),
             },
             Layout::Machine {
                 machine_state_dir,
@@ -136,7 +137,7 @@ impl Layout {
                 user_state_dir: f(user_state_dir),
                 cache_dir: f(cache_dir),
                 versions_dir: versions_dir.as_deref().map(&f),
-                current_tree: current_tree.as_deref().map(&f),
+                current_tree: current_tree.as_deref().map(&tree),
             },
         }
     }
@@ -294,13 +295,14 @@ impl UpdaterBuilder {
             None => (
                 Arc::new(lunepack_fs::StdFs::new()),
                 // lunepack-fs refuses symlinked components (macOS /var, a symlinked home):
-                // resolve the layout's existing ancestors once.
-                self.layout.map(canonical),
+                // resolve the layout's directories once. The live tree keeps its final component
+                // as given, so a symlink there still fails "is a real directory" (M4-D4).
+                self.layout.map(canonical, canonical_parent),
             ),
         };
-        let transport: Arc<dyn Transport> = match (self.transport, self.blocking_transport) {
-            (Some(t), _) => t,
-            (None, Some(b)) => Arc::new(WorkerTransport::new(DynBlocking(b))),
+        let transport = match (self.transport, self.blocking_transport) {
+            (Some(t), _) => Transports::Async(t),
+            (None, Some(b)) => Transports::Worker(WorkerTransport::new(DynBlocking(b))),
             (None, None) => default_transport(&self.feed_url, self.timeouts)?,
         };
         let workers = self.workers.unwrap_or_else(|| {
@@ -360,8 +362,38 @@ fn canonical(path: &Path) -> PathBuf {
     }
 }
 
+/// `path` with its parent resolved through the OS (as [`canonical`]) and the final component kept
+/// as given, so a symlink at `path` itself is not followed.
+fn canonical_parent(path: &Path) -> PathBuf {
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) if !parent.as_os_str().is_empty() => {
+            canonical(parent).join(name)
+        }
+        _ => canonical(path),
+    }
+}
+
+/// How operations reach the network: an async transport polled on the caller's task, or a blocking
+/// one run on lunepack worker threads.
+enum Transports {
+    Async(Arc<dyn Transport>),
+    Worker(WorkerTransport<DynBlocking>),
+}
+
+impl Transports {
+    /// The transport for one operation. A worker transport's request and body jobs hold a clone of
+    /// the operation's `lock`, so a worker still in a blocked read keeps the lock held and the next
+    /// operation gets [`Error::Busy`] until it returns (M4-D15).
+    fn for_op(&self, lock: &OpLock) -> Arc<dyn Transport> {
+        match self {
+            Transports::Async(t) => Arc::clone(t),
+            Transports::Worker(w) => Arc::new(w.for_op(lock)),
+        }
+    }
+}
+
 /// The default transport: ureq for `http`/`https`, the directory source for `file:`.
-fn default_transport(feed_url: &str, timeouts: Timeouts) -> Result<Arc<dyn Transport>, Error> {
+fn default_transport(feed_url: &str, timeouts: Timeouts) -> Result<Transports, Error> {
     let url =
         url::Url::parse(feed_url).map_err(|_| Error::Config("feed URL is not a valid URL"))?;
     if url.scheme() == "file" {
@@ -372,18 +404,18 @@ fn default_transport(feed_url: &str, timeouts: Timeouts) -> Result<Arc<dyn Trans
             .parent()
             .map(Path::to_path_buf)
             .ok_or(Error::Config("feed file URL has no directory"))?;
-        return Ok(Arc::new(WorkerTransport::new(
-            lunepack_http::DirSource::new(root),
-        )));
+        return Ok(Transports::Worker(WorkerTransport::new(DynBlocking(
+            Arc::new(lunepack_http::DirSource::new(root)),
+        ))));
     }
     let options = lunepack_http::UreqOptions {
         connect_timeout: timeouts.connect,
         read_timeout: timeouts.read,
         ..lunepack_http::UreqOptions::default()
     };
-    Ok(Arc::new(WorkerTransport::new(
-        lunepack_http::UreqTransport::with_options(&options),
-    )))
+    Ok(Transports::Worker(WorkerTransport::new(DynBlocking(
+        Arc::new(lunepack_http::UreqTransport::with_options(&options)),
+    ))))
 }
 
 /// A shared blocking transport, so an `Arc<dyn BlockingTransport>` can run on worker threads.
@@ -590,7 +622,7 @@ struct Inner {
     feed_url: String,
     channel: Channel,
     layout: Layout,
-    transport: Arc<dyn Transport>,
+    transport: Transports,
     fs: Arc<dyn Fs>,
     codec: Arc<dyn Codec>,
     hasher: Arc<dyn Hasher>,
@@ -687,7 +719,7 @@ impl Inner {
                 if record.floors.max(floors) == record.floors {
                     return Ok(());
                 }
-                let next = record.raise_floors(floors).with_seq(loaded.next_seq);
+                let next = record.raise_floors(floors);
                 store.commit(&*self.fs, loaded, &next, &*self.hasher)?;
             }
             Snapshot::Machine {
@@ -702,7 +734,7 @@ impl Inner {
                 if counters.record.is_some() && effective.max(floors) == effective {
                     return Ok(());
                 }
-                let next = base.raise_floors(floors).with_seq(counters.next_seq);
+                let next = base.raise_floors(floors);
                 store.commit_counters(&*self.fs, machine, counters, &next, &*self.hasher)?;
             }
         }
@@ -794,8 +826,12 @@ async fn with_progress<F: Future>(
     .await
 }
 
-/// Forwards a core progress event (a running total) into a sink as deltas.
+/// Forwards a core progress event (a running total) into a sink as deltas. The core knows the
+/// phase's real total (scan hashes only the files that could match), so it replaces the sink's.
 fn forward(sink: &ProgressSink, last: &AtomicU64, event: &Progress) {
+    if event.total > 0 {
+        sink.set_total(event.total);
+    }
     let before = last.swap(event.done, Ordering::SeqCst);
     sink.add_done(event.done.saturating_sub(before));
     sink.set_file(event.file.clone());
@@ -924,7 +960,8 @@ async fn check(inner: Arc<Inner>) -> Result<Option<UpdateInfo>, Error> {
     let clock = ClockReading::read(&*inner.clock, Some(current.issued));
     let hasher = &*inner.hasher;
     let verifier = &*inner.verifier;
-    let transport = &*inner.transport;
+    let transport_arc = inner.transport.for_op(&lock);
+    let transport = &*transport_arc;
 
     // Root walk (FORMAT.md 5.2) from the higher of the stored and the embedded root.
     let mut root = match &floors.root {
@@ -1034,7 +1071,7 @@ async fn load_fresh(
 
 fn fetch_ctx(inner: &Inner, lock: &OpLock, cancel: &CancelToken, sink: &ProgressSink) -> FetchCtx {
     FetchCtx {
-        transport: Arc::clone(&inner.transport),
+        transport: inner.transport.for_op(lock),
         cache: inner.cache(),
         hasher: Arc::clone(&inner.hasher),
         lock: Some(lock.clone()),
@@ -1076,7 +1113,8 @@ async fn download(
         )
         .await?;
 
-        sink.set_phase(Phase::Scan, file_bytes(&manifest));
+        // The total is the bytes scan hashes, which only its first event knows.
+        sink.set_phase(Phase::Scan, 0);
         let scan_sink = sink.clone();
         let scan_manifest = Arc::clone(&manifest);
         let unchanged = on_job(
@@ -1104,8 +1142,8 @@ async fn download(
             .filter(|(i, _)| unchanged.get(*i).is_none_or(Option::is_none))
             .map(|(_, f)| f.clone())
             .collect();
-        let needed_bytes = needed.iter().fold(0u64, |s, f| s.saturating_add(f.length));
-        sink.set_phase(Phase::Download, needed_bytes);
+        // The total is what the download will move: `fetch::download` adds it once it has planned.
+        sink.set_phase(Phase::Download, 0);
         let ctx = fetch_ctx(&inner, &lock, &cancel, &sink);
         let fetched = fetch::download(&ctx, &info.pack, &needed).await?;
         let frames: HashMap<Sha256Digest, PathBuf> = needed
@@ -1166,6 +1204,57 @@ fn sources(
         .collect()
 }
 
+/// Refuses to stage a version whose directory name differs only in ASCII letter case from that of
+/// the current, previous, pending or staged version or from an entry of the versions directory: on
+/// a case-insensitive file system (Windows, macOS default) both names are one directory, and
+/// staging would rebuild a kept version's tree under a different version's name (F11).
+async fn refuse_case_collision(
+    inner: &Arc<Inner>,
+    lock: &OpLock,
+    cancel: &CancelToken,
+    record: &InstallState,
+    info: &UpdateInfo,
+    versions_dir: &Path,
+) -> Result<(), Error> {
+    let mut names: Vec<String> = record
+        .current
+        .iter()
+        .map(|c| c.version.to_string())
+        .chain(record.previous.iter().map(|p| p.version.to_string()))
+        .chain(record.pending.iter().map(|p| p.version.to_string()))
+        .chain(record.staged.iter().map(|s| s.tree.clone()))
+        .collect();
+    let candidate = info.version.to_string();
+    let dir = versions_dir.to_path_buf();
+    on_job(
+        inner,
+        Some(lock),
+        cancel,
+        "version-dirs",
+        move |inner, _| {
+            match inner.fs.list_dir(&dir) {
+                Ok(entries) => names.extend(
+                    entries
+                        .into_iter()
+                        .map(|e| e.name.to_string_lossy().into_owned()),
+                ),
+                Err(e) if e.kind == lunepack_core::FsErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+            let partial = format!("{candidate}{}", lunepack_core::stage::PARTIAL_SUFFIX);
+            let collides = names.iter().any(|n| {
+                (n != &candidate && n.eq_ignore_ascii_case(&candidate))
+                    || (n != &partial && n.eq_ignore_ascii_case(&partial))
+            });
+            if collides {
+                return Err(Error::VersionDirCollision);
+            }
+            Ok(())
+        },
+    )
+    .await
+}
+
 async fn stage(inner: Arc<Inner>, downloaded: Downloaded) -> Result<StagedVersion, Error> {
     let Layout::User { versions_dir, .. } = &inner.layout else {
         return Err(Error::MachineScope);
@@ -1185,6 +1274,7 @@ async fn stage(inner: Arc<Inner>, downloaded: Downloaded) -> Result<StagedVersio
         let lock = take_lock(&inner, &cancel).await?;
         let snap = load_fresh(&inner, &lock, &cancel, &info).await?;
         let manifest = Arc::clone(&info.manifest);
+        refuse_case_collision(&inner, &lock, &cancel, snap.record(), &info, &versions_dir).await?;
         let all_frames = frames_of(&manifest);
         let mut use_pack: HashSet<usize> = HashSet::new();
         let (mut range_tried, mut pack_tried) = (false, false);
@@ -1234,7 +1324,7 @@ async fn stage(inner: Arc<Inner>, downloaded: Downloaded) -> Result<StagedVersio
                 Err(StageError::Unsupported) => {
                     return Err(Error::Config("the manifest needs an unsupported source"));
                 }
-                Err(StageError::Other(e)) => return Err(Error::Verify(e)),
+                Err(StageError::Other(e)) => return Err(e.into()),
                 Err(_) => return Err(Error::Config("stage failed")),
             };
             let failed: Vec<usize> = manifest
@@ -1299,7 +1389,8 @@ async fn stage(inner: Arc<Inner>, downloaded: Downloaded) -> Result<StagedVersio
                     move |inner, _| Ok(inner.cache().remove_entry(CacheKind::Pack, &sha)?),
                 )
                 .await?;
-                sink.set_phase(Phase::Download, info.pack.size);
+                // `fetch_pack` adds the pack's size to the total.
+                sink.set_phase(Phase::Download, 0);
                 pack = Some(fetch::fetch_pack(&ctx, &info.pack, None).await?);
                 use_pack.extend(failed.iter().copied());
             } else {
@@ -1326,15 +1417,16 @@ async fn stage(inner: Arc<Inner>, downloaded: Downloaded) -> Result<StagedVersio
                 else {
                     return Err(Error::MachineScope);
                 };
-                let next = record
-                    .set_staged(Some(staged_ref))
-                    .with_seq(loaded.next_seq);
+                let next = record.set_staged(Some(staged_ref));
                 store.commit(&*inner.fs, loaded, &next, &*inner.hasher)?;
+                // The tree is in place and recorded: dropping the cache entries is housekeeping
+                // (M4-D17), so a failure here (a file held open by a scanner, a permission change)
+                // is not an error of `stage`. The next `download` removes leftovers.
                 let cache = inner.cache();
                 for sha in &drop_frames {
-                    cache.remove_entry(CacheKind::Frame, sha)?;
+                    let _ = cache.remove_entry(CacheKind::Frame, sha);
                 }
-                cache.remove_entry(CacheKind::Pack, &pack_sha)?;
+                let _ = cache.remove_entry(CacheKind::Pack, &pack_sha);
                 Ok(())
             },
         )

@@ -25,12 +25,17 @@ pub enum Error {
     /// Staging a per-machine install is the privileged engine's job (C8).
     #[error("staging is not available for a per-machine install")]
     MachineScope,
+    /// The new version's directory name differs only in letter case from that of an installed,
+    /// staged or kept version, so on a case-insensitive file system both would be one directory
+    /// (FORMAT.md 12). Nothing is staged.
+    #[error("the version's directory name collides, ignoring case, with an existing version")]
+    VersionDirCollision,
     /// The install state was written by a newer build; nothing is written (M4-D22 c).
     #[error("the install state is from a newer lunepack")]
     StateTooNew,
     /// Bytes or documents failed verification or a format rule (the core's error).
     #[error("{0}")]
-    Verify(#[from] lunepack_core::Error),
+    Verify(lunepack_core::Error),
     /// A transport failed to produce a response or a body chunk.
     #[error("{0}")]
     Transport(#[from] TransportError),
@@ -54,6 +59,21 @@ pub enum Error {
     /// The configuration is unusable (for example a feed URL with an unsupported scheme).
     #[error("configuration: {0}")]
     Config(&'static str),
+}
+
+/// Sorts a core error into the variant an app can act on: a disk failure is [`Error::Fs`] (so
+/// "free some space" can be offered), not [`Error::Verify`], which stays for refused documents,
+/// hashes and signatures.
+impl From<lunepack_core::Error> for Error {
+    fn from(e: lunepack_core::Error) -> Self {
+        match e {
+            lunepack_core::Error::Fs(e) => Error::Fs(e),
+            lunepack_core::Error::Transport(e) => Error::Transport(e),
+            lunepack_core::Error::Cancelled => Error::Cancelled,
+            lunepack_core::Error::State(e) => Error::from(e),
+            other => Error::Verify(other),
+        }
+    }
 }
 
 impl From<RangeError> for Error {

@@ -1,6 +1,6 @@
 # State
 
-Last updated: 2026-11-14 (milestone 4, client fetch and stage, done on the branch; push and review pending)
+Last updated: 2026-11-15 (milestone 4, client fetch and stage: review round 1 fixed on the branch; re-review and push pending)
 
 ## Now
 
@@ -33,6 +33,13 @@ on branch `orch/lunepack-v1`, not pushed and not yet merged (review, gate and th
   are in `docs/DECISIONS.md` (M4-D10, 403 as an absent root, decided by the user).
 - Probe P-U1 (LuneUI on hosted runners) is in `probes/luneui/` and `probes.yml`; it has not run.
 
+M4 review round 1 (F1 to F11, `M4-R1-D1` in `docs/DECISIONS.md`) is fixed on the branch: download and scan progress totals, a
+best-effort cache cleanup after the staged commit, disk errors as `Error::Fs`, the transport worker
+holding the operation lock, `DirSource` running the transport suite, the facade re-exporting its API
+types (and `lunepack::trusted_root`), a complete cached pack re-hashed before use, the store assigning
+the record seq, a symlinked `current_tree` not followed, the task plumbing hidden in
+`unstable_internals`, and a refusal of versions whose directory names differ only in case.
+
 ## Next
 
 Push of `orch/lunepack-v1` (the first push of M2, M3 and M4; the user's stop), which runs CI on three
@@ -64,10 +71,6 @@ the staged tree).
   the failed operation and the OS code, so a repeat names itself.
 - A dropped download on the default transport leaves its worker in a socket read until the per-read
   timeout (30 s), and the updater lock stays held meanwhile (`Busy`); documented in the threat model.
-- `DirSource` has its own tests and does not run the whole transport contract suite (that needs an
-  HTTP server's validators, redirects and request log).
-- The app must name `lunepack-core` (and `lunepack-crypto` for a root key) in its own dependencies
-  for `AppId`, `Channel`, `TrustedRoot` and `CancelToken`; the facade does not re-export them.
 - Per-OS layout discovery, `Layout` for installed apps and the apply step are M5, M7 and M8.
 
 ## Blockers / open questions

@@ -89,6 +89,32 @@ impl ProgressSink {
         self.shared.mark_dirty();
     }
 
+    /// Sets the total of the current phase without touching `done` (what is to do became known
+    /// after the phase started).
+    pub fn set_total(&self, total: u64) {
+        lock(&self.shared.meta).total = total;
+        self.shared.mark_dirty();
+    }
+
+    /// Raises the total of the current phase by `n` bytes (saturating); `done` is untouched.
+    pub fn add_total(&self, n: u64) {
+        {
+            let mut meta = lock(&self.shared.meta);
+            meta.total = meta.total.saturating_add(n);
+        }
+        self.shared.mark_dirty();
+    }
+
+    /// Lowers the total of the current phase by `n` bytes (saturating at 0): work that will not be
+    /// done after all.
+    pub fn sub_total(&self, n: u64) {
+        {
+            let mut meta = lock(&self.shared.meta);
+            meta.total = meta.total.saturating_sub(n);
+        }
+        self.shared.mark_dirty();
+    }
+
     /// Starts `phase` with `total` bytes to do: `done` goes back to 0 and the file to none.
     pub fn set_phase(&self, phase: Phase, total: u64) {
         {

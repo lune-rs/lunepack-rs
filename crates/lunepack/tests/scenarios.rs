@@ -519,13 +519,18 @@ fn scenario<E: Exec>(e: &E, baseline: &Baseline, kind: Kind) {
     assert!(scan < download && download < stage, "{label}: phase order");
     let last = |phase: Phase| events.iter().rev().find(|p| p.phase == phase).cloned();
     let download_end = last(Phase::Download).expect("download event");
+    // The total is what the download moved (the plan: the whole pack, or the Range runs) and the
+    // bar ends exactly there, never past it.
     assert!(
-        download_end.total < fixture().pack_sizes[V110],
-        "{label}: libcore.so is unchanged, so fewer bytes than the pack are needed ({} vs {})",
+        download_end.total <= fixture().pack_sizes[V110],
+        "{label}: {} bytes planned for a {} byte pack",
         download_end.total,
         fixture().pack_sizes[V110]
     );
-    assert!(download_end.done >= download_end.total, "{label}");
+    assert_eq!(download_end.done, download_end.total, "{label}");
+    for p in events.iter().filter(|p| p.phase == Phase::Download) {
+        assert!(p.done <= p.total, "{label}: past 100 %: {p:?}");
+    }
     let stage_end = last(Phase::Stage).expect("stage event");
     assert_eq!(
         stage_end.done, stage_end.total,
@@ -550,11 +555,18 @@ fn scenario<E: Exec>(e: &E, baseline: &Baseline, kind: Kind) {
                     pack_requests.iter().all(|r| r.range.is_none()),
                     "{label}: the whole pack, no Range"
                 );
+                assert_eq!(download_end.total, fixture().pack_sizes[V110], "{label}");
             } else {
                 assert!(
                     pack_requests.iter().all(|r| r.range.is_some()),
                     "{label}: Range runs only"
                 );
+                let requested: u64 = pack_requests
+                    .iter()
+                    .filter_map(|r| r.range)
+                    .map(|r| r.last.map_or(0, |last| last - r.first + 1))
+                    .sum();
+                assert_eq!(download_end.total, requested, "{label}: the runs requested");
             }
         }
         Kind::Injected => {
@@ -929,7 +941,7 @@ fn dropping_stage_while_a_frame_is_decoding_stops_the_worker_and_a_fresh_call_co
 }
 
 fn live_worker_count() -> usize {
-    lunepack::live_workers()
+    lunepack::unstable_internals::live_workers()
 }
 
 // ---- progress ------------------------------------------------------------------------------------

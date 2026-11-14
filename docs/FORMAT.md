@@ -889,6 +889,10 @@ step 3 completed.
 ### 12.7 Trees on disk
 
 - Version `V`'s tree is `<versions dir>/<V's version text>`; staging builds it there (M4-D18).
+  Version texts that differ only in ASCII letter case (`1.0.0-RC1`, `1.0.0-rc1`) are different
+  versions but one directory on a case-insensitive file system, so staging refuses a version whose
+  directory name collides, ignoring case, with the current, previous, pending or staged version's, or
+  with any entry of the versions directory (`Error::VersionDirCollision`); nothing is written.
 - The **current tree** is the layout's explicit current tree when one is given (for a layout whose
   live tree is not under the versions directory), else `<versions dir>/<current.version text>`. It
   counts only when it is a real directory (a symlink is not followed); otherwise there is none and
