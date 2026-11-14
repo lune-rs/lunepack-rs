@@ -57,3 +57,8 @@ libc = "0.2"
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 toml = "1.2"
+
+# HTTP adapter (M4 step 8): ureq with rustls (ring) and the platform verifier, no content decoding
+# (D23, M4-D14). ring stays confined to lunepack-http (M4-D16).
+ureq = { version = "3.5", default-features = false, features = ["rustls", "platform-verifier", "win-system-proxy"] }
+url = "2"

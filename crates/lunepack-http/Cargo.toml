@@ -12,3 +12,28 @@ workspace = true
 
 [dependencies]
 lunepack-core.workspace = true
+# No gzip, no brotli, no aws-lc: the transport never negotiates or decodes a content coding.
+ureq = { workspace = true }
+url = { workspace = true }
+# Only to recognise a TLS failure in an error chain (ureq reports a failed handshake as an I/O
+# error around the rustls one); the same crate and features ureq already links.
+rustls = { version = "0.23", default-features = false, features = ["std"] }
+
+# macOS reads the system proxy through hyper-util's matcher (M4-D14; P-N1's verified path).
+[target.'cfg(target_os = "macos")'.dependencies]
+hyper-util = { version = "0.1", default-features = false, features = ["client-proxy", "client-proxy-system"] }
+http = "1"
+
+[dev-dependencies]
+lunepack-testkit.workspace = true
+tempfile = { workspace = true }
+# The TLS control test and the os_trust example serve TLS from a certificate made at run time.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring", "pem"] }
+time = "0.3"
+
+# Own main: the proxy tests re-run this binary as a child process with a chosen environment (the
+# environment is never changed in the parent).
+[[test]]
+name = "proxy_env"
+harness = false
