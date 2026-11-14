@@ -658,7 +658,9 @@ The reader persists, per app, the highest values it has verified:
 - the feed `seq`, per channel.
 
 A document below its floor MUST be rejected; equal is allowed. After a check verifies documents,
-the floors are raised to their values.
+the floors are raised to their values. Where the floors are persisted (the install-state record and,
+for a per-machine install, the per-user counters records) and how a reader treats that record is
+section 12.
 
 ### 11.3 Freshness and the implausible clock
 

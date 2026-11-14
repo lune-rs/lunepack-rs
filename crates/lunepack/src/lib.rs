@@ -1,5 +1,100 @@
 //! Facade crate: the public Rust API that applications depend on, and the root that wires the
 //! default adapters.
+//!
+//! An app checks for an update, downloads it resumably and stages a verified version tree with an
+//! [`Updater`]. The futures it returns are `Send + 'static` and run on any async executor, or on
+//! none through [`blocking`]: lunepack never spawns onto the caller's executor. File I/O, hashing,
+//! decoding and the default HTTP transport run on lunepack's own worker threads.
+//!
+//! - **Cancel.** Dropping a future cancels it, and a [`CancelToken`](lunepack_core::CancelToken)
+//!   in [`DownloadOptions`] cancels from elsewhere. Partial downloads stay resumable, a half-built
+//!   tree is resumed or discarded by the next call, and state changes only at a commit.
+//! - **Progress.** The optional callback runs on the thread that polls the operation, never on a
+//!   worker, and sees coalesced counters, so a slow callback does not stall a download.
+//! - **Lock.** Every operation takes `<state dir>/lock`; another holder gives [`Error::Busy`]. The
+//!   OS releases it when a holder dies.
+//! - **Locations.** A [`Layout`] names the state, cache and versions directories; per-OS discovery
+//!   comes later. The app compiles its trusted root key in
+//!   ([`TrustedRoot::from_parts`](lunepack_core::TrustedRoot::from_parts) in `lunepack-core`).
+//!
+//! The examples below build the updater the same way (`# ` lines are hidden). Each is compiled but
+//! not run, because it would reach the network.
+//!
+//! # With tokio
+//!
+//! ```no_run
+//! # use lunepack::{DownloadOptions, Layout, Updater, UpdaterBuilder};
+//! # use lunepack_core::{AppId, Channel, TrustedRoot};
+//! # fn trusted_root() -> TrustedRoot { unimplemented!("the app compiles its root key in") }
+//! # fn build() -> Result<Updater, lunepack::Error> {
+//! let layout = Layout::User {
+//!     state_dir: "/home/me/.local/share/org.example.app/state".into(),
+//!     cache_dir: "/home/me/.cache/org.example.app".into(),
+//!     versions_dir: "/home/me/.local/share/org.example.app/versions".into(),
+//!     current_tree: None,
+//! };
+//! UpdaterBuilder::new(
+//!     AppId::parse("org.example.app").expect("app id"),
+//!     trusted_root(),
+//!     "https://updates.example.org/app/feed-stable.json",
+//!     Channel::parse("stable").expect("channel"),
+//!     layout,
+//! )
+//! .build()
+//! # }
+//! #[tokio::main(flavor = "current_thread")]
+//! async fn main() -> Result<(), lunepack::Error> {
+//!     let updater = build()?;
+//!     if let Some(info) = updater.check().await? {
+//!         let options = DownloadOptions {
+//!             progress: Some(Box::new(|p| println!("{:?}: {} of {}", p.phase, p.done, p.total))),
+//!             cancel: None,
+//!         };
+//!         let downloaded = updater.download(&info, options).await?;
+//!         let staged = updater.stage(downloaded).await?;
+//!         println!("staged {} in {}", staged.version(), staged.tree().display());
+//!     }
+//!     Ok(())
+//! }
+//! ```
+//!
+//! # With smol
+//!
+//! ```no_run
+//! # use lunepack::{DownloadOptions, Updater};
+//! # fn build() -> Result<Updater, lunepack::Error> { unimplemented!("as in the tokio example") }
+//! fn main() -> Result<(), lunepack::Error> {
+//!     smol::block_on(async {
+//!         let updater = build()?;
+//!         if let Some(info) = updater.check().await? {
+//!             let downloaded = updater.download(&info, DownloadOptions::default()).await?;
+//!             updater.stage(downloaded).await?;
+//!         }
+//!         Ok(())
+//!     })
+//! }
+//! ```
+//!
+//! # Without an async runtime
+//!
+//! [`blocking::Updater`] runs the same operations as plain calls on the calling thread; a
+//! [`CancelToken`](lunepack_core::CancelToken) is the only way to cancel. Never call it from inside
+//! an async task.
+//!
+//! ```no_run
+//! # use lunepack::{DownloadOptions, Updater};
+//! # use lunepack_core::CancelToken;
+//! # fn build() -> Result<Updater, lunepack::Error> { unimplemented!("as in the tokio example") }
+//! fn main() -> Result<(), lunepack::Error> {
+//!     let updater = lunepack::blocking::Updater::from(build()?);
+//!     let cancel = CancelToken::new();
+//!     if let Some(info) = updater.check(&cancel)? {
+//!         let downloaded = updater.download(&info, DownloadOptions::default(), &cancel)?;
+//!         updater.stage(downloaded, &cancel)?;
+//!     }
+//!     Ok(())
+//! }
+//! ```
 
 use std::time::{SystemTime, UNIX_EPOCH};
 

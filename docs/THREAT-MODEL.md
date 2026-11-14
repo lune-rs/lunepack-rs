@@ -4,7 +4,7 @@ Status: **draft**, awaiting approval together with `docs/FORMAT.md`.
 
 What lunepack's update and install path defends against, and what it does not. The format rules
 referred to here are in `docs/FORMAT.md`; the decisions in `docs/DECISIONS.md` (D7, D17, D21, D24,
-D33, D34, D35, M3-D1 to M3-D13).
+D33, D34, D35, M3-D1 to M3-D13, M4-D1 to M4-D23).
 
 ## Assets
 
@@ -49,6 +49,9 @@ Stopped:
   size check, the strict JSON pre-pass, the envelope parse and base64 decoding: pure safe Rust,
   fuzzed. Payload parsers, frame descriptors and decoders run only on authenticated bytes.
 - **Tracking**: no identifying query parameters; the rollout bucket is computed locally.
+- **Hostile responses to a Range request (M4)**: see "The download path" below. A short, long,
+  mislabelled, re-encoded or mixed-version body is refused or caught by a hash before anything is
+  placed.
 
 Not stopped:
 - **Freeze**: withholding new documents (feed, key set, a root rotation) keeps clients on the
@@ -102,6 +105,17 @@ from its own user.
 Stopped: it cannot alter a per-machine install or its machine-scope state (written only by the
 privileged engine in admin-only locations).
 
+The library's own files are in the same position (M4). For a per-user install the state directory,
+the download cache and the version trees are writable by that user, so such a process can:
+- rewrite or delete the install-state records, including lowering the floors or emptying `bad`
+  (FORMAT.md 12). The records are checksummed against a torn write, not authenticated; the checksum
+  is no defence against an attacker who writes a whole record. Not stopped, like the tree itself;
+- plant or edit cache files. This gains nothing beyond what it can already do: a complete cache file
+  is named by its SHA-256 and is hashed again before use (and a frame again by `decode_verified`), so a
+  planted file fails the hash, is refetched, and at worst costs the user a download;
+- hold or release the updater lock, which only gives `Busy` or lets two operations race on files each
+  of which is checked by hash. A race can fail a stage; it cannot place unverified bytes.
+
 ### 5. Local process running as another user
 
 Stopped:
@@ -112,6 +126,11 @@ Stopped:
   caller-supplied path or URL, never runs payload code before verification, and never acts for an
   app id without a protected install record. Machine-scope floors are kept by the engine; the
   non-elevated library also keeps its own floors and enforces the higher of the two.
+- The library never writes the machine install's state (M4, FORMAT.md 12.6): it reads the machine
+  record and the tree through the layout, and writes only this user's `install-counters` records,
+  cache and lock in the user's own directories. Another user cannot lower this user's floors, and
+  this user's counters cannot lower the machine record's: a check uses the field-wise higher of the
+  two. A counters record whose install id differs from the machine record's stops the load.
 
 Not stopped: denying service to other users' updates by holding resources, within OS limits.
 
@@ -130,6 +149,12 @@ SHA-256 matched the publisher-signed manifest, and only after the descriptor (co
 sizes at most 16 MiB, BCJ2 sub-stream lengths) passed the pure-core checks. Feeding the decoder
 crafted input therefore needs a release key (class 2) or the publisher (class 6). The output is
 capped at the signed size and checked against the signed file hash before placement.
+
+The client keeps that order in memory (M4-D11). The staging engine reads exactly the signed `length`
+bytes of a frame into memory and `decode_verified` hashes those bytes and decodes the same buffer, so
+the decoder never reads bytes that were checked earlier and re-read from a file an attacker could
+change in between. A frame that does not hash right is never decoded, whether it came from the cache,
+a Range response, the full pack or the current tree.
 
 ## The UI process is untrusted (Revision 2)
 
@@ -211,6 +236,60 @@ is a publisher-side compromise (classes 2, 3 and 6), never something a client ha
   between the moves. Nothing is uploaded between them; if the publisher uploads after the first move,
   the old key is still accepted by clients until the second.
 
+## The download path (M4)
+
+The client's fetch and staging code adds untrusted input beyond the signed documents. Every item
+below is checked before it can influence a file placed in a version tree.
+
+**Response headers, Range responses and redirects.** A transport reports every header (names
+lowercased, values as raw bytes, duplicates kept) and core applies one set of rules to all
+transports (M4-D9), failing closed:
+- at most one each of `content-range`, `content-length`, `content-encoding`, `etag` and
+  `last-modified`; a duplicate fails;
+- a `206` needs a `Content-Range` that matches `bytes <first>-<last>/<total>` exactly (lowercase
+  unit, digits only, at most 16 digits, values at most 2^53 - 1), whose range equals the one
+  requested and whose total equals the signed pack size; `*`, unsatisfied-range forms and any
+  mismatch are an error, so a host cannot hand over a different window of a different file;
+- `content-encoding` absent or `identity`; `Accept-Encoding` is never sent and no coding is decoded,
+  so a compression layer cannot change the bytes between the host and the hash;
+- `If-Range` carries a strong ETag or the Last-Modified value; if the file changed (or the host
+  ignores `If-Range`), the final hash catches the mixed file, the part is deleted and the download
+  restarts once from byte 0;
+- a transport follows at most 5 redirects and returns the final response. A redirect changes where
+  bytes come from, never what they must hash to: documents are verified by signature and artifacts
+  by the signed SHA-256 and size, so a redirect to a hostile host (class 1) gains what that class
+  already has. The default transport sends only `User-Agent: lunepack`, `Range` and `If-Range`:
+  no app id, version or install id (D24).
+
+**Cache files.** The cache holds frames and packs under their SHA-256 and `.part` files with a small
+strict-JSON sidecar (the validator and a hash of the URL). All of it is local input of class 4. A
+complete file was hashed when it was finished and is hashed again when used; a `.part` longer than
+its signed size is deleted; a sidecar that is missing, does not parse or names another URL is ignored, so the part is
+resumed without `If-Range` and the final hash decides.
+Documents are never cached, so the floors alone protect them.
+
+**State records.** The install-state records are local input too (FORMAT.md 12). M4-D23 sets the
+rule for a record that is damaged or wrong:
+- a file that fails an *integrity* check (name, size cap, magic, format byte, length, checksum, or a
+  payload `seq` that differs from its name) is a torn write: it is skipped and the next lower record
+  is tried;
+- a record that passes integrity but fails parsing or the semantic rules (or names a newer format,
+  an unknown critical feature or another app id) **stops the load** and writes nothing. Its checksum
+  shows a writer wrote it whole, and falling back to an older record would let one with lower floors
+  win, which is a rollback.
+
+So the load returns the newest record that was completely written, or fails; it never returns an
+older one while a newer whole one exists. A commit refuses to lower any floor and reads back its own
+bytes before it writes. A record from a newer build (for example after an app rollback) fails closed
+with a distinct error rather than a panic.
+
+**Absent root documents and 403 (M4-D10).** The root walk asks for `root-<k+1>.json` and treats 404,
+410 and 403 as "no such root"; every other status and every transport error fails the check. The
+user decided to include 403 because an S3 bucket without `s3:ListBucket` answers 403 for a missing
+key, and a host that cannot say 404 would otherwise fail every check. It adds no attacker
+capability: an attacker who controls responses (class 1) can already answer 404 and hide a rotation,
+which is the freeze already described there, bounded by the key set's and feed's expiry.
+
 ## Denial-of-service bounds
 
 | Resource | Bound |
@@ -219,11 +298,31 @@ is a publisher-side compromise (classes 2, 3 and 6), never something a client ha
 | Signature checks per document | at most 16 signatures, each a single Ed25519 verification |
 | JSON | depth 32; duplicate keys rejected; integers at most 2^53 − 1 |
 | Counts | 16 root keys, 64 release keys, 10,000 releases, 200,000 entries |
-| Downloads | capped by signed sizes; nothing fetched is trusted before its hash matches |
+| Downloads | capped by signed sizes; nothing fetched is trusted before its hash matches. A response's `Content-Length`, when present, must equal the expected byte count and is checked before the body is read; a body is read to at most that count and fails on one byte more (M4-D9) |
+| Range requests | one at a time; at most 64 runs, else the full pack; a `200` to a Range request becomes the full-pack download, never a second request (M4-D8) |
+| Install-state records | at most 1 MiB each; at most three kept after a commit |
 | Decoder memory | the signed dictionary per LZMA2 stream, at most 16 MiB (three for BCJ2), checked before allocation; concurrent decoders limited by a memory budget |
 | Decoder output | exactly the signed size; decoding stops as soon as it would exceed it |
-| Root walk | each step needs signatures from both roots, so its length is bounded by real rotations |
+| Root walk | each step needs signatures from both roots, so its length is bounded by real rotations; a check also stops after 1024 steps |
 | Freeze | feed and key-set expiry turn a silent freeze into a reported error |
+
+Memory budget (M4-D11, M4-D13). Staging charges each decode job `length + decoder memory + 256 KiB`
+of I/O buffers against a budget (default 256 MiB) and runs at most `min(available_parallelism, 8)`
+jobs at once. The decoder memory is the frame's signed dictionaries plus a constant per codec
+measured for `lzma-rust2` (about 10 MiB for the LZMA2 variants, about 12 MiB for BCJ2, none for
+stored), and a measurement test keeps the constants above what the decoder really allocates. A job
+that alone exceeds the budget runs only when nothing else runs, so a large signed frame slows
+staging and never deadlocks it. The peak is therefore bounded by the budget plus one oversized job,
+and by the signed sizes, not by anything the host sends.
+
+Cancel latency. Cancelling or dropping an operation stops its work at the next check: the transport
+is polled on the caller's task, file I/O and decoding run on lunepack's worker threads and look at
+the cancel token between chunks, jobs and writes. The default HTTP transport is the exception: a
+worker blocked inside a socket read ends at the per-read timeout (30 s by default, a builder
+option), and the updater lock stays held until that worker returns, so a new operation meanwhile gets
+`Busy`. An injected async transport has no such delay, because its futures die with the operation's.
+A host that stalls a connection can therefore delay a retry by up to the read timeout; it cannot
+corrupt anything.
 
 ## Clock
 
