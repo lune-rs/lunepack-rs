@@ -1152,6 +1152,8 @@ impl ReadAt for CountingReader {
     fn read_exact_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FsError> {
         if self.reads.fetch_add(1, Ordering::SeqCst) == 0 {
             self.token.cancel();
+            // Let the polling side notice and cancel the worker's own token before it reads on.
+            thread::sleep(Duration::from_millis(100));
         }
         self.inner.read_exact_at(offset, buf)
     }
@@ -1251,4 +1253,70 @@ fn a_cancelled_rehash_of_a_cached_pack_stops_at_the_next_read_and_keeps_the_pack
         assert!(exists(&mem, &path), "wrong={wrong}: the pack was removed");
     }
     workers_stopped();
+}
+
+#[test]
+fn a_cancelled_hash_of_a_resumed_part_stops_and_leaves_the_part_as_it_was() {
+    let _s = serial();
+    let big: Vec<u8> = (0..1_048_576usize).map(|i| (i % 251) as u8).collect();
+    let digest = sha(&big);
+    // A part short of the pack (the resume path, hashed on the cache-writer job) and a part as
+    // long as the pack (the full-length check on the cache-check job).
+    for part_len in [900_000usize, big.len()] {
+        let mem = MemFs::new();
+        let origin = FakeOrigin::new();
+        origin.put(PACK_NAME, big.clone());
+        let token = CancelToken::new();
+        let reads = Arc::new(AtomicU64::new(0));
+        let fs: Arc<dyn Fs> = Arc::new(CancelOnRead {
+            inner: mem.clone(),
+            token: token.clone(),
+            reads: Arc::clone(&reads),
+        });
+        let cache = Cache::new(Arc::clone(&fs), PathBuf::from(CACHE));
+        cache.ensure_dirs().expect("dirs");
+        let part = cache.part_path(CacheKind::Pack, &digest);
+        let mut w = mem.create_new(&part).expect("create");
+        w.write_all(&big[..part_len]).expect("write");
+        w.sync().expect("sync");
+        drop(w);
+        let ctx = FetchCtx {
+            transport: Arc::new(FakeTransport::new(origin)),
+            cache,
+            hasher: Arc::new(FakeHasher),
+            lock: None,
+            cancel: token,
+            progress: None,
+            policy: FetchPolicy::default(),
+        };
+        let pack = PackTarget {
+            url: format!("{FAKE_BASE_URL}/{PACK_NAME}"),
+            size: big.len() as u64,
+            sha256: digest,
+        };
+        let result = block_on(fetch_pack(&ctx, &pack, None));
+        assert!(
+            matches!(result, Err(Error::Cancelled)),
+            "{part_len}: {result:?}"
+        );
+        workers_stopped();
+        assert!(
+            reads.load(Ordering::SeqCst) <= 2,
+            "{part_len}: the hash read on after the cancel ({} reads)",
+            reads.load(Ordering::SeqCst)
+        );
+        assert_eq!(
+            read(&mem, &part),
+            big[..part_len],
+            "{part_len}: the part changed"
+        );
+        assert!(
+            !exists(&mem, &pack_path_of(&digest)),
+            "{part_len}: completed"
+        );
+    }
+}
+
+fn pack_path_of(digest: &Sha256Digest) -> PathBuf {
+    Path::new(CACHE).join("packs").join(digest.to_hex())
 }

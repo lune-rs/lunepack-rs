@@ -341,23 +341,32 @@ struct OpenPart {
     written: u64,
 }
 
+/// What opening a part needs besides the entry: the hasher, and the token checked while a resumed
+/// prefix is hashed.
+pub(crate) struct PartTools<'a> {
+    pub(crate) hasher: &'a dyn Hasher,
+    pub(crate) cancel: &'a CancelToken,
+}
+
 impl Cache {
     /// Opens the entry's part for writing. `resume_from > 0` appends to the existing part of that
     /// length (its bytes are hashed first); otherwise any old part is replaced by an empty one and
-    /// a fresh sidecar.
+    /// a fresh sidecar. Hashing the resumed prefix checks `cancel` before every read; a cancelled
+    /// call returns [`Error::Cancelled`] before it touches the part.
     fn open_part(
         &self,
-        hasher: &dyn Hasher,
+        tools: &PartTools<'_>,
         kind: CacheKind,
         sha: &Sha256Digest,
         resume_from: u64,
         validator: Option<&Validator>,
         url_sha256: &Sha256Digest,
     ) -> Result<OpenPart, Error> {
+        let (hasher, cancel) = (tools.hasher, tools.cancel);
         let path = self.part_path(kind, sha);
         let mut hash = hasher.sha256_start();
         if resume_from > 0 {
-            hash_prefix(&*self.fs, &path, resume_from, &mut hash, None)?;
+            hash_prefix(&*self.fs, &path, resume_from, &mut hash, Some(cancel))?;
             // Bytes past `resume_from` (none, unless the part grew since it was measured) would
             // be appended after; cut them so the part is exactly the hashed prefix.
             self.fs.truncate(&path, resume_from)?;
@@ -446,6 +455,8 @@ pub(crate) struct RunWriter {
     validator: Option<Validator>,
     url_sha256: Sha256Digest,
     bad: Vec<Sha256Digest>,
+    /// The writer job's token, checked while a resumed prefix is hashed.
+    cancel: CancelToken,
 }
 
 impl RunWriter {
@@ -456,6 +467,7 @@ impl RunWriter {
         start: u64,
         validator: Option<Validator>,
         url_sha256: Sha256Digest,
+        cancel: CancelToken,
     ) -> Self {
         RunWriter {
             cache,
@@ -472,6 +484,7 @@ impl RunWriter {
             validator,
             url_sha256,
             bad: Vec::new(),
+            cancel,
         }
     }
 
@@ -489,8 +502,12 @@ impl RunWriter {
                 continue;
             }
             if self.slots[i].part.is_none() {
+                let tools = PartTools {
+                    hasher: &*self.hasher,
+                    cancel: &self.cancel,
+                };
                 let part = self.cache.open_part(
-                    &*self.hasher,
+                    &tools,
                     CacheKind::Frame,
                     &t.sha,
                     t.resume_from,
@@ -586,7 +603,7 @@ impl PackWriter {
     /// starts an empty part (a `200`, or nothing to resume).
     pub(crate) fn new(
         cache: Cache,
-        hasher: &dyn Hasher,
+        tools: &PartTools<'_>,
         sha: Sha256Digest,
         size: u64,
         resume_from: u64,
@@ -594,7 +611,7 @@ impl PackWriter {
         url_sha256: Sha256Digest,
     ) -> Result<Self, Error> {
         let part = cache.open_part(
-            hasher,
+            tools,
             CacheKind::Pack,
             &sha,
             resume_from,

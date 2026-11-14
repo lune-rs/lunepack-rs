@@ -27,7 +27,7 @@ use lunepack_core::{
 use url::Url;
 
 use crate::Error;
-use crate::cache::{Cache, CacheKind, PackWriter, RunTarget, RunWriter, WriteReport};
+use crate::cache::{Cache, CacheKind, PackWriter, PartTools, RunTarget, RunWriter, WriteReport};
 use crate::pipe::{self, AsyncSender, Closed};
 use crate::progress::ProgressSink;
 use crate::task::{OpLock, spawn_job};
@@ -508,26 +508,32 @@ async fn stream_body<M>(
     make: M,
 ) -> Result<WriteReport, Error>
 where
-    M: FnOnce() -> Result<Writer, Error> + Send + 'static,
+    M: FnOnce(&CancelToken) -> Result<Writer, Error> + Send + 'static,
 {
     let writer_cancel = CancelToken::new();
     let (tx, rx) = pipe::from_async::<WriteMsg>(pipe::DEFAULT_CAPACITY, writer_cancel.clone());
-    let writer = spawn_job("cache-writer", writer_cancel, ctx.lock.clone(), move |_| {
-        let mut writer = make()?;
-        loop {
-            match rx.recv() {
-                Ok(Some(WriteMsg::Data(chunk))) => {
-                    if let Err(e) = writer.write(&chunk) {
-                        writer.abort();
-                        return Err(e);
+    let writer = spawn_job(
+        "cache-writer",
+        writer_cancel,
+        ctx.lock.clone(),
+        move |token| {
+            // The token reaches the writer so hashing a resumed prefix stops when the job is cancelled.
+            let mut writer = make(token)?;
+            loop {
+                match rx.recv() {
+                    Ok(Some(WriteMsg::Data(chunk))) => {
+                        if let Err(e) = writer.write(&chunk) {
+                            writer.abort();
+                            return Err(e);
+                        }
                     }
+                    Ok(Some(WriteMsg::Discard)) => return writer.discard(),
+                    Ok(None) => return writer.end(),
+                    Err(Closed) => return Ok(writer.abort()),
                 }
-                Ok(Some(WriteMsg::Discard)) => return writer.discard(),
-                Ok(None) => return writer.end(),
-                Err(Closed) => return Ok(writer.abort()),
             }
-        }
-    });
+        },
+    );
     let mut got = 0u64;
     loop {
         let next = cancellable(&ctx.cancel, response.body.next_chunk()).await?;
@@ -651,7 +657,7 @@ pub async fn fetch_run(
     let cache = ctx.cache.clone();
     let hasher = Arc::clone(&ctx.hasher);
     let fresh_validator = info.validator.clone();
-    let report = stream_body(ctx, response, expected, move || {
+    let report = stream_body(ctx, response, expected, move |token| {
         Ok(Writer::Run(RunWriter::new(
             cache,
             hasher,
@@ -659,6 +665,7 @@ pub async fn fetch_run(
             start,
             fresh_validator,
             url_sha256,
+            token.clone(),
         )))
     })
     .await?;
@@ -740,10 +747,14 @@ pub async fn fetch_pack(
         let cache = ctx.cache.clone();
         let hasher = Arc::clone(&ctx.hasher);
         let target = pack.clone();
-        let make = move || {
+        let make = move |token: &CancelToken| {
+            let tools = PartTools {
+                hasher: &*hasher,
+                cancel: token,
+            };
             Ok(Writer::Pack(PackWriter::new(
                 cache,
-                &*hasher,
+                &tools,
                 target.sha256,
                 target.size,
                 resume_from,
@@ -753,7 +764,7 @@ pub async fn fetch_pack(
         };
         let report = match response {
             Some(response) => stream_body(ctx, response, expected, make).await?,
-            None => job(ctx, "cache-check", move || make()?.end()).await?,
+            None => job_with_cancel(ctx, "cache-check", move |token| make(token)?.end()).await?,
         };
         match report {
             WriteReport::Complete { .. } => {
