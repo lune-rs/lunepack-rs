@@ -2,6 +2,7 @@
 
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
+use std::path::Path;
 use std::pin::pin;
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
@@ -11,9 +12,9 @@ use lunepack_core::error::{CodecError, SignatureError};
 use lunepack_core::fetch::classify;
 use lunepack_core::{
     BlockingResponse, BlockingTransport, ByteRange, CancelToken, Clock, Codec, CodecId,
-    DecodeReport, Encoder, Error, FrameView, Hasher, Head, RangeError, Request, ResponseInfo,
-    Sha256Digest, SignatureAlg, Signer, StreamView, Transport, TransportError, TransportErrorKind,
-    Validator, Verifier,
+    DecodeReport, Encoder, Error, FileKind, FrameView, Fs, FsErrorKind, Hasher, Head, RangeError,
+    Request, ResponseInfo, Sha256Digest, SignatureAlg, Signer, StreamView, Transport,
+    TransportError, TransportErrorKind, Validator, Verifier,
 };
 use lunepack_testkit::*;
 
@@ -1112,4 +1113,416 @@ fn dropping_the_loopback_server_stops_it_within_a_second() {
         TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_err(),
         "the port still accepts connections"
     );
+}
+
+// ---- MemFs (M4 step 3) -----------------------------------------------------------------------------------
+
+fn mem() -> (MemFs, &'static Path) {
+    let fs = MemFs::new();
+    let root = Path::new("/mem");
+    fs.create_dir_all(root).unwrap();
+    fs.sync_dir(Path::new("/")).unwrap();
+    (fs, root)
+}
+
+fn put(fs: &MemFs, path: &Path, bytes: &[u8], sync: bool) {
+    let mut f = fs.create_new(path).unwrap();
+    f.write_all(bytes).unwrap();
+    if sync {
+        f.sync().unwrap();
+    }
+}
+
+fn after(fs: &MemFs, mode: RecoverMode, path: &Path) -> Option<Vec<u8>> {
+    let image = fs.recover(mode);
+    image
+        .symlink_metadata(path)
+        .unwrap()
+        .map(|_| image.read_capped(path, 1 << 20).unwrap())
+}
+
+#[test]
+fn memfs_passes_the_fs_suite_with_symlinks_everywhere() {
+    let (fs, root) = mem();
+    run_fs_suite_with(&fs, root, true);
+    // The suite leaves nothing behind.
+    assert!(fs.list_dir(root).unwrap().is_empty());
+    // And on a second run over the same disk.
+    run_fs_suite(&fs, root);
+}
+
+#[test]
+fn the_fs_suite_catches_a_fs_that_follows_symlinks_on_create() {
+    // A wrapper whose create_new follows a dangling symlink (writes through it) must fail the suite.
+    struct Follows(MemFs);
+    impl Fs for Follows {
+        fn read_capped(&self, p: &Path, m: u64) -> Result<Vec<u8>, lunepack_core::FsError> {
+            self.0.read_capped(p, m)
+        }
+        fn open_read(
+            &self,
+            p: &Path,
+        ) -> Result<Box<dyn lunepack_core::ReadAt>, lunepack_core::FsError> {
+            self.0.open_read(p)
+        }
+        fn create_new(
+            &self,
+            p: &Path,
+        ) -> Result<Box<dyn lunepack_core::FileWrite>, lunepack_core::FsError> {
+            // Lets a dangling symlink through as if the path were free.
+            match self.0.create_new(p) {
+                Err(e)
+                    if e.kind == FsErrorKind::AlreadyExists
+                        && self.0.read_capped(p, 1).is_err() =>
+                {
+                    Ok(Box::new(Sink))
+                }
+                other => other,
+            }
+        }
+        fn open_append(
+            &self,
+            p: &Path,
+        ) -> Result<Box<dyn lunepack_core::FileWrite>, lunepack_core::FsError> {
+            self.0.open_append(p)
+        }
+        fn truncate(&self, p: &Path, l: u64) -> Result<(), lunepack_core::FsError> {
+            self.0.truncate(p, l)
+        }
+        fn rename(&self, a: &Path, b: &Path) -> Result<(), lunepack_core::FsError> {
+            self.0.rename(a, b)
+        }
+        fn remove_file(&self, p: &Path) -> Result<(), lunepack_core::FsError> {
+            self.0.remove_file(p)
+        }
+        fn remove_dir_all_nofollow(&self, p: &Path) -> Result<(), lunepack_core::FsError> {
+            self.0.remove_dir_all_nofollow(p)
+        }
+        fn create_dir_all(&self, p: &Path) -> Result<(), lunepack_core::FsError> {
+            self.0.create_dir_all(p)
+        }
+        fn list_dir(
+            &self,
+            p: &Path,
+        ) -> Result<Vec<lunepack_core::DirEntryInfo>, lunepack_core::FsError> {
+            self.0.list_dir(p)
+        }
+        fn symlink_metadata(
+            &self,
+            p: &Path,
+        ) -> Result<Option<lunepack_core::Meta>, lunepack_core::FsError> {
+            self.0.symlink_metadata(p)
+        }
+        fn sync_dir(&self, p: &Path) -> Result<(), lunepack_core::FsError> {
+            self.0.sync_dir(p)
+        }
+        fn copy_file(&self, a: &Path, b: &Path) -> Result<(), lunepack_core::FsError> {
+            self.0.copy_file(a, b)
+        }
+        fn set_exec(&self, p: &Path, e: bool) -> Result<(), lunepack_core::FsError> {
+            self.0.set_exec(p, e)
+        }
+        fn symlink(&self, t: &str, l: &Path) -> Result<(), lunepack_core::FsError> {
+            self.0.symlink(t, l)
+        }
+        fn try_lock(
+            &self,
+            p: &Path,
+        ) -> Result<Option<Box<dyn lunepack_core::LockGuard>>, lunepack_core::FsError> {
+            self.0.try_lock(p)
+        }
+    }
+    struct Sink;
+    impl Write for Sink {
+        fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    impl lunepack_core::FileWrite for Sink {
+        fn sync(&mut self) -> Result<(), lunepack_core::FsError> {
+            Ok(())
+        }
+    }
+    let (fs, root) = mem();
+    let broken = std::panic::catch_unwind(|| run_fs_suite_with(&Follows(fs), root, true));
+    assert!(
+        broken.is_err(),
+        "the suite passed a create_new that accepts a dangling symlink"
+    );
+}
+
+#[test]
+fn a_synced_file_survives_drop_volatile_and_an_unsynced_one_does_not() {
+    let (fs, root) = mem();
+    put(&fs, &root.join("synced"), b"durable", true);
+    put(&fs, &root.join("unsynced"), b"volatile", false);
+    fs.sync_dir(root).unwrap();
+    // The entries are durable; the bytes of `unsynced` are not.
+    assert_eq!(
+        after(&fs, RecoverMode::DropVolatile, &root.join("synced")),
+        Some(b"durable".to_vec())
+    );
+    assert_eq!(
+        after(&fs, RecoverMode::DropVolatile, &root.join("unsynced")),
+        Some(Vec::new())
+    );
+    // A file whose directory was never synced is gone, synced bytes or not.
+    put(&fs, &root.join("no-dir-sync"), b"x", true);
+    assert_eq!(
+        after(&fs, RecoverMode::DropVolatile, &root.join("no-dir-sync")),
+        None
+    );
+    assert_eq!(
+        after(&fs, RecoverMode::KeepVolatile, &root.join("no-dir-sync")),
+        Some(b"x".to_vec())
+    );
+}
+
+#[test]
+fn keep_volatile_keeps_everything_and_torn_volatile_keeps_a_prefix() {
+    let (fs, root) = mem();
+    put(&fs, &root.join("f"), b"0123456789", false);
+    fs.sync_dir(root).unwrap();
+    let f = root.join("f");
+    assert_eq!(after(&fs, RecoverMode::DropVolatile, &f), Some(Vec::new()));
+    assert_eq!(
+        after(&fs, RecoverMode::KeepVolatile, &f),
+        Some(b"0123456789".to_vec())
+    );
+    assert_eq!(
+        after(&fs, RecoverMode::TornVolatile(3), &f),
+        Some(b"012".to_vec())
+    );
+    assert_eq!(
+        after(&fs, RecoverMode::TornVolatile(0), &f),
+        Some(Vec::new())
+    );
+    assert_eq!(
+        after(&fs, RecoverMode::TornVolatile(99), &f),
+        Some(b"0123456789".to_vec())
+    );
+    // An append after a sync: the synced prefix stays, `n` more bytes survive.
+    let mut w = fs.open_append(&f).unwrap();
+    w.sync().unwrap();
+    w.write_all(b"ABCDEF").unwrap();
+    assert_eq!(
+        after(&fs, RecoverMode::TornVolatile(2), &f),
+        Some(b"0123456789AB".to_vec())
+    );
+    assert_eq!(
+        after(&fs, RecoverMode::DropVolatile, &f),
+        Some(b"0123456789".to_vec())
+    );
+    // A cut file keeps its synced bytes in the torn image.
+    fs.truncate(&f, 4).unwrap();
+    assert_eq!(
+        after(&fs, RecoverMode::TornVolatile(1), &f),
+        Some(b"0123456789".to_vec())
+    );
+    assert_eq!(
+        after(&fs, RecoverMode::KeepVolatile, &f),
+        Some(b"0123".to_vec())
+    );
+}
+
+#[test]
+fn a_rename_is_volatile_until_its_directory_is_synced() {
+    let (fs, root) = mem();
+    put(&fs, &root.join("old"), b"data", true);
+    fs.sync_dir(root).unwrap();
+    fs.rename(&root.join("old"), &root.join("new")).unwrap();
+    assert_eq!(
+        after(&fs, RecoverMode::DropVolatile, &root.join("old")),
+        Some(b"data".to_vec())
+    );
+    assert_eq!(
+        after(&fs, RecoverMode::DropVolatile, &root.join("new")),
+        None
+    );
+    fs.sync_dir(root).unwrap();
+    assert_eq!(
+        after(&fs, RecoverMode::DropVolatile, &root.join("old")),
+        None
+    );
+    assert_eq!(
+        after(&fs, RecoverMode::DropVolatile, &root.join("new")),
+        Some(b"data".to_vec())
+    );
+    // The same for a removal.
+    fs.remove_file(&root.join("new")).unwrap();
+    assert!(after(&fs, RecoverMode::DropVolatile, &root.join("new")).is_some());
+    fs.sync_dir(root).unwrap();
+    assert!(after(&fs, RecoverMode::DropVolatile, &root.join("new")).is_none());
+}
+
+/// The commit sequence of M4-D5: create_new, write, sync, sync_dir.
+fn commit(fs: &MemFs, dir: &Path) -> Result<(), lunepack_core::FsError> {
+    let mut f = fs.create_new(&dir.join("rec"))?;
+    f.write_all(b"record")
+        .map_err(|e| lunepack_core::FsError::from_io(dir, e))?;
+    f.sync()?;
+    fs.sync_dir(dir)
+}
+
+#[test]
+fn crash_after_n_fails_op_n_and_everything_later() {
+    let (probe, root) = mem();
+    let before = probe.op_count();
+    commit(&probe, root).unwrap();
+    let ops = probe.op_count() - before;
+    assert_eq!(ops, 4, "create_new, write, sync, sync_dir");
+
+    for n in 0..ops {
+        let (fs, root) = mem();
+        let start = fs.op_count();
+        fs.crash_after(start + n);
+        let err = commit(&fs, root).unwrap_err();
+        assert_eq!(err.kind, FsErrorKind::Crashed, "crash at op {n}");
+        assert!(fs.is_crashed());
+        assert_eq!(fs.op_count(), start + n, "the crashed op is not counted");
+        // Everything after fails, reads included.
+        assert_eq!(
+            fs.read_capped(&root.join("rec"), 10).unwrap_err().kind,
+            FsErrorKind::Crashed
+        );
+        assert_eq!(
+            fs.create_dir_all(&root.join("x")).unwrap_err().kind,
+            FsErrorKind::Crashed
+        );
+        assert_eq!(
+            fs.try_lock(&root.join("l")).err().map(|e| e.kind),
+            Some(FsErrorKind::Crashed)
+        );
+        // The disk after the crash: the record is durable only if sync_dir ran (n == 4 never crashes).
+        let image = fs.recover(RecoverMode::DropVolatile);
+        assert!(!image.is_crashed());
+        assert_eq!(image.op_count(), 0);
+        assert_eq!(
+            image.symlink_metadata(&root.join("rec")).unwrap(),
+            None,
+            "op {n}"
+        );
+    }
+    // Crash exactly after the last op: nothing fails, the record is durable.
+    let (fs, root) = mem();
+    fs.crash_after(fs.op_count() + ops);
+    commit(&fs, root).unwrap();
+    assert_eq!(
+        after(&fs, RecoverMode::DropVolatile, &root.join("rec")),
+        Some(b"record".to_vec())
+    );
+}
+
+#[test]
+fn a_writer_fails_with_a_crashed_fs_error_after_the_crash() {
+    let (fs, root) = mem();
+    let mut f = fs.create_new(&root.join("w")).unwrap();
+    fs.crash_now();
+    let err = f.write_all(b"x").unwrap_err();
+    let inner = err
+        .get_ref()
+        .unwrap()
+        .downcast_ref::<lunepack_core::FsError>()
+        .unwrap();
+    assert_eq!(inner.kind, FsErrorKind::Crashed);
+    assert_eq!(f.sync().unwrap_err().kind, FsErrorKind::Crashed);
+    assert!(f.flush().is_err());
+}
+
+#[test]
+fn locks_are_per_path_and_a_killed_process_releases_them() {
+    let (fs, root) = mem();
+    let a = fs.process();
+    let b = fs.process();
+    let lock = root.join("lock");
+    let held = a.try_lock(&lock).unwrap().expect("a takes it");
+    assert!(b.try_lock(&lock).unwrap().is_none());
+    assert!(fs.try_lock(&lock).unwrap().is_none());
+    assert!(b.try_lock(&root.join("other")).unwrap().is_some());
+    fs.kill_process(&a);
+    let taken = b.try_lock(&lock).unwrap();
+    assert!(taken.is_some(), "the dead process's lock is free");
+    // The dead process's old guard dropping must not release b's lock.
+    drop(held);
+    assert!(fs.try_lock(&lock).unwrap().is_none());
+    drop(taken);
+    assert!(fs.try_lock(&lock).unwrap().is_some());
+    // A missing directory is an error, a recovered disk holds no locks.
+    assert_eq!(
+        fs.try_lock(&root.join("nodir/lock")).err().map(|e| e.kind),
+        Some(FsErrorKind::NotFound)
+    );
+    let _guard = fs.try_lock(&lock).unwrap().unwrap();
+    assert!(
+        fs.recover(RecoverMode::KeepVolatile)
+            .try_lock(&lock)
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
+fn memfs_follows_relative_symlinks_and_stops_loops() {
+    let (fs, root) = mem();
+    fs.create_dir_all(&root.join("d/e")).unwrap();
+    put(&fs, &root.join("d/file"), b"via link", true);
+    fs.symlink("../file", &root.join("d/e/rel")).unwrap();
+    assert_eq!(
+        fs.read_capped(&root.join("d/e/rel"), 100).unwrap(),
+        b"via link"
+    );
+    fs.symlink("/mem/d", &root.join("abs")).unwrap();
+    assert_eq!(
+        fs.read_capped(&root.join("abs/file"), 100).unwrap(),
+        b"via link"
+    );
+    assert_eq!(
+        fs.list_dir(&root.join("abs")).unwrap().len(),
+        2,
+        "list_dir follows a symlink to a directory"
+    );
+    fs.symlink("b", &root.join("a")).unwrap();
+    fs.symlink("a", &root.join("b")).unwrap();
+    assert_eq!(
+        fs.read_capped(&root.join("a"), 1).unwrap_err().kind,
+        FsErrorKind::Other
+    );
+    assert_eq!(
+        fs.symlink_metadata(&root.join("a"))
+            .unwrap()
+            .map(|m| m.kind),
+        Some(FileKind::Symlink)
+    );
+    // Symlinks are entries: volatile until the directory is synced, then durable.
+    assert!(
+        fs.recover(RecoverMode::DropVolatile)
+            .symlink_metadata(&root.join("abs"))
+            .unwrap()
+            .is_none()
+    );
+    fs.sync_dir(root).unwrap();
+    assert!(
+        fs.recover(RecoverMode::DropVolatile)
+            .symlink_metadata(&root.join("abs"))
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
+fn memfs_errors_name_only_the_file() {
+    let (fs, root) = mem();
+    let err = fs
+        .read_capped(&root.join("secret-dir/inner.txt"), 1)
+        .unwrap_err();
+    let shown = format!("{err} {err:?}");
+    assert!(
+        !shown.contains("secret-dir") && !shown.contains("/mem"),
+        "{shown}"
+    );
+    let err = fs.read_capped(&root.join("only-name.txt"), 1).unwrap_err();
+    assert!(format!("{err}").contains("only-name.txt"));
 }

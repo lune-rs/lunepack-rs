@@ -8,6 +8,7 @@ pub mod error;
 pub mod feed;
 pub mod fetch;
 pub mod frame;
+pub mod fs;
 #[doc(hidden)]
 pub mod fuzz;
 pub mod ident;
@@ -41,6 +42,9 @@ pub use fetch::{
 };
 pub use frame::{
     CheckedFrame, FrameDesc, StreamDesc, check_file_frame, decode_verified, decoder_memory,
+};
+pub use fs::{
+    DirEntryInfo, FileKind, FileWrite, Fs, FsError, FsErrorKind, LockGuard, Meta, ReadAt,
 };
 pub use ident::{AppId, Channel};
 pub use keyset::{KeySetDocument, ReleaseKeyEntry, VerifiedKeySet, verify_key_set};

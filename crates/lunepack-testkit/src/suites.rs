@@ -2,6 +2,7 @@
 //! implementation and by this crate against the fakes. They panic (assert) on a violation.
 
 use std::io::{self, Read, Write};
+use std::path::Path;
 
 use lunepack_core::encoding::{base64_encode, hex_encode};
 use lunepack_core::error::FrameError;
@@ -9,9 +10,9 @@ use lunepack_core::fetch::classify;
 use lunepack_core::frame::{MAX_DICT_SIZE, MIN_DICT_SIZE};
 use lunepack_core::{
     BlockingTransport, ByteRange, CancelToken, Clock, Codec, CodecId, DecodeReport, EncodedFrame,
-    Encoder, Error, FrameDesc, FrameView, Hasher, Head, Outcome, Request, ResponseInfo,
-    Sha256Digest, SignatureAlg, Signer, StreamDesc, StreamView, Transport, TransportError,
-    TransportErrorKind, U53, Validator, Verifier, decode_verified,
+    Encoder, Error, FileKind, FrameDesc, FrameView, Fs, FsError, FsErrorKind, Hasher, Head,
+    Outcome, Request, ResponseInfo, Sha256Digest, SignatureAlg, Signer, StreamDesc, StreamView,
+    Transport, TransportError, TransportErrorKind, U53, Validator, Verifier, decode_verified,
 };
 
 use crate::transport::{SeenRequest, TransportFixture, block_on};
@@ -1075,4 +1076,364 @@ pub fn run_transport_suite(
     seen: &dyn Fn() -> Vec<SeenRequest>,
 ) {
     transport_cases(&AsyncClient(transport), base_url, seen);
+}
+
+// ---- filesystem suite (M4 step 3) ---------------------------------------------------------------------
+
+fn fs_kind<T>(result: Result<T, FsError>, what: &str) -> FsErrorKind {
+    match result {
+        Ok(_) => panic!("{what}: succeeded, expected an error"),
+        Err(e) => e.kind,
+    }
+}
+
+/// Filesystem contract. `root` must be an existing directory with no symlink in its path (a host
+/// temp directory canonicalised); the suite works in a directory of its own below it and removes it
+/// at the end. Symlink cases run only on Unix; [`run_fs_suite_with`] chooses.
+pub fn run_fs_suite(fs: &dyn Fs, root: &Path) {
+    run_fs_suite_with(fs, root, cfg!(unix));
+}
+
+/// [`run_fs_suite`] with the symlink cases switched on or off (`MemFs` runs them everywhere).
+pub fn run_fs_suite_with(fs: &dyn Fs, root: &Path, symlinks: bool) {
+    let base = root.join("lunepack-fs-suite");
+    if fs
+        .symlink_metadata(&base)
+        .expect("stat the suite directory")
+        .is_some()
+    {
+        fs.remove_dir_all_nofollow(&base)
+            .expect("clear an old suite directory");
+    }
+    fs.create_dir_all(&base)
+        .expect("create the suite directory");
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        fs_cases(fs, root, &base, symlinks);
+    }));
+    let _ = fs.remove_dir_all_nofollow(&base);
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+fn write_file(fs: &dyn Fs, path: &Path, bytes: &[u8]) {
+    let mut f = fs.create_new(path).expect("create_new");
+    f.write_all(bytes).expect("write");
+    f.sync().expect("sync");
+}
+
+fn fs_cases(fs: &dyn Fs, root: &Path, base: &Path, symlinks: bool) {
+    // create_dir_all: nested, idempotent, a file in the way.
+    let deep = base.join("a/b/c");
+    fs.create_dir_all(&deep).expect("create_dir_all nested");
+    fs.create_dir_all(&deep).expect("create_dir_all again");
+    assert_eq!(
+        fs.symlink_metadata(&deep).unwrap().map(|m| m.kind),
+        Some(FileKind::Dir)
+    );
+    assert_eq!(
+        fs.symlink_metadata(&base.join("none")).unwrap(),
+        None,
+        "a missing path"
+    );
+    write_file(fs, &base.join("plain"), b"x");
+    assert_eq!(
+        fs_kind(
+            fs.create_dir_all(&base.join("plain/sub")),
+            "create_dir_all through a file"
+        ),
+        FsErrorKind::NotADirectory
+    );
+    fs.sync_dir(base).expect("sync_dir");
+    assert_eq!(
+        fs_kind(fs.sync_dir(&base.join("none")), "sync_dir of a missing dir"),
+        FsErrorKind::NotFound
+    );
+
+    // create_new, write, sync, read_capped at max and max + 1, errors name only the file name.
+    let file = base.join("a/data.bin");
+    let bytes: Vec<u8> = (0..1000u32).map(|i| (i % 251) as u8).collect();
+    write_file(fs, &file, &bytes);
+    assert_eq!(
+        fs_kind(fs.create_new(&file), "create_new on an existing file"),
+        FsErrorKind::AlreadyExists
+    );
+    assert_eq!(
+        fs.read_capped(&file, 1000).expect("read_capped at max"),
+        bytes
+    );
+    assert_eq!(
+        fs_kind(fs.read_capped(&file, 999), "read_capped at max + 1"),
+        FsErrorKind::TooLarge
+    );
+    assert_eq!(fs.read_capped(&file, u64::MAX).unwrap().len(), 1000);
+    let missing = base.join("a/missing-file.bin");
+    let err = fs.read_capped(&missing, 10).unwrap_err();
+    assert_eq!(err.kind, FsErrorKind::NotFound);
+    assert!(
+        err.to_string().contains("missing-file.bin"),
+        "the message names the file: {err}"
+    );
+    let shown = format!("{err} {err:?}");
+    assert!(
+        !shown.contains(&*root.to_string_lossy()),
+        "an error shows a full path: {shown}"
+    );
+    assert_eq!(
+        fs.symlink_metadata(&file).unwrap(),
+        Some(lunepack_core::Meta {
+            kind: FileKind::File,
+            len: 1000
+        })
+    );
+
+    // Positional reads.
+    let reader = fs.open_read(&file).expect("open_read");
+    assert_eq!(reader.size().unwrap(), 1000);
+    let mut buf = [0u8; 10];
+    reader.read_exact_at(100, &mut buf).expect("read_exact_at");
+    assert_eq!(&buf, &bytes[100..110]);
+    reader.read_exact_at(990, &mut buf).expect("read the tail");
+    assert_eq!(&buf, &bytes[990..]);
+    reader.read_exact_at(0, &mut []).expect("an empty read");
+    assert!(
+        reader.read_exact_at(991, &mut buf).is_err(),
+        "a read past the end"
+    );
+    assert_eq!(
+        fs_kind(fs.open_read(&missing), "open_read of a missing file"),
+        FsErrorKind::NotFound
+    );
+
+    // Append and truncate.
+    let mut w = fs.open_append(&file).expect("open_append");
+    w.write_all(b"tail").unwrap();
+    w.sync().unwrap();
+    assert_eq!(fs.read_capped(&file, 2000).unwrap().len(), 1004);
+    fs.truncate(&file, 10).expect("truncate");
+    assert_eq!(fs.read_capped(&file, 2000).unwrap(), &bytes[..10]);
+    assert_eq!(
+        fs_kind(fs.open_append(&missing), "open_append of a missing file"),
+        FsErrorKind::NotFound
+    );
+    assert_eq!(
+        fs_kind(fs.truncate(&missing, 0), "truncate of a missing file"),
+        FsErrorKind::NotFound
+    );
+
+    // copy_file: a new copy, never over an existing file; set_exec on files only.
+    let copy = base.join("a/copy.bin");
+    fs.copy_file(&file, &copy).expect("copy_file");
+    assert_eq!(fs.read_capped(&copy, 100).unwrap(), &bytes[..10]);
+    assert_eq!(
+        fs_kind(
+            fs.copy_file(&file, &copy),
+            "copy_file over an existing file"
+        ),
+        FsErrorKind::AlreadyExists
+    );
+    assert_eq!(
+        fs_kind(
+            fs.copy_file(&missing, &base.join("a/c2")),
+            "copy_file of a missing file"
+        ),
+        FsErrorKind::NotFound
+    );
+    fs.open_append(&copy)
+        .and_then(|mut f| f.sync())
+        .expect("sync a copied file");
+    fs.set_exec(&copy, true).expect("set_exec on");
+    fs.set_exec(&copy, false).expect("set_exec off");
+    assert_eq!(
+        fs_kind(fs.set_exec(&missing, true), "set_exec of a missing file"),
+        FsErrorKind::NotFound
+    );
+
+    // list_dir.
+    let mut names: Vec<_> = fs
+        .list_dir(&base.join("a"))
+        .expect("list_dir")
+        .into_iter()
+        .map(|e| (e.name.to_string_lossy().into_owned(), e.kind))
+        .collect();
+    names.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(
+        names,
+        vec![
+            ("b".to_owned(), FileKind::Dir),
+            ("copy.bin".to_owned(), FileKind::File),
+            ("data.bin".to_owned(), FileKind::File),
+        ]
+    );
+    assert_eq!(
+        fs_kind(fs.list_dir(&missing), "list_dir of a missing dir"),
+        FsErrorKind::NotFound
+    );
+    assert!(fs.list_dir(&file).is_err(), "list_dir of a file");
+
+    // rename a file and a directory.
+    let moved = base.join("a/moved.bin");
+    fs.rename(&copy, &moved).expect("rename a file");
+    assert_eq!(fs.symlink_metadata(&copy).unwrap(), None);
+    assert_eq!(fs.read_capped(&moved, 100).unwrap(), &bytes[..10]);
+    assert_eq!(
+        fs_kind(
+            fs.rename(&missing, &base.join("zzz")),
+            "rename of a missing path"
+        ),
+        FsErrorKind::NotFound
+    );
+    fs.rename(&base.join("a/b"), &base.join("b2"))
+        .expect("rename a directory");
+    assert_eq!(
+        fs.symlink_metadata(&base.join("b2/c"))
+            .unwrap()
+            .map(|m| m.kind),
+        Some(FileKind::Dir)
+    );
+    fs.sync_dir(base).unwrap();
+    fs.sync_dir(&base.join("a")).unwrap();
+
+    // remove_file: a file; not a directory; not a missing path.
+    fs.remove_file(&moved).expect("remove_file");
+    assert_eq!(fs.symlink_metadata(&moved).unwrap(), None);
+    assert_eq!(
+        fs_kind(fs.remove_file(&moved), "remove_file of a missing file"),
+        FsErrorKind::NotFound
+    );
+    assert!(
+        fs.remove_file(&base.join("b2")).is_err(),
+        "remove_file of a directory"
+    );
+    assert_eq!(
+        fs_kind(
+            fs.remove_dir_all_nofollow(&base.join("plain")),
+            "remove_dir_all of a file"
+        ),
+        FsErrorKind::NotADirectory
+    );
+    fs.remove_dir_all_nofollow(&base.join("b2"))
+        .expect("remove_dir_all");
+    assert_eq!(fs.symlink_metadata(&base.join("b2")).unwrap(), None);
+    assert_eq!(
+        fs_kind(
+            fs.remove_dir_all_nofollow(&base.join("b2")),
+            "remove_dir_all of a missing dir"
+        ),
+        FsErrorKind::NotFound
+    );
+
+    // try_lock: exclusive, released on drop, per path.
+    let lock_path = base.join("lock");
+    let first = fs
+        .try_lock(&lock_path)
+        .expect("try_lock")
+        .expect("the first lock");
+    assert!(
+        fs.try_lock(&lock_path).expect("try_lock again").is_none(),
+        "a second lock"
+    );
+    let other = base.join("other-lock");
+    let second = fs
+        .try_lock(&other)
+        .expect("try_lock other")
+        .expect("a lock on another path");
+    drop(first);
+    let again = fs.try_lock(&lock_path).expect("try_lock after drop");
+    assert!(again.is_some(), "the lock is free after the guard dropped");
+    drop((again, second));
+
+    if symlinks {
+        fs_symlink_cases(fs, base);
+    }
+}
+
+fn fs_symlink_cases(fs: &dyn Fs, base: &Path) {
+    let outside = base.join("outside");
+    fs.create_dir_all(&outside).unwrap();
+    write_file(fs, &outside.join("keep.txt"), b"keep");
+
+    // A symlink to a file: reported as a symlink, read through, listed as one.
+    let target_file = base.join("target.txt");
+    write_file(fs, &target_file, b"hello");
+    let link = base.join("link-to-file");
+    fs.symlink(&target_file.to_string_lossy(), &link)
+        .expect("symlink");
+    assert_eq!(
+        fs.symlink_metadata(&link).unwrap().map(|m| m.kind),
+        Some(FileKind::Symlink)
+    );
+    assert_eq!(fs.read_capped(&link, 100).unwrap(), b"hello");
+    assert_eq!(
+        fs_kind(
+            fs.symlink(&target_file.to_string_lossy(), &link),
+            "symlink over a symlink"
+        ),
+        FsErrorKind::AlreadyExists
+    );
+
+    // create_new on a dangling symlink fails and does not write through it.
+    let dangling = base.join("dangling");
+    let dangling_target = base.join("not-there.txt");
+    fs.symlink(&dangling_target.to_string_lossy(), &dangling)
+        .unwrap();
+    assert_eq!(
+        fs_kind(fs.create_new(&dangling), "create_new on a dangling symlink"),
+        FsErrorKind::AlreadyExists
+    );
+    assert_eq!(
+        fs.symlink_metadata(&dangling_target).unwrap(),
+        None,
+        "created through the link"
+    );
+
+    // create_dir_all through a symlink fails.
+    let dir_link = base.join("dir-link");
+    fs.symlink(&outside.to_string_lossy(), &dir_link).unwrap();
+    let err = fs.create_dir_all(&dir_link.join("new")).unwrap_err();
+    assert!(
+        matches!(
+            err.kind,
+            FsErrorKind::IsSymlink | FsErrorKind::NotADirectory | FsErrorKind::Other
+        ),
+        "create_dir_all through a symlink: {err}"
+    );
+    assert_eq!(
+        fs.symlink_metadata(&outside.join("new")).unwrap(),
+        None,
+        "created through the link"
+    );
+
+    // remove_dir_all_nofollow removes the link itself and never reaches the outside directory.
+    let tree = base.join("tree");
+    fs.create_dir_all(&tree.join("inner")).unwrap();
+    write_file(fs, &tree.join("inner/f"), b"f");
+    fs.symlink(&outside.to_string_lossy(), &tree.join("inner/escape"))
+        .unwrap();
+    fs.remove_dir_all_nofollow(&tree)
+        .expect("remove a tree holding a symlink");
+    assert_eq!(fs.symlink_metadata(&tree).unwrap(), None);
+    assert_eq!(
+        fs.read_capped(&outside.join("keep.txt"), 10).unwrap(),
+        b"keep"
+    );
+    fs.remove_dir_all_nofollow(&dir_link)
+        .expect("remove a symlink to a directory");
+    assert_eq!(fs.symlink_metadata(&dir_link).unwrap(), None);
+    assert_eq!(
+        fs.read_capped(&outside.join("keep.txt"), 10).unwrap(),
+        b"keep"
+    );
+
+    // remove_file removes a link, not its target; rename moves the link.
+    fs.remove_file(&link).expect("remove_file on a symlink");
+    assert_eq!(fs.read_capped(&target_file, 100).unwrap(), b"hello");
+    fs.rename(&dangling, &base.join("dangling2"))
+        .expect("rename a symlink");
+    assert_eq!(
+        fs.symlink_metadata(&base.join("dangling2"))
+            .unwrap()
+            .map(|m| m.kind),
+        Some(FileKind::Symlink)
+    );
 }

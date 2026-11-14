@@ -6,6 +6,7 @@
 use std::fmt;
 
 use crate::fetch::RangeError;
+use crate::fs::FsError;
 use crate::path::{PathError, TreeError};
 use crate::target::TargetError;
 use crate::traits::CodecId;
@@ -584,6 +585,9 @@ pub enum Error {
     /// A response broke the HTTP response rules of the fetch (M4-D9).
     #[error("response refused: {0}")]
     Range(#[from] RangeError),
+    /// A filesystem operation failed.
+    #[error("{0}")]
+    Fs(#[from] FsError),
     /// The operation's cancel token was cancelled.
     #[error("cancelled")]
     Cancelled,
