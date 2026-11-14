@@ -739,6 +739,11 @@ fn is_real_dir(fs: &dyn Fs, path: &Path) -> Result<bool, Error> {
 }
 
 /// Runs `f` over the updater on a job that holds `lock`, cancellable through `cancel`.
+///
+/// `f` gets the job's own token. It is cancelled when the job's future is dropped, which happens
+/// when the operation's future is dropped and also when `cancel` fires (`cancellable` then returns
+/// and drops the job future). A token of the operation alone would leave the worker running to the
+/// end after a drop (C9: dropping the future cancels).
 async fn on_job<T, F>(
     inner: &Arc<Inner>,
     lock: Option<&OpLock>,
@@ -751,9 +756,8 @@ where
     F: FnOnce(&Inner, &CancelToken) -> Result<T, Error> + Send + 'static,
 {
     let inner = Arc::clone(inner);
-    let op_cancel = cancel.clone();
-    let future = spawn_job(name, CancelToken::new(), lock.cloned(), move |_| {
-        f(&inner, &op_cancel)
+    let future = spawn_job(name, CancelToken::new(), lock.cloned(), move |job| {
+        f(&inner, job)
     });
     cancellable(cancel, future).await??
 }

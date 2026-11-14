@@ -33,3 +33,9 @@ tempfile = { workspace = true }
 futures = { version = "0.3", default-features = false, features = ["std", "executor"] }
 tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "macros", "time"] }
 smol = "2"
+
+# Own main: the cross-process tests re-run this binary as a child process (as lunepack-crypto's
+# signer test does), and the child's stdout carries a line protocol the libtest harness would break.
+[[test]]
+name = "cross_process"
+harness = false
