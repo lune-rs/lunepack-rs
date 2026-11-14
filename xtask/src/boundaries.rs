@@ -68,6 +68,15 @@ pub const CORE_EXTERNAL_ALLOWLIST: &[&str] = &[
 /// later confined crate is one line. Matched on the package name, never the rename.
 pub const CONFINED: &[(&str, &[&str])] = &[("lzma-rust2", &["lunepack-codec-lzma"])];
 
+/// Reach-only-through crates (M4-D16): `(crate, via)`. In the lock graph of the workspace and of
+/// `fuzz/`, no workspace member may reach `crate` except through the member `via`. `ring` is the
+/// only crypto provider the project allows (D17), and only the HTTP adapter links it.
+pub const REACH_ONLY_THROUGH: &[(&str, &str)] = &[("ring", "lunepack-http")];
+
+/// Packages no lock the check reads may contain (D17), matched by exact package name, so
+/// `openssl-probe` is not `openssl`.
+pub const FORBIDDEN_ANYWHERE: &[&str] = &["aws-lc-rs", "aws-lc-sys", "openssl", "openssl-sys"];
+
 /// Exact version pins: `(package, dependency, requirement string as cargo reports it)`. The
 /// package must exist in the workspace and must declare the dependency, always with this
 /// requirement.
@@ -389,6 +398,7 @@ fn check_lock(md: &Metadata, manifests: &Manifests, out: &mut Vec<Violation>) {
         &members,
         out,
     );
+    check_lock_graph(WORKSPACE_LABEL, manifests.lock.as_ref(), &members, out);
     for probe in &manifests.probes {
         let members = probe_member(&probe.manifest)
             .into_iter()
@@ -429,6 +439,185 @@ fn check_lock(md: &Metadata, manifests: &Manifests, out: &mut Vec<Violation>) {
             &members,
             out,
         );
+        check_lock_graph(&fuzz.label, fuzz.lock.as_ref(), &members, out);
+    }
+}
+
+/// One `[[package]]` entry of a lock file, for the graph rules.
+struct LockNode {
+    name: String,
+    version: String,
+    /// `None` for a path package (a workspace member in a clean lock).
+    source: Option<String>,
+}
+
+/// The node a lock `dependencies` string names. The string is `name`, `name version` or
+/// `name version (source)`; a bare name resolves only when exactly one entry has that name. An
+/// unrecognised form, no match and several matches are all errors (fail closed).
+fn resolve_lock_dep(nodes: &[LockNode], dep: &str) -> std::result::Result<usize, String> {
+    let parts: Vec<&str> = dep.split(' ').collect();
+    let (name, version, source) = match parts.as_slice() {
+        [n] => (*n, None, None),
+        [n, v] => (*n, Some(*v), None),
+        [n, v, src] if src.len() > 2 && src.starts_with('(') && src.ends_with(')') => {
+            (*n, Some(*v), Some(&src[1..src.len() - 1]))
+        }
+        _ => return Err(format!("`{dep}` is not a form this check recognises")),
+    };
+    let found: Vec<usize> = nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| {
+            n.name == name
+                && version.is_none_or(|v| n.version == v)
+                && source.is_none_or(|s| n.source.as_deref() == Some(s))
+        })
+        .map(|(i, _)| i)
+        .collect();
+    match found.as_slice() {
+        [one] => Ok(*one),
+        [] => Err(format!("`{dep}` matches no entry of the lock")),
+        _ => Err(format!("`{dep}` matches several entries of the lock")),
+    }
+}
+
+/// Rules `forbidden` and `reach` (M4-D16) over one lock file's package graph. Nodes are
+/// `[[package]]` entries; edges are their `dependencies` strings, which cover every platform and
+/// every dev edge. Roots are the source-less entries that are members of `members`.
+///
+/// - `forbidden`: an entry named exactly like a [`FORBIDDEN_ANYWHERE`] package.
+/// - `reach`: for each [`REACH_ONLY_THROUGH`] pair, the walk from each root does not enter a
+///   member named `via`; reaching `crate` anyway is a violation that names one shortest path.
+/// - A `dependencies` value that is not an array of strings, and an edge that matches no entry or
+///   several, is a `reach` violation too (the graph cannot be trusted). A missing lock or a
+///   malformed `[[package]]` array is reported by [`check_lock_for`], not here.
+fn check_lock_graph(
+    label: &str,
+    lock: Option<&toml::Table>,
+    members: &BTreeSet<(String, String)>,
+    out: &mut Vec<Violation>,
+) {
+    let Some(packages) = lock
+        .and_then(|l| l.get("package"))
+        .and_then(|p| p.as_array())
+    else {
+        return;
+    };
+    let mut nodes = Vec::new();
+    let mut raw_deps = Vec::new();
+    for entry in packages {
+        let Some(table) = entry.as_table() else {
+            continue;
+        };
+        let Some(name) = table.get("name").and_then(|n| n.as_str()) else {
+            continue;
+        };
+        nodes.push(LockNode {
+            name: name.to_string(),
+            version: table
+                .get("version")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string(),
+            source: table.get("source").map(|s| match s.as_str() {
+                Some(text) => text.to_string(),
+                None => "<not a string>".to_string(),
+            }),
+        });
+        raw_deps.push(table.get("dependencies"));
+    }
+
+    for node in &nodes {
+        if FORBIDDEN_ANYWHERE.contains(&node.name.as_str()) {
+            out.push(v(
+                &node.name,
+                "forbidden",
+                format!(
+                    "Cargo.lock ({label}) contains `{}` {}: no lock may (D17)",
+                    node.name, node.version
+                ),
+            ));
+        }
+    }
+
+    let mut edges: Vec<Vec<usize>> = vec![Vec::new(); nodes.len()];
+    for (i, deps) in raw_deps.iter().enumerate() {
+        let name = &nodes[i].name;
+        let Some(deps) = deps else {
+            continue;
+        };
+        let Some(deps) = deps.as_array() else {
+            out.push(v(
+                name,
+                "reach",
+                format!("Cargo.lock ({label}): `dependencies` of `{name}` is not an array"),
+            ));
+            continue;
+        };
+        for dep in deps {
+            let Some(dep) = dep.as_str() else {
+                out.push(v(
+                    name,
+                    "reach",
+                    format!(
+                        "Cargo.lock ({label}): a `dependencies` entry of `{name}` is not a string"
+                    ),
+                ));
+                continue;
+            };
+            match resolve_lock_dep(&nodes, dep) {
+                Ok(j) => edges[i].push(j),
+                Err(why) => out.push(v(
+                    name,
+                    "reach",
+                    format!("Cargo.lock ({label}): `{name}` depends on {why}"),
+                )),
+            }
+        }
+    }
+
+    let is_member =
+        |n: &LockNode| n.source.is_none() && members.contains(&(n.name.clone(), n.version.clone()));
+    for (target, via) in REACH_ONLY_THROUGH {
+        let blocked = |i: usize| is_member(&nodes[i]) && nodes[i].name == *via;
+        for root in (0..nodes.len()).filter(|&i| is_member(&nodes[i]) && !blocked(i)) {
+            // Breadth first, so the first hit has a shortest path.
+            let mut parent: Vec<Option<usize>> = vec![None; nodes.len()];
+            let mut seen = vec![false; nodes.len()];
+            seen[root] = true;
+            let mut queue = std::collections::VecDeque::from([root]);
+            let mut hit = None;
+            while let Some(at) = queue.pop_front() {
+                if nodes[at].name == *target {
+                    hit = Some(at);
+                    break;
+                }
+                for &next in &edges[at] {
+                    if !seen[next] && !blocked(next) {
+                        seen[next] = true;
+                        parent[next] = Some(at);
+                        queue.push_back(next);
+                    }
+                }
+            }
+            if let Some(mut at) = hit {
+                let mut path = vec![nodes[at].name.clone()];
+                while let Some(p) = parent[at] {
+                    path.push(nodes[p].name.clone());
+                    at = p;
+                }
+                path.reverse();
+                out.push(v(
+                    &nodes[root].name,
+                    "reach",
+                    format!(
+                        "Cargo.lock ({label}): `{}` reaches `{target}` other than through `{via}`: {}",
+                        nodes[root].name,
+                        path.join(" -> ")
+                    ),
+                ));
+            }
+        }
     }
 }
 

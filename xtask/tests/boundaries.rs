@@ -978,6 +978,228 @@ lz = { package = "lzma-rust2", version = "=0.25.0" }"#,
         assert_has(&fx.run().1, "lunepack-codec-lzma", "exact-pin");
     }
 
+    // M4-D16: ring only through lunepack-http; aws-lc and openssl forbidden --------------------------
+
+    /// A lock chain `ureq -> rustls -> ring` (crates.io entries), for the reach tests.
+    fn tls_chain() -> String {
+        [
+            lock_crate("ureq", "3.5.2", Some("[\"rustls 0.23.46\"]")),
+            lock_crate("rustls", "0.23.46", Some("[\"ring 0.17.14\"]")),
+            lock_crate("ring", "0.17.14", None),
+        ]
+        .concat()
+    }
+
+    /// The clean fixture with the member lock entries' dependencies and extra lock crates.
+    fn with_graph(members: &[(&str, &str)], extra: &str) -> Fx {
+        let mut fx = Fx::clean();
+        for (name, deps) in members {
+            fx.lock_member_extra
+                .insert((*name).into(), format!("dependencies = {deps}\n"));
+        }
+        fx.lock_extra = Some(extra.to_string());
+        fx
+    }
+
+    fn detail_of<'a>(vs: &'a [Violation], package: &str, rule: &str) -> &'a str {
+        vs.iter()
+            .find(|x| x.package == package && x.rule == rule)
+            .map(|x| x.detail.as_str())
+            .unwrap_or_else(|| panic!("expected {package}: {rule}, got:\n{}", render(vs)))
+    }
+
+    #[test]
+    fn v_ring_through_the_http_adapter_passes() {
+        let fx = with_graph(
+            &[
+                ("lunepack", "[\"lunepack-core\", \"lunepack-http\"]"),
+                ("lunepack-http", "[\"lunepack-core\", \"ureq\"]"),
+            ],
+            &tls_chain(),
+        );
+        assert_clean(&fx.run().1);
+    }
+
+    #[test]
+    fn v_ring_reached_by_the_facade_directly_fails_and_names_the_path() {
+        let fx = with_graph(
+            &[
+                ("lunepack", "[\"lunepack-core\", \"rustls\"]"),
+                ("lunepack-http", "[\"lunepack-core\", \"ureq\"]"),
+            ],
+            &tls_chain(),
+        );
+        let vs = fx.run().1;
+        assert_has(&vs, "lunepack", "reach");
+        let detail = detail_of(&vs, "lunepack", "reach");
+        assert!(
+            detail.contains("lunepack -> rustls -> ring"),
+            "the path is named: {detail}"
+        );
+        // Only the offending member is named.
+        assert!(!has(&vs, "lunepack-http", "reach"), "{}", render(&vs));
+    }
+
+    #[test]
+    fn v_a_dev_dependency_on_rcgen_reaches_ring_and_fails() {
+        // The lock records dev edges like any other: the facade's dev-dependency on rcgen is an edge.
+        let extra = [
+            lock_crate("rcgen", "0.14.10", Some("[\"ring 0.17.14\"]")),
+            lock_crate("ring", "0.17.14", None),
+        ]
+        .concat();
+        let fx = with_graph(&[("lunepack", "[\"lunepack-core\", \"rcgen\"]")], &extra);
+        let vs = fx.run().1;
+        let detail = detail_of(&vs, "lunepack", "reach");
+        assert!(detail.contains("lunepack -> rcgen -> ring"), "{detail}");
+    }
+
+    #[test]
+    fn v_the_http_adapter_itself_may_reach_ring_by_normal_and_dev_edges() {
+        let extra = [
+            lock_crate("rcgen", "0.14.10", Some("[\"ring 0.17.14\"]")),
+            lock_crate("rustls", "0.23.46", Some("[\"ring 0.17.14\"]")),
+            lock_crate("ring", "0.17.14", None),
+        ]
+        .concat();
+        let fx = with_graph(
+            &[(
+                "lunepack-http",
+                "[\"lunepack-core\", \"rcgen\", \"rustls\"]",
+            )],
+            &extra,
+        );
+        assert_clean(&fx.run().1);
+    }
+
+    #[test]
+    fn v_a_crates_io_package_named_like_the_via_member_is_not_exempt() {
+        // A transitive `lunepack-http` from crates.io is not the member, so it is walked.
+        let extra = [
+            lock_crate("lunepack-http", "9.9.9", Some("[\"ring 0.17.14\"]")),
+            lock_crate("ring", "0.17.14", None),
+        ]
+        .concat();
+        let fx = with_graph(
+            &[("lunepack", "[\"lunepack-core\", \"lunepack-http 9.9.9\"]")],
+            &extra,
+        );
+        assert_has(&fx.run().1, "lunepack", "reach");
+    }
+
+    #[test]
+    fn v_forbidden_crates_fail_by_exact_name_only() {
+        for name in ["aws-lc-sys", "aws-lc-rs", "openssl", "openssl-sys"] {
+            let fx = with_graph(&[], &lock_crate(name, "1.0.0", None));
+            assert_has(&fx.run().1, name, "forbidden");
+        }
+        let fx = with_graph(&[], &lock_crate("openssl-probe", "0.1.6", None));
+        assert_clean(&fx.run().1);
+    }
+
+    #[test]
+    fn v_forbidden_crates_in_the_fuzz_lock_fail_too() {
+        let lock = format!(
+            "{FUZZ_LOCK_HEAD}{}",
+            lock_crate("aws-lc-sys", "0.1.0", None)
+        );
+        let (_, vs) = with_fuzz(FUZZ_MANIFEST, Some(&lock));
+        assert_has(&vs, "aws-lc-sys", "forbidden");
+    }
+
+    #[test]
+    fn v_an_ambiguous_bare_name_fails_closed() {
+        let extra = [
+            lock_crate("rustls", "0.23.46", Some("[\"ring\"]")),
+            lock_crate("ring", "0.17.14", None),
+            lock_crate("ring", "0.16.20", None),
+        ]
+        .concat();
+        let fx = with_graph(
+            &[
+                ("lunepack-http", "[\"lunepack-core\", \"rustls\"]"),
+                ("lunepack", "[\"lunepack-core\"]"),
+            ],
+            &extra,
+        );
+        let vs = fx.run().1;
+        assert_has(&vs, "rustls", "reach");
+        assert!(
+            detail_of(&vs, "rustls", "reach").contains("several"),
+            "{}",
+            render(&vs)
+        );
+    }
+
+    #[test]
+    fn v_an_unresolvable_or_unrecognised_edge_fails_closed() {
+        for dep in [
+            "nothing-here 1.0.0",
+            "ring 0.17.14 extra (src) more",
+            "ring 9.9.9",
+        ] {
+            let fx = with_graph(
+                &[("lunepack", &format!("[\"lunepack-core\", \"{dep}\"]"))],
+                &lock_crate("ring", "0.17.14", None),
+            );
+            assert_has(&fx.run().1, "lunepack", "reach");
+        }
+    }
+
+    #[test]
+    fn v_a_non_array_or_non_string_dependencies_value_fails_closed() {
+        let fx = with_graph(
+            &[("lunepack", "\"ring\"")],
+            &lock_crate("ring", "0.17.14", None),
+        );
+        assert_has(&fx.run().1, "lunepack", "reach");
+        let fx = with_graph(
+            &[("lunepack", "[1, 2]")],
+            &lock_crate("ring", "0.17.14", None),
+        );
+        assert_has(&fx.run().1, "lunepack", "reach");
+    }
+
+    #[test]
+    fn v_a_ring_edge_in_the_fuzz_lock_fails() {
+        let lock = FUZZ_LOCK_HEAD.replace(
+            "dependencies = [\"libfuzzer-sys\", \"lunepack-core\"]",
+            "dependencies = [\"libfuzzer-sys\", \"lunepack-core\", \"rustls\"]",
+        );
+        let lock = format!(
+            "{lock}{}{}",
+            lock_crate("rustls", "0.23.46", Some("[\"ring 0.17.14\"]")),
+            lock_crate("ring", "0.17.14", None)
+        );
+        let (_, vs) = with_fuzz(FUZZ_MANIFEST, Some(&lock));
+        let detail = detail_of(&vs, "lunepack-fuzz", "reach");
+        assert!(
+            detail.contains("lunepack-fuzz -> rustls -> ring"),
+            "{detail}"
+        );
+        assert!(detail.contains("(fuzz)"), "{detail}");
+    }
+
+    #[test]
+    fn v_a_probe_lock_with_ring_passes() {
+        let dir = Fx::clean().write();
+        let probe = dir.path().join("probes").join("demo");
+        fs::create_dir_all(probe.join("src")).unwrap();
+        fs::write(probe.join("Cargo.toml"), manifest("demo", "", "")).unwrap();
+        fs::write(probe.join("src/lib.rs"), "").unwrap();
+        fs::write(
+            probe.join("Cargo.lock"),
+            format!(
+                "version = 4\n\n[[package]]\nname = \"demo\"\nversion = \"0.0.0\"\ndependencies = [\"ring 0.17.14\", \"aws-lc-sys 0.1.0\"]\n{}{}",
+                lock_crate("ring", "0.17.14", None),
+                lock_crate("aws-lc-sys", "0.1.0", None)
+            ),
+        )
+        .unwrap();
+        let (_, vs) = check_workspace(dir.path()).expect("check");
+        assert_clean(&vs);
+    }
+
     #[test]
     fn p_real_workspace_passes() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
