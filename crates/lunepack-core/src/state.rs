@@ -380,17 +380,18 @@ impl InstallState {
         }
     }
 
-    /// The same record numbered `seq` (to commit at [`Loaded::next_seq`] when a torn file took
-    /// the number after the loaded record's).
+    /// The same record numbered `seq`. Test hook for building raw payloads: [`commit`] numbers the
+    /// record itself.
+    #[doc(hidden)]
     pub fn with_seq(mut self, seq: u64) -> InstallState {
         self.seq = seq;
         self
     }
 
+    /// A copy for a transition. Its `seq` is the loaded record's and means nothing until a commit:
+    /// [`commit`] gives the written record the store's next seq.
     fn next(&self) -> InstallState {
-        let mut out = self.clone();
-        out.seq = self.seq.saturating_add(1);
-        out
+        self.clone()
     }
 
     /// The next record with every floor raised to at least `floors` (never lowered).
@@ -455,7 +456,8 @@ impl InstallCounters {
         }
     }
 
-    /// The same record numbered `seq`.
+    /// The same record numbered `seq`. Test hook: [`commit`] numbers the record itself.
+    #[doc(hidden)]
     pub fn with_seq(mut self, seq: u64) -> InstallCounters {
         self.seq = seq;
         self
@@ -464,7 +466,6 @@ impl InstallCounters {
     /// The next record with every floor raised to at least `floors`.
     pub fn raise_floors(&self, floors: &Floors) -> InstallCounters {
         let mut out = self.clone();
-        out.seq = self.seq.saturating_add(1);
         out.floors = self.floors.max(floors);
         out
     }
@@ -483,6 +484,9 @@ pub trait Record: Clone + sealed::Sealed {
 
     /// The sequence number.
     fn seq(&self) -> u64;
+
+    #[doc(hidden)]
+    fn numbered(&self, seq: u64) -> Self;
 
     /// The app id.
     fn app_id(&self) -> &AppId;
@@ -507,6 +511,10 @@ impl Record for InstallState {
 
     fn seq(&self) -> u64 {
         self.seq
+    }
+
+    fn numbered(&self, seq: u64) -> Self {
+        self.clone().with_seq(seq)
     }
 
     fn app_id(&self) -> &AppId {
@@ -585,6 +593,10 @@ impl Record for InstallCounters {
 
     fn seq(&self) -> u64 {
         self.seq
+    }
+
+    fn numbered(&self, seq: u64) -> Self {
+        self.clone().with_seq(seq)
     }
 
     fn app_id(&self) -> &AppId {
@@ -949,29 +961,27 @@ pub fn load<T: Record>(
     })
 }
 
-/// Commits `next` as the record after `loaded` (FORMAT.md 12.5), then prunes.
+/// Commits `next` as the record after `loaded` (FORMAT.md 12.5), then prunes. Returns the record
+/// as written.
 ///
-/// `next.seq` must be `loaded.next_seq` (at most `2^53 - 1`), its app id `loaded`'s, and its
-/// floors at or above the loaded record's (no writer lowers a floor). The record must pass every
-/// check [`load`] runs. The file is created with `create_new` (an existing one is
-/// [`StateError::Conflict`]), written, synced and its directory synced; only then old records are
-/// pruned, best effort, keeping the [`KEEP_RECORDS`] highest valid ones.
+/// The store owns the sequence: the record is written as `loaded.next_seq` (at most `2^53 - 1`,
+/// else [`StateError::SeqExhausted`]), whatever `next.seq` holds, so a caller cannot commit a wrong
+/// number. Its app id must be `loaded`'s and its floors at or above the loaded record's (no writer
+/// lowers a floor). The record must pass every check [`load`] runs. The file is created with
+/// `create_new` (an existing one is [`StateError::Conflict`]), written, synced and its directory
+/// synced; only then old records are pruned, best effort, keeping the [`KEEP_RECORDS`] highest
+/// valid ones.
 pub fn commit<T: Record>(
     fs: &dyn Fs,
     dir: &Path,
     loaded: &Loaded<T>,
     next: &T,
     hasher: &dyn Hasher,
-) -> Result<(), StateError> {
-    if next.seq() > MAX_JSON_INT {
+) -> Result<T, StateError> {
+    if loaded.next_seq > MAX_JSON_INT {
         return Err(StateError::SeqExhausted);
     }
-    if next.seq() != loaded.next_seq {
-        return Err(StateError::Seq {
-            expected: loaded.next_seq,
-            found: next.seq(),
-        });
-    }
+    let next = next.numbered(loaded.next_seq);
     if *next.app_id() != loaded.app_id {
         return Err(invalid("app id does not match"));
     }
@@ -980,7 +990,7 @@ pub fn commit<T: Record>(
     {
         return Err(StateError::FloorLowered);
     }
-    let bytes = encode(next, hasher)?;
+    let bytes = encode(&next, hasher)?;
     // The writer writes only what its own reader accepts.
     match classify::<T>(&bytes, next.seq(), &loaded.app_id, hasher)? {
         Class::Valid(_) => {}
@@ -988,7 +998,7 @@ pub fn commit<T: Record>(
     }
     write_file(fs, dir, next.seq(), &bytes)?;
     prune::<T>(fs, dir, next.seq(), &loaded.app_id, hasher);
-    Ok(())
+    Ok(next)
 }
 
 /// Frames `payload` as record `seq` and writes it the way [`commit`] does, without any check of
@@ -1109,7 +1119,7 @@ impl UserScope {
         loaded: &Loaded<InstallState>,
         next: &InstallState,
         hasher: &dyn Hasher,
-    ) -> Result<(), StateError> {
+    ) -> Result<InstallState, StateError> {
         if next.scope != Scope::User {
             return Err(invalid("record scope does not match"));
         }
@@ -1175,7 +1185,7 @@ impl MachineScope {
         loaded: &Loaded<InstallCounters>,
         next: &InstallCounters,
         hasher: &dyn Hasher,
-    ) -> Result<(), StateError> {
+    ) -> Result<InstallCounters, StateError> {
         if next.install_id != machine.install_id {
             return Err(invalid("counters belong to another install"));
         }

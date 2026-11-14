@@ -129,9 +129,8 @@ fn store_with(steps: &[&dyn Fn(&InstallState) -> InstallState]) -> (MemFs, Vec<I
     let mut records = vec![first];
     for step in steps {
         let loaded = load_state(&fs).unwrap();
-        let next = step(loaded.record.as_ref().unwrap()).with_seq(loaded.next_seq);
-        commit(&fs, &dir(), &loaded, &next, &H).unwrap();
-        records.push(next);
+        let next = step(loaded.record.as_ref().unwrap());
+        records.push(commit(&fs, &dir(), &loaded, &next, &H).unwrap());
     }
     (fs, records)
 }
@@ -188,20 +187,20 @@ fn a_committed_record_loads_back_equal() {
 }
 
 #[test]
-fn transitions_number_the_next_record_and_keep_the_rest() {
+fn transitions_keep_the_rest_and_leave_the_numbering_to_commit() {
     let r = sample(4);
     let staged = r.set_staged(None);
-    assert_eq!(staged.seq, 5);
+    assert_eq!(staged.seq, 4);
     assert!(staged.staged.is_none());
     assert_eq!(staged.floors, r.floors);
     let bad = r
         .mark_bad(v("1.0.3"))
         .mark_bad(v("0.5.0"))
         .mark_bad(v("1.0.3"));
-    assert_eq!(bad.seq, 7);
+    assert_eq!(bad.seq, 4);
     assert_eq!(bad.bad, vec![v("0.5.0"), v("1.0.1"), v("1.0.3")]);
     let installed = r.install(v("1.1.0"), 1_800_000_000, Target::LinuxAarch64, [9; 16]);
-    assert_eq!(installed.seq, 5);
+    assert_eq!(installed.seq, 4);
     assert_eq!(installed.previous.as_ref().unwrap().version, v("1.0.0"));
     assert_eq!(installed.current.as_ref().unwrap().version, v("1.1.0"));
     assert_eq!(installed.current.as_ref().unwrap().issued, 1_800_000_000);
@@ -216,29 +215,44 @@ fn transitions_number_the_next_record_and_keep_the_rest() {
 }
 
 #[test]
-fn commit_checks_the_seq() {
+fn commit_numbers_the_record_itself() {
     let (fs, _) = two_records();
     let loaded = load_state(&fs).unwrap();
     let record = loaded.record.clone().unwrap();
-    // A transition of record 2 is 3, the next seq: accepted. Any other is refused.
-    let wrong = record.set_staged(None).with_seq(9);
-    assert!(matches!(
-        commit(&fs, &dir(), &loaded, &wrong, &H),
-        Err(StateError::Seq {
-            expected: 3,
-            found: 9
-        })
-    ));
+    assert_eq!(loaded.next_seq, 3);
+    // Whatever seq the caller's record holds, the store writes it as the next one.
+    for held in [9, 1, 3] {
+        let (fs, _) = two_records();
+        let loaded = load_state(&fs).unwrap();
+        let written = commit(
+            &fs,
+            &dir(),
+            &loaded,
+            &record.set_staged(None).with_seq(held),
+            &H,
+        )
+        .unwrap();
+        assert_eq!(written.seq, 3, "held {held}");
+        assert_eq!(load_state(&fs).unwrap().record, Some(written));
+        assert!(names(&fs).contains(&"00000000000000000003.rec".to_owned()));
+        if held == 9 {
+            assert!(!names(&fs).contains(&format!("{held:020}.rec")));
+        }
+    }
     let exhausted = Loaded {
         next_seq: MAX_U53 + 1,
         ..loaded.clone()
     };
-    let over = record.set_staged(None).with_seq(MAX_U53 + 1);
     assert!(matches!(
-        commit(&fs, &dir(), &exhausted, &over, &H),
+        commit(&fs, &dir(), &exhausted, &record.set_staged(None), &H),
         Err(StateError::SeqExhausted)
     ));
-    commit(&fs, &dir(), &loaded, &record.set_staged(None), &H).unwrap();
+    // After a torn file took a number, the next commit skips it with no help from the caller.
+    put_file(&fs, &dir().join(format!("{:020}.rec", 7)), b"torn");
+    let loaded = load_state(&fs).unwrap();
+    assert_eq!(loaded.next_seq, 8);
+    let written = commit(&fs, &dir(), &loaded, &record.set_staged(None), &H).unwrap();
+    assert_eq!(written.seq, 8);
 }
 
 #[test]
@@ -674,7 +688,7 @@ fn unknown_top_level_fields_are_kept_through_transitions() {
     assert_eq!(record.extra.get("x_future"), Some(&x_future));
     assert_eq!(record.extra.get("health"), Some(&health));
     let next = record.raise_floors(&floors(9, 9));
-    commit(&fs, &dir(), &loaded, &next, &H).unwrap();
+    let next = commit(&fs, &dir(), &loaded, &next, &H).unwrap();
     let written = payload(&bytes_of(&fs, 4));
     assert_eq!(written.get("x_future"), Some(&x_future));
     assert_eq!(written.get("health"), Some(&health));
@@ -851,10 +865,10 @@ fn machine_scope_keeps_counters_per_install_and_takes_the_higher_floors() {
     let loaded = scope.load_counters(&fs, &machine, &H).unwrap();
     assert_eq!(loaded.record.as_ref(), Some(&counters));
     let raised = counters.raise_floors(&floors(5, 1));
-    assert_eq!(raised.seq, 2);
-    scope
+    let raised = scope
         .commit_counters(&fs, &machine, &loaded, &raised, &H)
         .unwrap();
+    assert_eq!(raised.seq, 2);
 
     let effective = MachineScope::effective_floors(&machine, Some(&raised));
     assert_eq!(effective.keyset_version, 5);

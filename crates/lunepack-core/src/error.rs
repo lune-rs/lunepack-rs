@@ -403,14 +403,6 @@ pub enum StateError {
     /// rather than fall back to an older record (M4-D23).
     #[error("invalid state record: {0}")]
     Invalid(Untrusted),
-    /// A commit's seq is not the next one.
-    #[error("state record seq {found} is not the next seq {expected}")]
-    Seq {
-        /// The next seq.
-        expected: u64,
-        /// The record's seq.
-        found: u64,
-    },
     /// The next seq would be above `2^53 - 1`.
     #[error("state record seq space exhausted")]
     SeqExhausted,
