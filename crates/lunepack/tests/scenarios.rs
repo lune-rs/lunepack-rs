@@ -730,72 +730,91 @@ fn finish_and_verify(rig: &Rig, site: &Site, info: &UpdateInfo, label: &str) {
     no_leftovers(site);
 }
 
-/// Polls `download` and then `stage` N times and cuts, for every N up to completion.
+/// Which operation a sweep cuts: the other one runs to its end.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Sweep {
+    Download,
+    Stage,
+}
+
+/// Polls `download` and then `stage` N times and cuts, for every N up to completion. Two sweeps,
+/// so that every poll of each operation is a cut point however the other one's poll count varies
+/// from run to run: one cuts `download` after N polls (then `stage` runs on), the other runs
+/// `download` to its end and cuts `stage` after N polls.
 fn cancel_at_every_poll(kind: Kind, mode: Mode) {
     let _s = serial();
     let baseline = Baseline::new();
-    let (mut cut_in_download, mut cut_in_stage) = (0usize, 0usize);
-    let mut n = 0usize;
-    loop {
-        assert!(n < 5_000, "the operation never completed");
-        let label = format!("{kind:?} / {mode:?} / N={n}");
-        let site = baseline.fresh();
-        let rig = Rig::new(kind, &site, 2);
-        let u = &rig.updater;
-        let info = block_on(u.check())
-            .unwrap_or_else(|e| panic!("{label}: check: {e}"))
-            .expect("an update");
-        let token = CancelToken::new();
-        let mut budget = n;
+    for sweep in [Sweep::Download, Sweep::Stage] {
+        let mut cuts = 0usize;
+        let mut n = 0usize;
+        loop {
+            assert!(n < 5_000, "the {sweep:?} sweep never completed");
+            let label = format!("{kind:?} / {mode:?} / {sweep:?} / N={n}");
+            let site = baseline.fresh();
+            let rig = Rig::new(kind, &site, 2);
+            let u = &rig.updater;
+            let info = block_on(u.check())
+                .unwrap_or_else(|e| panic!("{label}: check: {e}"))
+                .expect("an update");
+            let token = CancelToken::new();
+            let (mut download_budget, mut stage_budget) = match sweep {
+                Sweep::Download => (n, usize::MAX),
+                Sweep::Stage => (usize::MAX, n),
+            };
 
-        let mut download = Box::pin(u.download(
-            &info,
-            DownloadOptions {
-                progress: None,
-                cancel: Some(token.clone()),
-            },
-        ));
-        let downloaded = match drive(&mut download, &mut budget, mode, &token) {
-            Step::Done(result) => result.unwrap_or_else(|e| panic!("{label}: download: {e}")),
-            Step::Cut => {
-                cut_in_download += 1;
-                drop(download);
-                workers_stopped();
-                assert!(u.staged().expect("staged").is_none(), "{label}");
-                finish_and_verify(&rig, &site, &info, &label);
-                n += 1;
-                continue;
-            }
-        };
-        let mut stage = Box::pin(u.stage(downloaded));
-        match drive(&mut stage, &mut budget, mode, &token) {
-            Step::Done(result) => {
-                let staged = result.unwrap_or_else(|e| panic!("{label}: stage: {e}"));
-                assert_tree(staged.tree(), &release_tree(V110));
-                assert!(u.staged().expect("staged").is_some(), "{label}");
-                workers_stopped();
-                no_leftovers(&site);
-                break;
-            }
-            Step::Cut => {
-                cut_in_stage += 1;
-                drop(stage);
-                workers_stopped();
-                // A cut after the commit job ran keeps the commit; otherwise nothing is staged.
-                if let Some(seen) = u.staged().expect("staged") {
-                    assert_eq!(seen.tree(), site.tree(V110), "{label}");
-                    assert_tree(seen.tree(), &release_tree(V110));
+            let mut download = Box::pin(u.download(
+                &info,
+                DownloadOptions {
+                    progress: None,
+                    cancel: Some(token.clone()),
+                },
+            ));
+            let downloaded = match drive(&mut download, &mut download_budget, mode, &token) {
+                Step::Done(result) if !token.is_cancelled() => {
+                    result.unwrap_or_else(|e| panic!("{label}: download: {e}"))
                 }
-                finish_and_verify(&rig, &site, &info, &label);
+                // Cut, or finished in the same instant the token fired (its stage would be
+                // cancelled too).
+                Step::Cut | Step::Done(_) => {
+                    cuts += 1;
+                    drop(download);
+                    workers_stopped();
+                    assert!(u.staged().expect("staged").is_none(), "{label}");
+                    finish_and_verify(&rig, &site, &info, &label);
+                    n += 1;
+                    continue;
+                }
+            };
+            drop(download);
+            let mut stage = Box::pin(u.stage(downloaded));
+            match drive(&mut stage, &mut stage_budget, mode, &token) {
+                Step::Done(result) => {
+                    let staged = result.unwrap_or_else(|e| panic!("{label}: stage: {e}"));
+                    assert_tree(staged.tree(), &release_tree(V110));
+                    assert!(u.staged().expect("staged").is_some(), "{label}");
+                    workers_stopped();
+                    no_leftovers(&site);
+                    break;
+                }
+                Step::Cut => {
+                    cuts += 1;
+                    drop(stage);
+                    workers_stopped();
+                    // A cut after the commit job ran keeps the commit; otherwise nothing is staged.
+                    if let Some(seen) = u.staged().expect("staged") {
+                        assert_eq!(seen.tree(), site.tree(V110), "{label}");
+                        assert_tree(seen.tree(), &release_tree(V110));
+                    }
+                    finish_and_verify(&rig, &site, &info, &label);
+                }
             }
+            n += 1;
         }
-        n += 1;
+        // N = 0 cuts before the first poll, so each sweep has cuts; the count is the number of
+        // polls the operation took in the run that completed.
+        assert!(cuts > 0, "{sweep:?} sweep: no cut");
+        println!("{kind:?} / {mode:?} / {sweep:?}: completed at N={n}, {cuts} cuts");
     }
-    assert!(cut_in_download > 0, "no cut landed in download");
-    assert!(cut_in_stage > 0, "no cut landed in stage");
-    println!(
-        "{kind:?} / {mode:?}: completed at N={n}; cut in download {cut_in_download}, in stage {cut_in_stage}"
-    );
 }
 
 #[test]
