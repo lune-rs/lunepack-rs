@@ -17,7 +17,7 @@
 //! components.
 
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError, mpsc};
@@ -382,7 +382,7 @@ pub fn scan(
     }
 
     // Candidates: same relative path, every parent a real directory, a regular file of equal size.
-    let mut dirs: HashMap<String, bool> = HashMap::new();
+    let mut dirs: BTreeMap<String, bool> = BTreeMap::new();
     let mut cands: Vec<(usize, &RelPath, u64, Sha256Digest, PathBuf)> = Vec::new();
     for (i, e) in entries.iter().enumerate() {
         let VerifiedEntry::File {
@@ -607,7 +607,7 @@ pub fn stage(input: &StageInput<'_>, env: &StageEnv<'_>) -> Result<StagedVersion
 
     // What the tree holds: every entry, and every parent directory of one.
     let mut jobs: Vec<FileJob<'_>> = Vec::new();
-    let mut expected: HashMap<&str, Expect> = HashMap::new();
+    let mut expected: BTreeMap<&str, Expect> = BTreeMap::new();
     let mut dirs: BTreeSet<&str> = BTreeSet::new();
     let mut links: Vec<(&RelPath, &str)> = Vec::new();
     for (e, source) in entries.iter().zip(&input.sources) {
@@ -795,7 +795,7 @@ fn prepare_partial(fs: &dyn Fs, tree: &Path, partial: &Path) -> Result<(), FsErr
 fn clean(
     fs: &dyn Fs,
     partial: &Path,
-    expected: &HashMap<&str, Expect>,
+    expected: &BTreeMap<&str, Expect>,
     jobs: &mut [FileJob<'_>],
 ) -> Result<(), FsError> {
     let mut stack: Vec<(PathBuf, String)> = vec![(partial.to_path_buf(), String::new())];
