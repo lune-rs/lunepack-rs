@@ -12,6 +12,13 @@ workspace = true
 
 [dependencies]
 lunepack-core.workspace = true
+thiserror.workspace = true
 
 [dev-dependencies]
 lunepack-testkit.workspace = true
+# The plumbing and scenario suites run under five executors (M4 step 10): the built-in
+# `block_on`, futures' `block_on`, tokio current-thread and multi-thread, and smol. Tests only;
+# the facade's own task plumbing is std-only (M4-D3).
+futures = { version = "0.3", default-features = false, features = ["std", "executor"] }
+tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "macros", "time"] }
+smol = "2"
