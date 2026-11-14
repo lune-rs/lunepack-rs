@@ -142,4 +142,72 @@ t_check "a dir with one bad file fails" rc_nonzero
 t_check "the bad file is named" out_has "bad.yml:"
 t_check "the good file is not named" out_lacks "good.yml:"
 
+# --- the os-trust job (M4 step 14) --------------------------------------------------------
+# A regression check on the real adapter: it must be a required job with a time bound, and its
+# scripts must refuse to run off CI (they change the OS trust store and proxy settings).
+repo=$(cd "$here/../.." && pwd)
+ci=$repo/.github/workflows/ci.yml
+
+# job_block <file> <job>: the lines of one top-level job.
+job_block() {
+  awk -v job="  $2:" '
+    $0 == job { on = 1; print; next }
+    on && /^  [A-Za-z0-9_-]+:/ { exit }
+    on { print }
+  ' "$1"
+}
+
+# os_trust_job_ok <file>: prints one line per problem; nonzero when there is any.
+os_trust_job_ok() {
+  local block bad=0 os
+  block=$(job_block "$1" os-trust)
+  if [ -z "$block" ]; then echo "no os-trust job"; return 1; fi
+  if ! printf '%s\n' "$block" | grep -q 'timeout-minutes:'; then echo "os-trust has no timeout-minutes"; bad=1; fi
+  if printf '%s\n' "$block" | grep -q 'continue-on-error'; then echo "os-trust must not be continue-on-error"; bad=1; fi
+  for os in ubuntu-latest macos-latest windows-latest; do
+    if ! printf '%s\n' "$block" | grep -q "$os"; then echo "os-trust does not run on $os"; bad=1; fi
+  done
+  if ! printf '%s\n' "$block" | grep -q 'scripts/ci/os-trust.sh'; then echo "os-trust does not run os-trust.sh"; bad=1; fi
+  if ! printf '%s\n' "$block" | grep -q 'scripts/ci/os-trust.ps1'; then echo "os-trust does not run os-trust.ps1"; bad=1; fi
+  return "$bad"
+}
+
+if [ -f "$ci" ]; then
+  RC=0
+  os_trust_job_ok "$ci" >"$OUT" 2>&1 || RC=$?
+  t_check "ci.yml has a required, time-bounded os-trust job on three OSes" rc_is 0
+  if [ "$RC" -ne 0 ]; then sed 's/^/    /' "$OUT" >&2; fi
+  # seeded negatives: the check can fail
+  sed 's|^  os-trust:|  os-trust:\n    continue-on-error: true|' "$ci" >"$T_TMP/coe.yml"
+  RC=0
+  os_trust_job_ok "$T_TMP/coe.yml" >"$OUT" 2>&1 || RC=$?
+  t_check "seeded continue-on-error on os-trust fails" rc_nonzero
+  t_check "seeded continue-on-error reports why" out_has "continue-on-error"
+  grep -v 'timeout-minutes' "$ci" >"$T_TMP/no-timeout.yml" || true
+  RC=0
+  os_trust_job_ok "$T_TMP/no-timeout.yml" >"$OUT" 2>&1 || RC=$?
+  t_check "seeded os-trust without a timeout fails" rc_nonzero
+  t_check "seeded missing timeout reports why" out_has "no timeout-minutes"
+  RC=0
+  os_trust_job_ok "$T_TMP/good.yml" >"$OUT" 2>&1 || RC=$?
+  t_check "a file with no os-trust job fails" rc_nonzero
+fi
+
+# The scripts refuse off CI (exit 3) before touching anything: no scratch directory appears.
+guard_tmp=$T_TMP/guard-tmp
+mkdir -p "$guard_tmp"
+for setting in "" "CI=true" "GITHUB_ACTIONS=true"; do
+  RC=0
+  # shellcheck disable=SC2086  # $setting is empty or one VAR=value word
+  env -u CI -u GITHUB_ACTIONS $setting TMPDIR="$guard_tmp" bash "$repo/scripts/ci/os-trust.sh" >"$OUT" 2>&1 || RC=$?
+  t_check "os-trust.sh refuses without both CI and GITHUB_ACTIONS (${setting:-neither}): exit 3" rc_is 3
+done
+t_check "os-trust.sh left nothing behind after refusing" test -z "$(ls -A "$guard_tmp")"
+t_check "os-trust.ps1 carries the same guard" grep -q "GITHUB_ACTIONS -ne 'true'" "$repo/scripts/ci/os-trust.ps1"
+if command -v pwsh >/dev/null 2>&1; then
+  RC=0
+  env -u CI -u GITHUB_ACTIONS pwsh -NoProfile -File "$repo/scripts/ci/os-trust.ps1" >"$OUT" 2>&1 || RC=$?
+  t_check "os-trust.ps1 refuses off CI: exit 3" rc_is 3
+fi
+
 t_finish

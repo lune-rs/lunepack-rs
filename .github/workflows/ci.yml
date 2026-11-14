@@ -77,3 +77,31 @@ jobs:
         run: rustup toolchain install 1.88.0 --profile minimal
       - name: Check at the MSRV
         run: cargo +1.88.0 check --workspace --all-targets --locked
+
+  os-trust:
+    # the production transport honours the OS trust store and the system proxy (a regression check,
+    # not an experiment: scripts/ci/os-trust.sh and .ps1, ported from probe P-N1). The scripts
+    # change the hosted runner's trust store and proxy settings and undo them on every exit path.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, shell: bash }
+          - { os: macos-latest, shell: bash }
+          - { os: windows-latest, shell: pwsh }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: OS trust and system proxy (bash)
+        if: matrix.shell == 'bash'
+        timeout-minutes: 20
+        shell: bash
+        run: ./scripts/ci/os-trust.sh
+      - name: OS trust and system proxy (pwsh)
+        if: matrix.shell == 'pwsh'
+        timeout-minutes: 20
+        shell: pwsh
+        run: ./scripts/ci/os-trust.ps1
