@@ -7,14 +7,22 @@
 //! 64-byte signatures, and the payload harnesses sign with the fake scheme at run time.
 
 use lunepack_core::digest::{Sha256Digest, U53};
-use lunepack_core::fuzz::{FRAME_HEADER_LEN, FUZZ_TARGET, FUZZ_VERSION, HTTP_HEADER_LEN};
+use std::path::{Path, PathBuf};
+
+use lunepack_core::fuzz::{
+    FRAME_HEADER_LEN, FUZZ_APP_ID, FUZZ_TARGET, FUZZ_VERSION, HTTP_HEADER_LEN, STATE_NAME_SEQ,
+};
+use lunepack_core::state::{self, MAX_RECORD_BYTES};
+use lunepack_core::trust::PublicKey;
 use lunepack_core::{
-    ByteRange, Channel, CodecId, ContentRange, EnvelopeSignature, FrameDesc, Hasher, PayloadKind,
-    StreamDesc, Target, Validator, write_envelope,
+    AppId, ByteRange, Channel, CodecId, ContentRange, CurrentRef, EnvelopeSignature, Floors,
+    FrameDesc, Fs, Hasher, InstallCounters, InstallState, Loaded, PayloadKind, PreviousRef,
+    RootParts, Scope, StagedRef, StreamDesc, Target, Validator, Version, write_envelope,
 };
 
 use crate::docs::{ChainFixture, PackBuilder, SUITE_T0};
 use crate::hasher::FakeHasher;
+use crate::memfs::MemFs;
 
 const DAY: u64 = 86_400;
 const MANIFEST_STUB: &[u8] = b"manifest bytes the feed seeds point at";
@@ -73,6 +81,7 @@ pub fn fuzz_seeds() -> Vec<Seed> {
     json_seeds(&fx, &mut out);
     frame_seeds(&mut out);
     http_seeds(&mut out);
+    state_seeds(&mut out);
     out.0
 }
 
@@ -764,4 +773,141 @@ fn http_seeds(out: &mut Out) {
             &[("content-range", cr.as_bytes())],
         ),
     );
+}
+
+// ---- state ----------------------------------------------------------------------------------------
+
+/// The install-state record the `state` seeds start from: every field set. `seq` is its number.
+fn sample_install_state(seq: u64) -> InstallState {
+    let app_id = AppId::parse(FUZZ_APP_ID).expect("fuzz app id");
+    let version = |t: &str| Version::parse(t).expect("version");
+    let key = |label: &str| PublicKey::from_bytes(*FakeHasher.sha256(label.as_bytes()).as_bytes());
+    let mut record = InstallState::new(
+        seq,
+        app_id,
+        Scope::User,
+        [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+        FUZZ_TARGET,
+    );
+    record.current = Some(CurrentRef {
+        version: version(FUZZ_VERSION),
+        issued: SUITE_T0,
+    });
+    record.previous = Some(PreviousRef {
+        version: version("0.9.0"),
+    });
+    record.staged = Some(StagedRef::new(
+        version("1.1.0"),
+        FUZZ_TARGET,
+        FakeHasher.sha256(b"the 1.1.0 manifest"),
+    ));
+    record.bad = vec![version("1.0.1"), version("1.0.2-beta.1")];
+    record.floors = Floors {
+        root: Some(RootParts {
+            version: 2,
+            threshold: 1,
+            keys: vec![key("root key 1"), key("root key 2")],
+        }),
+        keyset_version: 3,
+        feed_seq: [(Channel::parse("stable").expect("channel"), 42)]
+            .into_iter()
+            .collect(),
+    };
+    record
+}
+
+/// Commits `records` in order into a fresh store and returns the last file's bytes.
+fn committed<T: state::Record>(records: &[T]) -> Vec<u8> {
+    let fs = MemFs::new();
+    let dir = PathBuf::from("/state");
+    let mut last = 0;
+    for record in records {
+        let loaded: Loaded<T> = state::load(&fs, &dir, record.app_id(), &FakeHasher).expect("load");
+        state::commit(&fs, &dir, &loaded, record, &FakeHasher).expect("commit");
+        last = record.seq();
+    }
+    record_bytes(&fs, &dir, last)
+}
+
+fn record_bytes(fs: &MemFs, dir: &Path, seq: u64) -> Vec<u8> {
+    fs.read_capped(&dir.join(format!("{seq:020}.rec")), MAX_RECORD_BYTES)
+        .expect("read record")
+}
+
+/// The JSON payload of a record file.
+fn payload_value(file: &[u8]) -> serde_json::Map<String, serde_json::Value> {
+    let len = u32::from_be_bytes([file[5], file[6], file[7], file[8]]) as usize;
+    serde_json::from_slice(&file[9..9 + len]).expect("payload")
+}
+
+/// `payload` (a record payload from `commit`, edited) framed by the real framing code.
+fn raw_record(payload: &serde_json::Map<String, serde_json::Value>) -> Vec<u8> {
+    let fs = MemFs::new();
+    let dir = PathBuf::from("/state");
+    let bytes = serde_json::to_vec(payload).expect("payload");
+    state::commit_raw_payload(&fs, &dir, STATE_NAME_SEQ, &bytes, &FakeHasher).expect("raw");
+    record_bytes(&fs, &dir, STATE_NAME_SEQ)
+}
+
+fn state_seeds(out: &mut Out) {
+    let valid = committed(&[sample_install_state(STATE_NAME_SEQ)]);
+    out.ok("state", "install-state", valid.clone());
+
+    let fresh = InstallState::new(
+        STATE_NAME_SEQ,
+        AppId::parse(FUZZ_APP_ID).expect("fuzz app id"),
+        Scope::Machine,
+        [0x5a; 16],
+        Target::WindowsX86_64,
+    );
+    out.ok("state", "install-state-first", committed(&[fresh]));
+
+    let mut counters = InstallCounters::new(
+        STATE_NAME_SEQ,
+        AppId::parse(FUZZ_APP_ID).expect("fuzz app id"),
+        [0x5a; 16],
+    );
+    counters.floors = sample_install_state(1).floors;
+    out.ok("state", "install-counters", committed(&[counters]));
+
+    let mut extra = payload_value(&valid);
+    extra.insert("x_future".to_owned(), serde_json::json!({ "a": [1, 2] }));
+    extra.insert("health".to_owned(), serde_json::json!({ "t": "token" }));
+    out.ok("state", "extra-fields", raw_record(&extra));
+
+    out.bad("state", "torn", valid[..valid.len() / 2].to_vec());
+    out.bad("state", "empty", Vec::new());
+    let mut flipped = valid.clone();
+    flipped[20] ^= 0x01;
+    out.bad("state", "flipped-payload", flipped);
+    let mut flipped = valid.clone();
+    flipped[7] ^= 0x01;
+    out.bad("state", "flipped-length", flipped);
+    let mut flipped = valid.clone();
+    let last = flipped.len() - 1;
+    flipped[last] ^= 0x01;
+    out.bad("state", "flipped-checksum", flipped);
+    let mut newer = valid.clone();
+    newer[4] = 2;
+    out.bad("state", "format-byte-2", newer);
+    out.bad(
+        "state",
+        "renamed",
+        committed(&[
+            sample_install_state(STATE_NAME_SEQ),
+            sample_install_state(STATE_NAME_SEQ + 1),
+        ]),
+    );
+
+    let mut critical = payload_value(&valid);
+    critical.insert("critical".to_owned(), serde_json::json!(["x_future"]));
+    out.bad("state", "unknown-critical", raw_record(&critical));
+    let mut nested = payload_value(&valid);
+    if let Some(serde_json::Value::Object(floors)) = nested.get_mut("floors") {
+        floors.insert("x_future".to_owned(), serde_json::json!(1));
+    }
+    out.bad("state", "unknown-key-in-floors", raw_record(&nested));
+    let mut unsorted = payload_value(&valid);
+    unsorted.insert("bad".to_owned(), serde_json::json!(["1.0.2", "1.0.1"]));
+    out.bad("state", "bad-not-sorted", raw_record(&unsorted));
 }

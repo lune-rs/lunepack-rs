@@ -61,6 +61,9 @@ pub const FRAME_HEADER_LEN: usize = 2 + 8 + 8 + 32;
 /// size (u64 BE), expected body length (u64 BE), status (u16 BE).
 pub const HTTP_HEADER_LEN: usize = 1 + 8 + 8 + 8 + 8 + 2;
 
+/// The record seq (file name) the `state` harness reads its input as.
+pub const STATE_NAME_SEQ: u64 = 1;
+
 const DAY: u64 = 86_400;
 const ALL_SEEDS: [u8; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
 const KINDS: [PayloadKind; 4] = [
@@ -86,6 +89,7 @@ pub const HARNESSES: &[(&str, Harness)] = &[
     ("json", json),
     ("frame", frame),
     ("http", http),
+    ("state", state),
 ];
 
 /// Runs the harness `name` and reports whether `data` got all the way through it (`None`: no such
@@ -103,6 +107,7 @@ pub fn accepts(name: &str, data: &[u8]) -> Option<bool> {
         "json" => json_run(data),
         "frame" => frame_run(data),
         "http" => http_run(data),
+        "state" => state_run(data),
         _ => return None,
     })
 }
@@ -191,6 +196,12 @@ pub fn frame(data: &[u8]) {
 /// rules, the `Content-Range` and `Content-Length` checks and the document check.
 pub fn http(data: &[u8]) {
     let _ = http_run(data);
+}
+
+/// `data` as install-state record file number [`STATE_NAME_SEQ`] of either kind (frame and
+/// payload), and as a bare payload of either kind, for app id [`FUZZ_APP_ID`].
+pub fn state(data: &[u8]) {
+    let _ = state_run(data);
 }
 
 // ---- scaffolding: fake hasher, fake signatures, clock, codec -------------------------------------
@@ -697,4 +708,11 @@ fn be_u64(bytes: &[u8]) -> u64 {
     let mut out = [0u8; 8];
     out.copy_from_slice(bytes);
     u64::from_be_bytes(out)
+}
+
+fn state_run(data: &[u8]) -> bool {
+    let Some(app) = app_id() else {
+        return false;
+    };
+    crate::state::fuzz_run(data, STATE_NAME_SEQ, &app, &FuzzHasher)
 }

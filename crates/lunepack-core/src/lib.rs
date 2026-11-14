@@ -21,6 +21,7 @@ pub mod path;
 pub mod policy;
 pub mod progress;
 pub mod root;
+pub mod state;
 pub mod target;
 pub mod traits;
 pub mod transport;
@@ -31,7 +32,7 @@ pub mod write;
 pub use cancel::CancelToken;
 pub use digest::{Sha256Digest, U53};
 pub use envelope::{EnvelopeSignature, OpenedEnvelope, PayloadKind, pae, write_envelope};
-pub use error::{Error, Result};
+pub use error::{Error, Result, StateError};
 pub use feed::{
     ArtifactRef, CheckedRef, FeedDocument, FeedTargetEntry, ReleaseDoc, Rollout, RolloutDoc,
     VerifiedFeed, VerifiedRelease, verify_feed,
@@ -55,6 +56,10 @@ pub use path::{EntryKind, RelPath, validate_path, validate_tree};
 pub use policy::{Candidate, in_rollout, rollout_bucket, select_candidate};
 pub use progress::{FileProgress, Phase, Progress, Source};
 pub use root::{RootDocument, TrustedRoot, advance_root};
+pub use state::{
+    CurrentRef, Floors, InstallCounters, InstallState, Loaded, MachineScope, PendingRef,
+    PreviousRef, Record, RootParts, Scope, StagedRef, UserScope,
+};
 pub use target::Target;
 pub use traits::{
     Clock, CodeSign, Codec, CodecId, DecodeReport, EncodedFrame, EncodedStream, Encoder, FrameView,

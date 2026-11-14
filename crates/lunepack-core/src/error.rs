@@ -368,6 +368,51 @@ pub enum FrameError {
     FileHash,
 }
 
+/// The install-state store refused to load or commit (FORMAT.md 12). Paths are never shown.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum StateError {
+    /// A filesystem operation failed.
+    #[error("{0}")]
+    Fs(#[from] FsError),
+    /// The record file for this seq already exists (another writer got there first).
+    #[error("state record {seq} already exists")]
+    Conflict {
+        /// The seq.
+        seq: u64,
+    },
+    /// A whole record is from a newer format (format byte or `format` above 1, or a `critical`
+    /// entry this build does not implement): nothing is read past it and nothing is written.
+    #[error("state record is from a newer format")]
+    NewerFormat,
+    /// A whole record (its checksum matches) fails parsing or a semantic rule; the load stops
+    /// rather than fall back to an older record (M4-D23).
+    #[error("invalid state record: {0}")]
+    Invalid(Untrusted),
+    /// A commit's seq is not the next one.
+    #[error("state record seq {found} is not the next seq {expected}")]
+    Seq {
+        /// The next seq.
+        expected: u64,
+        /// The record's seq.
+        found: u64,
+    },
+    /// The next seq would be above `2^53 - 1`.
+    #[error("state record seq space exhausted")]
+    SeqExhausted,
+    /// A record would be over the size cap.
+    #[error("state record is {size} bytes, over the {cap} byte cap")]
+    TooLarge {
+        /// The framed size.
+        size: u64,
+        /// The cap.
+        cap: u64,
+    },
+    /// A commit would lower an anti-rollback floor of the loaded record.
+    #[error("state commit would lower an anti-rollback floor")]
+    FloorLowered,
+}
+
 /// Every way the core rejects input or fails.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -591,4 +636,7 @@ pub enum Error {
     /// The operation's cancel token was cancelled.
     #[error("cancelled")]
     Cancelled,
+    /// The install-state store failed.
+    #[error("install state: {0}")]
+    State(#[from] StateError),
 }

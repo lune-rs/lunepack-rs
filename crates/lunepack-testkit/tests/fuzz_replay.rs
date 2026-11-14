@@ -225,14 +225,14 @@ macro_rules! replay {
 }
 
 replay!(
-    envelope, root, keys, feed, manifest, path, tree, rules, json, frame, http
+    envelope, root, keys, feed, manifest, path, tree, rules, json, frame, http, state
 );
 
 #[test]
 fn the_replay_list_covers_every_harness() {
     let named: BTreeSet<&str> = [
         "envelope", "root", "keys", "feed", "manifest", "path", "tree", "rules", "json", "frame",
-        "http",
+        "http", "state",
     ]
     .into_iter()
     .collect();
